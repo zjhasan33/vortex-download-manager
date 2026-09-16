@@ -1,0 +1,10 @@
+{
+  "name": "vortex-tauri",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "npm --prefix ..\\ui run dev",
+    "build": "npm --prefix ..\\ui run build",
+    "tauri": "..\\ui\\node_modules\\.bin\\tauri.cmd"
+  }
+}

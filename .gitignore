@@ -1,0 +1,8 @@
+target/
+dist/
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+.settings/
+.vscode/settings.json

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Vortex</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="head">
+      <span class="logo"></span>
+      <div class="ht">
+        <b>VORTEX</b>
+        <span id="status" class="status off">connecting…</span>
+      </div>
+    </header>
+
+    <section class="addurl">
+      <input id="url" type="text" placeholder="Paste direct file or video URL" spellcheck="false" />
+      <button id="addbtn" class="btn primary">Add URL</button>
+    </section>
+
+    <section id="stats" class="stats hidden">
+      <div><b id="st-active">0</b><span>active</span></div>
+      <div><b id="st-speed">0 B/s</b><span>speed</span></div>
+      <div><b id="st-done">0</b><span>finished</span></div>
+    </section>
+
+    <section class="captures">
+      <div class="cap-head">
+        <span>Detected links</span>
+        <button id="clear" class="linkbtn" title="Clear">clear</button>
+      </div>
+      <div id="cap-list" class="cap-list">
+        <div class="empty">Watching for downloads on any tab…</div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <button id="open" class="btn ghost">Open Vortex</button>
+      <button id="refresh" class="btn ghost">Refresh status</button>
+    </footer>
+    <script src="popup.js"></script>
+  </body>
+</html>
