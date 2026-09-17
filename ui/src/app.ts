@@ -35,6 +35,19 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "Done 17 Sep 2026 • 14:32" for finished downloads, "Added …" otherwise. */
+function fmtStamp(d: Download): string {
+  const ms = d.completed_at ?? d.created_at;
+  if (!ms) return "";
+  const dt = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  const day = `${dt.getDate()} ${MONTHS[dt.getMonth()]} ${dt.getFullYear()}`;
+  const time = `${p(dt.getHours())}:${p(dt.getMinutes())}`;
+  return `${d.completed_at ? "Done" : "Added"} ${day} • ${time}`;
+}
+
 interface Desc {
   grid: string;
   headGrid: string;
@@ -197,6 +210,7 @@ export class VortexApp {
           <span style="min-width:0">
             <div class="dl-name" title="${esc(d.title)}">${esc(d.title)}</div>
             <div class="dl-sub">${esc(d.url)} ${d.source === "youtube" ? "• " + esc(d.filename) : ""}</div>
+            <div class="dl-date">${fmtStamp(d)}</div>
           </span>
         </div>`,
       size: `<span class="dl-size">${formatBytes(d.total_size || d.downloaded)}</span>`,

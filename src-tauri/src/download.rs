@@ -164,6 +164,8 @@ pub struct DlView {
     pub save_path: String,
     pub created_at: u64,
     #[serde(default)]
+    pub completed_at: Option<u64>,
+    #[serde(default)]
     pub format_id: Option<String>,
 }
 
@@ -240,6 +242,8 @@ pub struct Task {
     done_flags: Mutex<Vec<bool>>,
     /// Which chunk each worker has currently claimed (for dynamic work-stealing).
     claimed: Mutex<Vec<bool>>,
+    /// Epoch ms when the download reached Completed (None until then).
+    completed_at: Mutex<Option<u64>>,
 }
 
 pub fn now_ms() -> u64 {
@@ -417,6 +421,7 @@ impl Task {
             source: self.source.clone(),
             save_path: self.save_path.display().to_string(),
             created_at: self.created_at,
+            completed_at: *self.completed_at.lock().unwrap(),
             format_id: None,
         }
     }
@@ -445,6 +450,9 @@ impl Task {
     }
 
     pub fn set_status(&self, s: DlStatus) {
+        if s == DlStatus::Completed {
+            *self.completed_at.lock().unwrap() = Some(now_ms());
+        }
         *self.status.write().unwrap() = s;
         let err = self.error.lock().unwrap().clone();
         let _ = self.app.emit(
@@ -586,6 +594,7 @@ pub async fn start(
         auto_retries: opts.auto_retries,
         start_at: opts.start_at,
         auth: Mutex::new(auth),
+        completed_at: Mutex::new(None),
     });
 
     Ok(task)
@@ -642,6 +651,7 @@ pub fn restore(
         segments: Mutex::new(segs),
         done_flags: Mutex::new(vec![false; num_segments]),
         claimed: Mutex::new(vec![false; num_segments]),
+        completed_at: Mutex::new(view.completed_at),
     });
     Ok(task)
 }

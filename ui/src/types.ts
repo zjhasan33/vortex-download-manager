@@ -29,6 +29,7 @@ export interface Download {
   source: "http" | "youtube";
   save_path: string;
   created_at: number;
+  completed_at?: number | null;
   format_id?: string;
 }
 

@@ -358,6 +358,8 @@ pub struct YtTask {
     pub thumb: Option<String>,
     pub app: AppHandle,
     pub created_at: u64,
+    /// Epoch ms when the job reached Completed (None until then).
+    pub completed_at: Mutex<Option<u64>>,
 }
 
 impl YtTask {
@@ -390,11 +392,15 @@ impl YtTask {
             source: "youtube".into(),
             save_path: path.display().to_string(),
             created_at: self.created_at,
+            completed_at: *self.completed_at.lock().unwrap(),
             format_id: Some(self.format_id.clone()),
         }
     }
 
     fn set_status(&self, s: DlStatus) {
+        if s == DlStatus::Completed {
+            *self.completed_at.lock().unwrap() = Some(download::now_ms());
+        }
         *self.status.write().unwrap() = s;
         let err = self.error.lock().unwrap().clone();
         let _ = self.app.emit(
@@ -497,6 +503,7 @@ pub async fn start(
         sub_langs,
         app,
         created_at,
+        completed_at: Mutex::new(None),
     });
 
     Ok(task)
