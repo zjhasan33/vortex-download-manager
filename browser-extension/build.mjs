@@ -21,13 +21,14 @@ const builds = [
 
 function zipDir(outDir, zipPath) {
   rmSync(zipPath, { force: true });
-  if (process.platform === "win32") {
-    const cmd = `Compress-Archive -Path '${outDir}\\*' -DestinationPath '${zipPath}' -Force`;
-    execFileSync("powershell", ["-NoProfile", "-Command", cmd], { stdio: "inherit", cwd: root });
-  } else {
-    // BSD/macOS tar; on Linux GNU tar ignores -a for zip — install zip if needed.
-    execFileSync("tar", ["-a", "-c", "-f", zipPath, "-C", outDir, "."], { stdio: "inherit", cwd: root });
-  }
+  // bsdtar (ships with Windows 10+ and macOS) writes standard zip entries with
+  // forward slashes. PowerShell's Compress-Archive emits "\\" separators, which
+  // AMO's validator rejects ("Invalid file name in archive").
+  const entries = [...shared.map((f) => f), "manifest.json"];
+  execFileSync("tar", ["-a", "-c", "-f", zipPath, "-C", outDir, ...entries], {
+    stdio: "inherit",
+    cwd: root,
+  });
   console.log("zipped " + zipPath);
 }
 
