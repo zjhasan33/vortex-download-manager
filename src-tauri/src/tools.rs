@@ -26,6 +26,10 @@ pub const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-
 pub const BROWSER_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
 
+/// Neutral tool UA used when a server answers a browser-like UA with an endless
+/// redirect loop (mirror anti-hotlinking, e.g. mirrors.nju.edu.cn 302->itself).
+pub const TOOL_UA: &str = "Wget/1.21.4";
+
 pub fn tools_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("tools");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

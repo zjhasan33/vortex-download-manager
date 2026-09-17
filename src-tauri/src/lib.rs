@@ -6,7 +6,7 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 mod auth;
-mod download;
+pub mod download;
 mod grabber;
 mod md5;
 mod state;

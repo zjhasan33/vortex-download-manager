@@ -31,13 +31,26 @@ pub fn log_net_err(e: &reqwest::Error, ctx: &str) {
 }
 
 pub fn build_client(proxy: &str) -> Result<Client, String> {
+    build_client_with_ua(proxy, crate::tools::BROWSER_UA)
+}
+
+/// Client that presents a neutral tool UA (e.g. `Wget/x`). Some mirror
+/// anti-hotlinking guards bounce browser-like UAs in an endless 302 loop;
+/// a curl/wget-grade UA gets served normally.
+pub fn build_tool_client(proxy: &str) -> Result<Client, String> {
+    build_client_with_ua(proxy, crate::tools::TOOL_UA)
+}
+
+fn build_client_with_ua(proxy: &str, ua: &str) -> Result<Client, String> {
     let mut cb = Client::builder()
-        // A browser-like UA avoids per-client/CDN throttling (IDM does the same).
-        .user_agent(crate::tools::BROWSER_UA)
+        .user_agent(ua)
         // Small TTFB chunks: disable Nagle so range requests stream immediately.
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(15))
+        // Mirror/CDN chains can bounce 15+ hops; follow up to 20 redirects across
+        // hosts and schemes (https<->http) — same behaviour as IDM.
+        .redirect(reqwest::redirect::Policy::limited(20))
         // Keep a pooled connection per segment alive for retries/resume.
         .pool_max_idle_per_host(64);
     if !proxy.trim().is_empty() {
@@ -494,8 +507,9 @@ pub async fn start(
     limit: Arc<AtomicU64>,
 ) -> Result<Arc<Task>, String> {
     let base = PathBuf::from(save_path.trim());
+    let mut url = url;
 
-    let client = build_client(&opts.proxy)?;
+    let mut client = build_client(&opts.proxy)?;
 
     // Auto-login with any credential already saved for this host (Basic/Digest).
     let settings = crate::state::load_settings(&app);
@@ -504,18 +518,48 @@ pub async fn start(
         cred,
     });
 
-    let (probe, mut auth) = send_authorized(&client, &url, Some("bytes=0-0"), &mut auth)
-        .await
-        .map_err(|e| {
+    let probe = match send_authorized(&client, &url, Some("bytes=0-0"), &mut auth).await {
+        Ok((p, a)) => {
+            auth = a;
+            p
+        }
+        Err(e) if e.is_redirect() => {
+            // Mirror anti-hotlinking guards bounce browser-like UAs in an endless
+            // 302 loop (e.g. mirrors.nju.edu.cn redirects to itself); retry once
+            // with a neutral tool UA like IDM/wget do.
+            log_net_err(&e, "probe redirect-loop; retrying with tool UA");
+            client = build_tool_client(&opts.proxy)?;
+            let (p, a) = send_authorized(&client, &url, Some("bytes=0-0"), &mut auth)
+                .await
+                .map_err(|e2| {
+                    log_net_err(&e2, "probe failed");
+                    format!("Connection failed: {e2}")
+                })?;
+            auth = a;
+            p
+        }
+        Err(e) => {
             log_net_err(&e, "probe failed");
-            format!("Connection failed: {e}")
-        })?;
+            if e.is_redirect() {
+                eprintln!("[vortex-net] probe redirect root cause: {:?}", e.source());
+            }
+            return Err(format!("Connection failed: {e}"));
+        }
+    };
 
     let accept_ranges = probe
         .headers()
         .get(ACCEPT_RANGES)
         .and_then(|v| v.to_str().ok().map(|s| s.to_lowercase().contains("bytes")))
         .unwrap_or(false);
+
+    // Resolve every redirect once, then pin segment workers straight to the final
+    // host (mirrors/CDNs bounce a lot; replaying the chain per chunk is fragile).
+    let final_url = probe.url().to_string();
+    if final_url != url {
+        eprintln!("[vortex-net] url resolved: {url} -> {final_url}");
+        url = final_url;
+    }
 
     let got_206 = probe.status() == StatusCode::PARTIAL_CONTENT;
     let total = parse_total(&probe);
