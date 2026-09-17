@@ -27,9 +27,6 @@ export interface AuthRequiredPayload {
   host: string;
 }
 
-/** Set by app.ts to open the login dialog when a download needs credentials. */
-export let onAuthRequired: ((p: AuthRequiredPayload) => void) | null = null;
-
 export async function initApi() {
   if (events.length) return;
   events.push(
@@ -42,7 +39,7 @@ export async function initApi() {
     ),
     await listen("downloads-changed", () => store.refresh()),
     await listen<AuthRequiredPayload>("auth-required", (e) => {
-      onAuthRequired?.(e.payload);
+      api.onAuthRequired?.(e.payload);
     }),
   );
 }
@@ -103,6 +100,8 @@ export const api = {
   getWsToken: () => cmd<string>("get_ws_token"),
   windowAction: (action: "minimize" | "toggle" | "close" | "hide" | "show") =>
     cmd<void>("window_action", { action }),
+  /** Set by app.ts to open the login dialog when a download needs credentials. */
+  onAuthRequired: null as ((p: AuthRequiredPayload) => void) | null,
 };
 
 // ---- Lightweight reactive store ----
