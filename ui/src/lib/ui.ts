@@ -24,13 +24,20 @@ export function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
-export function openModal(html: () => string, onMounted?: (root: HTMLElement, close: () => void) => void): () => void {
+export function openModal(
+  html: () => string,
+  onMounted?: (root: HTMLElement, close: () => void) => void,
+  onClose?: () => void,
+): () => void {
   const root = document.getElementById("modal-root")!;
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   overlay.innerHTML = html();
   root.appendChild(overlay);
-  const close = () => overlay.remove();
+  const close = () => {
+    overlay.remove();
+    onClose?.();
+  };
   overlay.addEventListener("mousedown", (e) => {
     if (e.target === overlay) close();
   });

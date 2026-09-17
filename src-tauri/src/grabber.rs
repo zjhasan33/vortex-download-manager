@@ -271,3 +271,66 @@ pub async fn grab_site(
     files.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.filename.cmp(&b.filename)));
     Ok(files)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_links_basics() {
+        let html = r#"<a HREF="a.mp4">x</a><img src='b.webp'/><a href=noquote>c</a><a data-href="d.mp4">e</a>"#;
+        let links = extract_links(html);
+        assert!(links.contains(&"a.mp4".to_string()), "{links:?}");
+        assert!(links.contains(&"b.webp".to_string()), "{links:?}");
+        assert!(!links.iter().any(|l| l == "noquote"), "{links:?}");
+        assert!(!links.iter().any(|l| l == "d.mp4"), "{links:?}");
+    }
+
+    #[test]
+    fn ext_and_kind_cover_expected_types() {
+        assert_eq!(kind_of("mp4"), Some("video"));
+        assert_eq!(kind_of("mp3"), Some("audio"));
+        assert_eq!(kind_of("pdf"), Some("document"));
+        assert_eq!(kind_of("zip"), Some("archive"));
+        assert_eq!(kind_of("webp"), Some("image"));
+        assert_eq!(kind_of("html"), None);
+        assert_eq!(ext_of("http://x/f.AAC?a=1#h"), "aac");
+        assert_eq!(filename_of("http://x/a%20b.mp4"), "a b.mp4");
+    }
+
+    /// Live crawl against a localhost fixture (needs the `grabtest` server on
+    /// 127.0.0.1:8931; skipped quietly when it isn't running).
+    #[tokio::test]
+    async fn grab_fixture_page() {
+        let cancel = AtomicBool::new(false);
+        let probe = reqwest::Client::new()
+            .get("http://127.0.0.1:8931/index.html")
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await;
+        if probe.is_err() {
+            eprintln!("grabtest server not running — skipping");
+            return;
+        }
+        let items = grab_site(
+            "http://127.0.0.1:8931/index.html",
+            10,
+            vec!["video".into(), "audio".into(), "document".into(), "archive".into(), "image".into()],
+            &cancel,
+        )
+        .await
+        .expect("grab failed");
+        let urls: Vec<&str> = items.iter().map(|i| i.url.as_str()).collect();
+        for want in [
+            "http://127.0.0.1:8931/video.mp4",
+            "http://127.0.0.1:8931/song.MP3",
+            "http://127.0.0.1:8931/files/doc.pdf?token=abc#page=2",
+            "http://127.0.0.1:8931/pic.webp",
+            "http://127.0.0.1:8931/movie.webm",
+            "http://127.0.0.1:8931/deep.mp3",
+            "https://other.example.com/x.zip",
+        ] {
+            assert!(urls.contains(&want), "missing {want} in {urls:?}");
+        }
+    }
+}

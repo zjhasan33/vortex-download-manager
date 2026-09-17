@@ -115,6 +115,26 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
                     break;
                 }
 
+                // ---- Instant acknowledgment for long-running commands ----
+                // No probe / async work happens before this ack, so the extension
+                // popup (which races against a short timeout) always gets a reply
+                // within microseconds. dispatch() below keeps working in the
+                // background and emits events when the job really starts.
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let req = v.get("req").and_then(|r| r.as_str()).unwrap_or("");
+                    if matches!(
+                        typ,
+                        "download" | "start_download" | "start_ytdl" | "open_grabber"
+                    ) {
+                        let mut ack = json!({"type":"ack","ok":true,"success":true,"action":"accepted"});
+                        if !req.is_empty() {
+                            ack["req"] = json!(req);
+                        }
+                        let _ = write_frame(&mut stream, 0x1, ack.to_string().as_bytes()).await;
+                    }
+                }
+
                 let reply = dispatch(&app, &text).await;
                 let _ = write_frame(&mut stream, 0x1, reply.as_bytes()).await;
             }
@@ -244,8 +264,18 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let app2 = app.clone();
                         let mgr2 = mgr.clone();
                         let payload = p.clone();
+                        let url2 = url.clone();
                         tokio::spawn(async move {
-                            let _ = download_op(&app2, &mgr2, &payload).await;
+                            // Acknowledge already sent; surface any background failure
+                            // in the app UI so silent drop-ins never happen again.
+                            let res = download_op(&app2, &mgr2, &payload).await;
+                            let j: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
+                            if j.get("type").and_then(|t| t.as_str()) != Some("started") {
+                                let _ = app2.emit(
+                                    "dl-error",
+                                    json!({ "via": "extension", "url": url2, "error": j.get("error").cloned().unwrap_or(json!(res)) }),
+                                );
+                            }
                         });
                         json!({"type":"ack","ok":true,"success":true,"action":"download_started"}).to_string()
                     }
@@ -278,8 +308,16 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let sp = settings_path(app);
                         let app2 = app.clone();
                         let mgr2 = mgr.clone();
+                        let url2 = url.clone();
                         tokio::spawn(async move {
-                            let _ = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail).await;
+                            let res = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail).await;
+                            let j: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
+                            if j.get("type").and_then(|t| t.as_str()) != Some("started") {
+                                let _ = app2.emit(
+                                    "dl-error",
+                                    json!({ "via": "extension", "url": url2, "error": j.get("error").cloned().unwrap_or(json!(res)) }),
+                                );
+                            }
                         });
                         json!({"type":"ack","ok":true,"success":true,"action":"ytdl_started"}).to_string()
                     }

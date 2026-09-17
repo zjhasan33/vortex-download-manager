@@ -10,6 +10,7 @@ import type {
   Settings,
   AppStats,
 } from "../types";
+import { toast } from "./ui";
 
 export interface ProgressPayload {
   id: string;
@@ -41,6 +42,12 @@ export async function initApi() {
       (e) => store.updateStatus(e.payload),
     ),
     await listen("downloads-changed", () => store.refresh()),
+    await listen<{ via?: string; url?: string; error?: string }>("dl-error", (e) => {
+      const p = e.payload;
+      const err = typeof p?.error === "string" && p.error ? p.error : "unknown error";
+      toast(`Download failed to start (${p?.via || "extension"}): ${err}`, "err");
+      console.error("[dl-error]", p);
+    }),
     await listen<AuthRequiredPayload>("auth-required", (e) => {
       api.onAuthRequired?.(e.payload);
     }),

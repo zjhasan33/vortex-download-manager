@@ -64,7 +64,24 @@
   let fmtsOpen = false;
   let hbarSubFmt = "srt"; // standalone subtitle output format
   const HBAR_POS_KEY = "vx_hbar_pos";
+  const HBAR_OPACITY_KEY = "vx_hbar_opacity";
   let hbarPos = null; // {x, y} — last dragged position (persisted)
+  let hbarOpacity = 100; // hover bar opacity % (persisted, popup slider)
+  function applyHbarOpacity() {
+    const o = String(Math.min(100, Math.max(20, Number(hbarOpacity) || 100)) / 100);
+    if (hbar) hbar.style.opacity = o;
+    if (hbarFmts) hbarFmts.style.opacity = o;
+  }
+  browser.storage.local.get({ [HBAR_OPACITY_KEY]: 100 }).then((r) => {
+    hbarOpacity = r[HBAR_OPACITY_KEY];
+    applyHbarOpacity();
+  });
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[HBAR_OPACITY_KEY]) {
+      hbarOpacity = changes[HBAR_OPACITY_KEY].newValue;
+      applyHbarOpacity();
+    }
+  });
   let isDragging = false; // a drag is in progress: placeHbar() must not move the bar
   let dragOffsetX = 0; // grab offset so the bar doesn't jump to the cursor
   let dragOffsetY = 0;
@@ -371,6 +388,7 @@
     hbarFmts.addEventListener("pointerleave", () => hbarHide(350));
     hbarFmts.addEventListener("pointerdown", (e) => e.stopPropagation());
     document.documentElement.appendChild(hbarFmts);
+    applyHbarOpacity();
     document.addEventListener("pointerdown", (e) => {
       if (fmtsOpen && !hbarFmts.contains(e.target) && !hbar.contains(e.target)) hbarHide(0);
     });

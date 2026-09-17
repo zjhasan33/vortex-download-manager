@@ -249,6 +249,23 @@ $("subs-toggle").addEventListener("change", async (e) => {
   await browser.storage.local.set({ vx_subs_embed: !!e.target.checked });
 });
 
+// ---- Hover bar opacity (20–100%, DEFAULT: 100 = solid) ----
+function hbarOpacityLabel(v) {
+  $("hbar-opacity-val").textContent = v + "%";
+}
+(async () => {
+  const { vx_hbar_opacity } = await browser.storage.local.get({ vx_hbar_opacity: 100 });
+  const v = Math.min(100, Math.max(20, Number(vx_hbar_opacity) || 100));
+  $("hbar-opacity").value = v;
+  hbarOpacityLabel(v);
+})();
+
+$("hbar-opacity").addEventListener("input", async (e) => {
+  const v = Math.min(100, Math.max(20, Number(e.target.value) || 100));
+  hbarOpacityLabel(v);
+  await browser.storage.local.set({ vx_hbar_opacity: v });
+});
+
 // ---- Standalone subtitle download (.srt / .vtt only) ----
 let popSubFmt = "srt";
 function setSubFmt(f) {

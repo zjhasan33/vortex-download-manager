@@ -120,6 +120,67 @@ fn parse_progress(line: &str) -> Option<(f64, u64, u64)> {
     Some((pct, total, speed))
 }
 
+/// Parse a `--progress-template` line:
+///   `__VX_PROG__:<downloaded>:<total>:<speed>:<eta>`
+/// yt-dlp prints unresolvable fields as `NA`/`None`, speed may be a raw number
+/// or a human string (`2.39MiB/s`), and eta may be seconds or `MM:SS`/`HH:MM:SS`.
+/// Returns (downloaded, total, speed_bps, eta_secs); unparseable fields are 0.
+fn parse_progress_vx(line: &str) -> Option<(u64, u64, u64, u64)> {
+    let rest = line.strip_prefix("__VX_PROG__:")?;
+    // ETA itself may contain colons (MM:SS), so split off only the first 3 fields.
+    let mut it = rest.splitn(4, ':');
+    let nx = |s: &str| -> u64 {
+        let t = s.trim();
+        if t.is_empty() {
+            return 0;
+        }
+        if let Ok(v) = t.parse::<f64>() {
+            return v.max(0.0) as u64;
+        }
+        parse_size(t.trim_end_matches("/s"))
+    };
+    let downloaded = nx(it.next()?);
+    let total = nx(it.next().unwrap_or(""));
+    let speed = nx(it.next().unwrap_or(""));
+    let eta = parse_eta(it.next().unwrap_or(""));
+    Some((downloaded, total, speed, eta))
+}
+
+/// Parse an ETA that yt-dlp may render as seconds (`42`), `MM:SS`, or
+/// `HH:MM:SS`. Returns 0 for `NA`/`None`/empty.
+fn parse_eta(s: &str) -> u64 {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("na") || t.eq_ignore_ascii_case("none") {
+        return 0;
+    }
+    if !t.contains(':') {
+        return t.parse::<f64>().map(|v| v.max(0.0) as u64).unwrap_or(0);
+    }
+    let mut acc = 0u64;
+    for part in t.split(':') {
+        let v = part.trim().parse::<f64>().map(|v| v.max(0.0) as u64).unwrap_or(0);
+        acc = acc.saturating_mul(60).saturating_add(v);
+    }
+    acc
+}
+
+/// Whether the bundled yt-dlp supports `--progress-template` (added in 2023.05)
+/// and the `progress.downloaded_bytes` template fields (added in 2023.11).
+/// Checked fresh on every download: caching a negative result would permanently
+/// disable live progress for the whole session when the app starts before
+/// yt-dlp has been auto-downloaded on first run. One `--version` spawn per
+/// download is negligible.
+fn ytdlp_has_progress_template(app: &AppHandle) -> bool {
+    let Some(v) = tools::ytdlp_version(app) else {
+        return false;
+    };
+    let mut it = v.split('.');
+    let y: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let m: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let d: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    (y, m, d) >= (2023, 11, 1)
+}
+
 fn parse_size(s: &str) -> u64 {
     let (num, unit) = split_num_unit(s);
     (num * unit_mult(unit)) as u64
@@ -742,13 +803,12 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         "--progress-delta".into(),
         "0.2".into(),
         "--no-warnings".into(),
-        // Emit the real video title + resolved size on dedicated lines the
-        // moment the download starts (before_dl hook) so the row updates
-        // immediately instead of staying as "YouTube video".
-        "--print".into(),
-        "before_dl:__VX_TITLE__:%(title)s".into(),
-        "--print".into(),
-        "before_dl:__VX_SIZE__:%(filesize,filesize_approx)s".into(),
+        // NOTE: do NOT add `--print before_dl:…` here. Verified against
+        // yt-dlp 2026.08.19: any `--print` with a `before_dl` stage silences
+        // ALL progress output (both `[download]` lines and
+        // `--progress-template`), freezing the row at 0% until completion.
+        // Title resolves at completion; total arrives with the first progress
+        // line instead.
     ];
     if task.include_playlist {
         args.push("--yes-playlist".into());
@@ -782,6 +842,15 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         args.push("--convert-subs".into());
         args.push(sub_fmt);
     } else {
+        // Stream progress as raw numbers on dedicated lines instead of parsing
+        // fragile terminal strings (avoids the "0% for ages then 100%" jump).
+        if ytdlp_has_progress_template(&task.app) {
+            args.push("--progress-template".into());
+            args.push(
+                "download:__VX_PROG__:%(progress.downloaded_bytes)s:%(progress.total_bytes,progress.total_bytes_estimate)s:%(progress.speed)s:%(progress.eta)s"
+                    .into(),
+            );
+        }
         args.push("-N".into());
         args.push("16".into());
         if let Some((container, quality)) = &audio_fmt {
@@ -800,6 +869,10 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             args.push("mp4".into());
             args.push("-f".into());
             args.push(task.format_id.clone());
+            // Embed chapter markers + full metadata so VLC/players show chapters
+            // (described/scoreboard) for tutorials & long videos.
+            args.push("--embed-metadata".into());
+            args.push("--embed-chapters".into());
             // Auto-embed one official/manual subtitle track so the video is self-contained (IDM-like).
             // Auto-generated captions are always excluded.
             if task.embed_subs && !task.sub_langs.trim().is_empty() {
@@ -902,6 +975,12 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
 
     let mut stderr_tail: Vec<String> = Vec::new();
     let mut saw_progress = false;
+    let mut last_prog_emit = Instant::now() - Duration::from_millis(1000);
+    // Cumulative-progress bookkeeping across the multiple files of one job
+    // (e.g. separate video + audio streams that get merged).
+    let mut prog_base: u64 = 0;
+    let mut last_file_dl: u64 = 0;
+    let mut last_file_total: u64 = 0;
     for msg in rx {
         if task.cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -922,6 +1001,14 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             println!("[yt-dlp raw stdout] {line}");
         }
 
+        // ffmpeg merge / extract stage: no byte progress flows here, so flip the
+        // chip to "merging" instead of leaving the bar frozen at its last value.
+        if line.contains("[Merger]") || line.contains("[ExtractAudio]") {
+            if *task.status.read().unwrap() == DlStatus::Downloading {
+                task.set_status(DlStatus::Merging);
+            }
+        }
+
         if let Some(title) = line.strip_prefix("__VX_TITLE__:") {
             let t = title.trim().to_string();
             if !t.is_empty() {
@@ -938,6 +1025,47 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             if let Some(total) = parse_size_or_bytes(sz) {
                 task.total.store(total, Ordering::Relaxed);
                 let _ = task.app.emit("downloads-changed", ());
+            }
+        } else if let Some((dl, total, spd, eta)) = parse_progress_vx(&line) {
+            if dl > 0 || total > 0 {
+                saw_progress = true;
+            }
+            // Merged downloads (video+audio) report progress PER FILE with
+            // `downloaded_bytes` resetting to ~0 when the next file starts.
+            // Accumulate with a base offset so the bar climbs 0→100 across all
+            // files instead of jumping to 100% on the first file and clamping
+            // there (done > total) while the second file downloads.
+            if dl + 1024 < last_file_dl && last_file_total > 0 {
+                prog_base = prog_base.saturating_add(last_file_total);
+            }
+            last_file_dl = dl;
+            if total > 0 {
+                last_file_total = total;
+                task.total.store(prog_base.saturating_add(total), Ordering::Relaxed);
+            }
+            task.done.store(
+                prog_base.saturating_add(dl).max(task.done.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
+            if spd > 0 {
+                task.speed.store(spd, Ordering::Relaxed);
+            }
+            // Emit live progress right away (throttled) so the bar moves smoothly.
+            if Instant::now().duration_since(last_prog_emit) >= Duration::from_millis(200) {
+                last_prog_emit = Instant::now();
+                let d = task.done.load(Ordering::Relaxed);
+                let t = task.total.load(Ordering::Relaxed);
+                let _ = task.app.emit(
+                    "download-progress",
+                    serde_json::json!({
+                        "id": task.id,
+                        "downloaded": d,
+                        "total_size": t,
+                        "speed": task.speed.load(Ordering::Relaxed),
+                        "progress": if t > 0 { (d as f64 / t as f64 * 100.0).min(100.0) } else { 0.0 },
+                        "eta": eta,
+                    }),
+                );
             }
         } else if let Some((pct, total, speed)) = parse_progress(&line) {
             saw_progress = true;
@@ -1136,7 +1264,12 @@ pub async fn progress_watch(task: Arc<YtTask>) {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let now = task.done.load(Ordering::Relaxed);
         let speed = ((now.saturating_sub(last_done)) as f64 / last.elapsed().as_secs_f64().max(0.2)) as u64;
-        task.speed.store(speed, Ordering::Relaxed);
+        // Never overwrite a live template-reported speed with 0: when yt-dlp is
+        // in a merge/extract stage `done` doesn't move, but zeroing the speed
+        // is what froze the row at "0 B/s" between progress bursts.
+        if speed > 0 {
+            task.speed.store(speed, Ordering::Relaxed);
+        }
         last = Instant::now();
         last_done = now;
         let total = task.total.load(Ordering::Relaxed);

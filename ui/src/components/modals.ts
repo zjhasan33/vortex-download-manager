@@ -417,6 +417,7 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       <span style="color:var(--acc-1)">${icon("link", 18)}</span>
       <h3>Site Grabber</h3>
       <div class="spacer"></div>
+      <button class="x" id="gb-min" title="Minimize — watch downloads below">${icon("minimize", 16)}</button>
       <button class="x" data-close>${icon("close", 16)}</button>
     </div>
     <div class="modal-body">
@@ -466,6 +467,42 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+      // Minimize: hide the overlay so the download list below is visible and
+      // pausable/stoppable, keep all modal state alive in this closure, and
+      // show a floating chip to restore. The chip dies with the modal via the
+      // openModal onClose hook (covers X, Cancel and outside-click).
+      let chip: HTMLElement | null = null;
+      let submitted = 0;
+      let submitTotal = 0;
+      const chipLabel = () => {
+        if (submitting) return `Grabber — starting ${submitted}/${submitTotal}… (click to restore)`;
+        if (finding) return "Grabber — crawling… (click to restore)";
+        if (items.length) return `Grabber — ${items.length} file(s) (click to restore)`;
+        return "Grabber (click to restore)";
+      };
+      const syncChip = () => {
+        if (chip) chip.querySelector("span")!.textContent = chipLabel();
+      };
+      const minimize = () => {
+        if (chip) return;
+        root.style.display = "none";
+        chip = document.createElement("div");
+        chip.title = "Restore Site Grabber";
+        chip.style.cssText =
+          "position:fixed;right:18px;bottom:70px;z-index:110;display:flex;gap:8px;align-items:center;" +
+          "background:var(--bg-2);border:1px solid var(--border-strong);border-radius:12px;" +
+          "padding:10px 14px;font-size:12.5px;color:var(--text-2);cursor:pointer;box-shadow:var(--shadow)";
+        chip.innerHTML = `${icon("link", 14)}<span></span>`;
+        chip.onclick = () => {
+          chip?.remove();
+          chip = null;
+          root.style.display = "";
+        };
+        document.body.appendChild(chip);
+        syncChip();
+      };
+      root.querySelector<HTMLButtonElement>("#gb-min")!.onclick = minimize;
+
       const setFinding = (on: boolean) => {
         finding = on;
         find.disabled = on;
@@ -475,6 +512,7 @@ export function openGrabber(initialUrl = "", autoStart = false) {
           que.style.display = "none";
           go.style.display = "none";
         }
+        syncChip();
       };
 
       const renderList = () => {
@@ -507,11 +545,7 @@ export function openGrabber(initialUrl = "", autoStart = false) {
         const all = root.querySelector<HTMLInputElement>("#gb-all")!;
         all.checked = true;
         all.onchange = () => body.querySelectorAll<HTMLInputElement>("input[data-idx]").forEach((c) => (c.checked = all.checked));
-      };
-
-      root.querySelector<HTMLButtonElement>("#gb-cancel")!.onclick = () => {
-        if (finding) void api.grabStop();
-        close();
+        syncChip();
       };
 
       stop.onclick = () => {
@@ -553,25 +587,66 @@ export function openGrabber(initialUrl = "", autoStart = false) {
         e.key === "Enter" && root.querySelector<HTMLButtonElement>("#gb-find")!.click(),
       );
 
+      // Bulk submit stays controllable: the modal does NOT auto-close, the
+      // buttons show live progress, and Cancel turns into Stop so a 50-file
+      // storm can be halted mid-flight (remaining items are skipped; use the
+      // toolbar Stop for downloads that already started).
+      let submitting = false;
+      let stopSubmit = false;
+      const cancelBtn = root.querySelector<HTMLButtonElement>("#gb-cancel")!;
       const submit = async (paused: boolean) => {
+        if (submitting || finding) return;
         const checked = body.querySelectorAll<HTMLInputElement>("input[data-idx]:checked");
         if (!checked.length) return toast("Nothing selected", "err");
         const path = store.settings?.path ?? "";
         const segs = store.settings?.segments ?? 8;
+        submitting = true;
+        stopSubmit = false;
+        find.disabled = true;
+        que.style.display = "none";
+        go.style.display = "none";
+        cancelBtn.textContent = "Stop";
         let n = 0;
+        const total = checked.length;
+        submitTotal = total;
+        submitted = 0;
         for (const c of checked) {
+          if (stopSubmit) break;
           const it = items[Number(c.dataset.idx)];
           if (!it) continue;
+          cancelBtn.textContent = `Stop (${n}/${total})`;
           try {
             await api.startDownload(it.url, path, segs, it.filename, undefined, paused);
             n++;
           } catch { /* keep going */ }
+          submitted = n;
+          syncChip();
         }
-        toast(paused ? `${n} download(s) added — paused` : `${n} download(s) downloading`, "ok");
-        close();
+        submitting = false;
+        find.disabled = false;
+        que.style.display = "";
+        go.style.display = "";
+        cancelBtn.textContent = "Close";
+        if (stopSubmit) {
+          toast(`Stopped — ${n}/${total} started (toolbar Stop halts the rest)`, "info");
+        } else {
+          const cap = store.settings?.max_active ?? 5;
+          toast(paused ? `${n} download(s) added — paused` : `${n} queued — ${cap} at once, rest wait`, "ok");
+        }
       };
       que.onclick = () => void submit(true);
       go.onclick = () => void submit(false);
+      // Replaces the plain closer bound above: while submitting, Cancel acts
+      // as Stop for the remaining queue.
+      cancelBtn.onclick = () => {
+        if (submitting) {
+          stopSubmit = true;
+          cancelBtn.textContent = "Stopping…";
+          return;
+        }
+        if (finding) void api.grabStop();
+        close();
+      };
 
       setTimeout(() => urlInp.focus(), 50);
 
@@ -582,6 +657,11 @@ export function openGrabber(initialUrl = "", autoStart = false) {
           void startGrab();
         }, 120);
       }
+    },
+    () => {
+      // Modal truly gone (X / Cancel / outside-click): drop the minimize chip.
+      chip?.remove();
+      chip = null;
     },
   );
   void finding;

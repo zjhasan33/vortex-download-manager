@@ -244,7 +244,7 @@ pub struct StartOpts {
 
 impl Default for StartOpts {
     fn default() -> Self {
-        Self::new(8)
+        Self::new(16)
     }
 }
 
@@ -314,6 +314,11 @@ pub struct Task {
     done_flags: Mutex<Vec<bool>>,
     /// Which chunk each worker has currently claimed (for dynamic work-stealing).
     claimed: Mutex<Vec<bool>>,
+    /// Per-chunk dynamic split point (IDM-style straggler split). `u64::MAX` =
+    /// no split. When an idle worker steals the tail half of a slow chunk it
+    /// stores the cut byte here; the victim stops there, truncates its own part
+    /// file (it is the sole writer, so this is race-free) and finishes early.
+    split_at: Mutex<Vec<u64>>,
     /// Epoch ms when the download reached Completed (None until then).
     completed_at: Mutex<Option<u64>>,
 }
@@ -324,6 +329,55 @@ pub fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// Exponential backoff with ±25% jitter: 1s, 2s, 4s … capped at 30s.
+/// Jitter uses a nanos-seeded xorshift so simultaneous workers don't wake in
+/// lockstep and hammer a recovering server (no extra deps needed).
+fn retry_backoff(attempt: u64) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    let base_ms = 1000u64.saturating_mul(1 << shift).min(30_000);
+    let mut x = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0x9E3779B9)
+        .max(1);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    let pct = 75 + (x % 51) as u64; // 75..125
+    Duration::from_millis((base_ms * pct / 100).max(200))
+}
+
+/// Honor `Retry-After: <seconds>` (429/503) when present, clamped to 2 min.
+/// HTTP-date form is ignored (treated as absent).
+fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|n| n.min(120))
+}
+
+/// Statuses where retrying is pointless (wrong URL, gone, range unusable…).
+/// Everything else failed is treated as transient and retried with backoff.
+fn is_fatal_status(s: StatusCode) -> bool {
+    matches!(
+        s,
+        StatusCode::BAD_REQUEST
+            | StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::GONE
+            | StatusCode::RANGE_NOT_SATISFIABLE
+            | StatusCode::NOT_IMPLEMENTED
+    )
+}
+
+/// Give up on one chunk after this many consecutive reconnects without any
+/// forward progress (the round-level backoff then applies).
+const MAX_CHUNK_ATTEMPTS: u64 = 15;
+/// A connection that delivers zero bytes for this long is half-dead: drop it
+/// and reconnect from the cursor instead of hanging the tail forever.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Heuristic: is this URL likely a downloadable file (vs a plain webpage)?
 pub fn url_is_downloadable(url: &str) -> bool {
@@ -693,6 +747,7 @@ pub async fn start(
         segments: Mutex::new(segs),
         done_flags: Mutex::new(vec![false; num_segments]),
         claimed: Mutex::new(vec![false; num_segments]),
+        split_at: Mutex::new(vec![u64::MAX; num_segments]),
         num_segments,
         max_conns,
         live: AtomicUsize::new(0),
@@ -766,6 +821,7 @@ pub fn restore(
         segments: Mutex::new(segs),
         done_flags: Mutex::new(vec![false; num_segments]),
         claimed: Mutex::new(vec![false; num_segments]),
+        split_at: Mutex::new(vec![u64::MAX; num_segments]),
         completed_at: Mutex::new(view.completed_at),
     });
     Ok(task)
@@ -797,8 +853,10 @@ pub async fn run(task: Arc<Task>) {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             if task.cancel.load(Ordering::Relaxed) {
+                // Cancel keeps part files on purpose: Resume continues from
+                // the partial bytes instead of starting over (IDM behavior).
+                // Parts are deleted on Remove (delete_part) and on completion.
                 task.set_status(DlStatus::Cancelled);
-                cleanup_parts(task.clone());
                 return;
             }
         }
@@ -806,11 +864,12 @@ pub async fn run(task: Arc<Task>) {
 
     task.set_status(DlStatus::Downloading);
     let monitor = tokio::spawn(monitor_task(task.clone()));
+    let mut last_round_done = task.done.load(Ordering::Relaxed);
 
     loop {
         if task.cancel.load(Ordering::Relaxed) {
+            // Keep parts (see above): resume continues where this stopped.
             task.set_status(DlStatus::Cancelled);
-            cleanup_parts(task.clone());
             break;
         }
         if task.paused.load(Ordering::Relaxed) {
@@ -870,20 +929,31 @@ pub async fn run(task: Arc<Task>) {
             break;
         }
 
-        // Some chunk failed — retry after short backoff, capped by auto_retries.
+        // Forward progress forgives past failures: a 99%-done file must not
+        // die because of 3 transient blips in a row.
+        let round_done = task.done.load(Ordering::Relaxed);
+        if round_done > last_round_done {
+            task.retries.store(0, Ordering::Relaxed);
+        }
+        last_round_done = round_done;
+
+        // Some chunk failed — retry with exponential backoff + jitter, capped
+        // by auto_retries.
         let r = task.retries.fetch_add(1, Ordering::Relaxed) + 1;
-        if r > task.auto_retries as u64 {
+        if r > task.auto_retries.max(1) as u64 {
             task.set_error("Too many consecutive failures");
             task.set_status(DlStatus::Error);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(retry_backoff(r)).await;
     }
 
     monitor.abort();
 }
 
-/// A worker claims chunks one after another until the queue is empty.
+/// A worker claims chunks one after another until the queue is empty. When no
+/// free chunk is left it tries to steal the tail half of a slow chunk
+/// (IDM-style dynamic re-segmentation) instead of idling on the tail.
 async fn worker_loop(task: Arc<Task>) -> bool {
     loop {
         if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
@@ -891,7 +961,24 @@ async fn worker_loop(task: Arc<Task>) -> bool {
         }
         let (idx, seg) = match claim_chunk(&task) {
             Some(c) => c,
-            None => return true,
+            None => match try_steal(&task) {
+                Some(c) => c,
+                // A slow tail may develop *after* we looked: while sibling
+                // workers are still busy, wait and look again instead of
+                // exiting and leaving one connection to crawl alone. Always
+                // re-check completion first, otherwise idle workers keep each
+                // other's `live` count above 1 and nobody ever exits.
+                None => {
+                    if all_chunks_done(&task) {
+                        return true;
+                    }
+                    if task.live.load(Ordering::Relaxed) > 1 {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    return true;
+                }
+            },
         };
         if !download_segment(task.clone(), seg, idx).await {
             return false;
@@ -916,6 +1003,110 @@ fn claim_chunk(task: &Task) -> Option<(usize, Segment)> {
     None
 }
 
+/// Minimum remaining bytes on a victim chunk worth splitting (each half stays
+/// >= 1 MB so the extra connection + part file actually pay off).
+const MIN_SPLIT_REMAINING: u64 = 2 * 1024 * 1024;
+
+/// Pure cut-point math for a straggler split: victim `[vstart..=vend]` has
+/// `written` bytes on disk. Returns the last byte the victim keeps; the
+/// stealer takes `[cut+1..=vend]`. `None` when there is nothing worth
+/// stealing (too little left, degenerate range, or already complete).
+/// The two halves always partition the original range exactly once.
+fn split_cut(vstart: u64, vend: u64, written: u64) -> Option<u64> {
+    if vend < vstart {
+        return None;
+    }
+    let total = vend - vstart + 1;
+    let have = written.min(total);
+    let remaining = total - have;
+    if remaining < MIN_SPLIT_REMAINING {
+        return None;
+    }
+    let done_upto = vstart + have;
+    if done_upto > vend {
+        return None;
+    }
+    let cut = done_upto + (vend - done_upto) / 2;
+    if cut <= done_upto || cut >= vend {
+        return None;
+    }
+    Some(cut)
+}
+
+/// Steal the tail half of the slowest in-progress chunk. Returns the new chunk
+/// already claimed by the caller. The victim observes the cut via `split_at`,
+/// stops there and truncates its own part file, so byte ranges never overlap
+/// and the final merge stays exact.
+fn try_steal(task: &Task) -> Option<(usize, Segment)> {
+    // Pointless (and pure overhead) with a single live worker — there is
+    // nobody to help, and "stealing from yourself" only adds part files.
+    if task.live.load(Ordering::Relaxed) < 2 {
+        return None;
+    }
+    // Lock order everywhere: segments -> done_flags -> claimed -> split_at.
+    let mut segs = task.segments.lock().unwrap();
+    let mut done_flags = task.done_flags.lock().unwrap();
+    let mut claimed = task.claimed.lock().unwrap();
+    let mut split_at = task.split_at.lock().unwrap();
+
+    // Slowest = largest remaining. Skip finished, unclaimed (claim_chunk's job),
+    // unbounded single-stream, already-splitting, and too-small chunks.
+    let mut victim: Option<(usize, u64)> = None; // (idx, remaining)
+    for (i, seg) in segs.iter().enumerate() {
+        if done_flags.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        if !claimed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        if seg.end == u64::MAX {
+            continue;
+        }
+        if split_at.get(i).copied().unwrap_or(0) != u64::MAX {
+            continue;
+        }
+        let written = seg.part.metadata().map(|m| m.len()).unwrap_or(0);
+        let have = written.min(seg.end - seg.start + 1);
+        let remaining = (seg.end - seg.start + 1) - have;
+        if remaining < MIN_SPLIT_REMAINING {
+            continue;
+        }
+        if victim.map(|(_, r)| remaining > r).unwrap_or(true) {
+            victim = Some((i, remaining));
+        }
+    }
+    let (idx, _) = victim?;
+
+    // Cut in the middle of the *remaining* work, not the original range, so a
+    // nearly-stalled victim hands over close to half of what's actually left.
+    let vstart = segs[idx].start;
+    let vend = segs[idx].end;
+    // Re-read: the victim kept downloading since the scan above.
+    let written = segs[idx].part.metadata().map(|m| m.len()).unwrap_or(0);
+    let cut = match split_cut(vstart, vend, written) {
+        Some(c) => c,
+        None => return None,
+    };
+
+    let new_idx = segs.len();
+    let new_seg = Segment {
+        start: cut + 1,
+        end: vend,
+        part: part_of(&task.save_path, new_idx),
+    };
+    // Shrink the victim first so every later `segment_done` check uses the cut
+    // range; the victim truncates its own part file when it observes `split_at`.
+    // All four vecs are extended while the locks are held so no other thread
+    // ever observes mismatched lengths.
+    segs[idx].end = cut;
+    segs.push(new_seg.clone());
+    done_flags.push(false);
+    claimed.push(true);
+    split_at[idx] = cut;
+    split_at.push(u64::MAX);
+    Some((new_idx, new_seg))
+}
+
 /// Mark finished chunks as taken; leave failed/partial chunks claimable again.
 fn reset_claims(task: &Task) {
     let segs = task.segments.lock().unwrap();
@@ -934,26 +1125,47 @@ fn all_chunks_done(task: &Task) -> bool {
 
 fn finalize(task: &Arc<Task>) {
     task.set_status(DlStatus::Merging);
+    let mut parts: Vec<PathBuf> = {
+        let mut segs = task.segments.lock().unwrap().clone();
+        segs.retain(|s| s.end != u64::MAX);
+        segs.sort_by_key(|s| s.start);
+        segs.into_iter().map(|s| s.part).collect()
+    };
+    if parts.is_empty() {
+        parts = vec![part_of(&task.save_path, 0)];
+    }
+    // Fast path: a single part IS the file — atomic rename instead of a full
+    // read+write copy pass. This halves disk I/O for small/single-connection
+    // downloads (no double write) and finishes instantly.
+    if parts.len() == 1 {
+        let moved = fs::rename(&parts[0], &task.save_path).is_ok() || copy_one(&parts[0], &task.save_path);
+        if moved {
+            // rename already removed the part; copy fallback leaves it behind.
+            let _ = fs::remove_file(&parts[0]);
+            finish_ok(task);
+        } else {
+            task.set_error("Failed to merge parts");
+            task.set_status(DlStatus::Error);
+        }
+        return;
+    }
     let out = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(&task.save_path);
     if let Ok(mut f) = out {
-        let mut ok = true;
-        let mut parts: Vec<PathBuf> = {
-            let mut segs = task.segments.lock().unwrap().clone();
-            segs.retain(|s| s.end != u64::MAX);
-            segs.sort_by_key(|s| s.start);
-            segs.into_iter().map(|s| s.part).collect()
-        };
-        if parts.is_empty() {
-            parts = vec![part_of(&task.save_path, 0)];
+        // Preallocate the final size up front: one contiguous allocation
+        // instead of fragmentation from incremental growth.
+        let total = task.total.load(Ordering::Relaxed);
+        if total > 0 {
+            let _ = f.set_len(total);
         }
+        let mut ok = true;
         for p in &parts {
             match fs::File::open(p) {
                 Ok(src) => {
-                    let mut r = std::io::BufReader::with_capacity(1024 * 1024, src);
+                    let mut r = std::io::BufReader::with_capacity(4 * 1024 * 1024, src);
                     if std::io::copy(&mut r, &mut f).is_err() {
                         ok = false;
                         break;
@@ -966,15 +1178,36 @@ fn finalize(task: &Arc<Task>) {
         drop(f);
         if ok {
             cleanup_parts(task.clone());
-            let sz = fs::metadata(&task.save_path).map(|m| m.len()).unwrap_or(0);
-            task.total.store(sz.max(task.total.load(Ordering::Relaxed)), Ordering::Relaxed);
-            task.done.store(sz, Ordering::Relaxed);
-            task.set_status(DlStatus::Completed);
+            finish_ok(task);
         } else {
             task.set_error("Failed to merge parts");
             task.set_status(DlStatus::Error);
         }
     }
+}
+
+/// Copy a single part to the destination (fallback when rename can't work,
+/// e.g. across volumes). Returns success.
+fn copy_one(src: &Path, dst: &Path) -> bool {
+    let out = OpenOptions::new().create(true).truncate(true).write(true).open(dst);
+    if let (Ok(s), Ok(mut d)) = (fs::File::open(src), out) {
+        let mut r = std::io::BufReader::with_capacity(4 * 1024 * 1024, s);
+        if std::io::copy(&mut r, &mut d).is_ok() {
+            let _ = d.flush();
+            return true;
+        }
+    }
+    false
+}
+
+/// Record successful completion: drop part files and pin counters to the real
+/// on-disk size.
+fn finish_ok(task: &Arc<Task>) {
+    cleanup_parts(task.clone());
+    let sz = fs::metadata(&task.save_path).map(|m| m.len()).unwrap_or(0);
+    task.total.store(sz.max(task.total.load(Ordering::Relaxed)), Ordering::Relaxed);
+    task.done.store(sz, Ordering::Relaxed);
+    task.set_status(DlStatus::Completed);
 }
 
 fn segment_done(task: &Task, seg: &Segment, idx: usize) -> bool {
@@ -1011,6 +1244,11 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
         Err(_) => return false,
     };
     let offset = std_file.metadata().map(|m| m.len()).unwrap_or(0);
+    // NOTE: no set_len preallocation here on purpose. Part-file length IS the
+    // resume/progress signal (`segment_done`, `done0`), and this handle writes
+    // in append mode — growing the file early would fake completion and
+    // misplace every later append. Contiguity is handled instead by the
+    // preallocated final file in `finalize` (Step 3).
     // Buffered async writes: flush in ~1 MB batches instead of one disk syscall
     // per network chunk (this is a major throughput win on both HDD and SSD).
     let mut file = tokio::io::BufWriter::with_capacity(1024 * 1024, tokio::fs::File::from_std(std_file));
@@ -1028,6 +1266,8 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
     let client = task.client.clone();
     let mut last_throttle = Instant::now();
     let mut throttle_bytes = 0u64;
+    // Consecutive reconnects without forward progress (reset on any bytes).
+    let mut attempts: u64 = 0;
 
     while !task.cancel.load(Ordering::Relaxed) && !task.paused.load(Ordering::Relaxed) {
         let range = if seg.end == u64::MAX {
@@ -1040,7 +1280,12 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             Ok(v) => v,
             Err(e) => {
                 log_net_err(&e, &format!("segment {idx} send"));
-                tokio::time::sleep(Duration::from_millis(900)).await;
+                attempts += 1;
+                if attempts > MAX_CHUNK_ATTEMPTS {
+                    task.set_error(&format!("Connection failed ({attempts} tries): {e}"));
+                    return false;
+                }
+                tokio::time::sleep(retry_backoff(attempts)).await;
                 continue;
             }
         };
@@ -1050,6 +1295,39 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             || (status == StatusCode::FORBIDDEN && challenge_of(&resp).is_some())
         {
             flag_needs_auth(&task);
+            return false;
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            // Transient: rate limit / wobbly mirror. Honor Retry-After, else
+            // back off; the chunk resumes from the cursor afterwards.
+            attempts += 1;
+            if attempts > MAX_CHUNK_ATTEMPTS {
+                task.set_error(&format!("HTTP {} (server keeps failing)", status.as_u16()));
+                return false;
+            }
+            let wait = retry_after_secs(&resp)
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| retry_backoff(attempts));
+            eprintln!("[vortex-net] segment {idx}: HTTP {} — waiting {}s", status.as_u16(), wait.as_secs());
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            // Cursor is at/past EOF: if the part already holds the full range,
+            // the chunk is done; otherwise fail so the round re-examines it.
+            let expected = seg.end - seg.start + 1;
+            if seg.end != u64::MAX
+                && seg.part.metadata().map(|m| m.len()).unwrap_or(0) >= expected
+            {
+                mark_done(&task, idx);
+                return true;
+            }
+            task.set_error("HTTP 416 (range past end of file)");
+            return false;
+        }
+        if is_fatal_status(status) {
+            // Retrying a 404/410/etc. is pointless — fail fast with the code.
+            task.set_error(&format!("HTTP {} (not retryable)", status.as_u16()));
             return false;
         }
         if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
@@ -1064,21 +1342,79 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
 
         let mut stream = resp.bytes_stream();
         let mut dropped = false;
-        while let Some(chunk) = stream.next().await {
+        loop {
+            // Stall guard: a half-dead connection that delivers zero bytes for
+            // STALL_TIMEOUT gets dropped and reconnected from the cursor.
+            let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("[vortex-net] segment {idx}: stalled, reconnecting at {cursor}");
+                    dropped = true;
+                    break;
+                }
+            };
+            let Some(chunk) = chunk else { break };
             match chunk {
                 Ok(c) => {
                     if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
                         break;
                     }
+                    if c.is_empty() {
+                        continue;
+                    }
                     if file.write_all(&c).await.is_err() {
                         let _ = file.flush().await;
                         return false;
                     }
+                    attempts = 0;
                     task.done.fetch_add(c.len() as u64, Ordering::Relaxed);
                     cursor += c.len() as u64;
 
                     if seg.end != u64::MAX && cursor >= seg.end + 1 {
                         break;
+                    }
+
+                    // Straggler split: an idle worker cut this chunk at `cut`
+                    // and took the tail. Stop here, drop the bytes past the
+                    // cut (re-downloaded by the stealer) and finish early so
+                    // the tail no longer blocks completion.
+                    let cut = task.split_at.lock().unwrap().get(idx).copied().unwrap_or(u64::MAX);
+                    if cut != u64::MAX && cut >= seg.start && cursor >= cut.saturating_add(1) {
+                        let want = cut - seg.start + 1;
+                        let _ = file.flush().await;
+                        // Truncate via a fresh handle: this task is the sole
+                        // writer of its part file, so shrink-to-`want` is exact.
+                        // Only finish early when the part is exactly `want`
+                        // afterwards — otherwise leave the chunk unfinished so
+                        // it gets re-downloaded instead of merged corrupt.
+                        let have = seg.part.metadata().map(|m| m.len()).unwrap_or(0);
+                        if have == want {
+                            mark_done(&task, idx);
+                            let _ = file.flush().await;
+                            return true;
+                        }
+                        if have > want {
+                            let cut_ok = std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&seg.part)
+                                .and_then(|f| f.set_len(want))
+                                .is_ok();
+                            let _ = file.flush().await;
+                            if cut_ok {
+                                task.done.fetch_sub(have - want, Ordering::Relaxed);
+                                mark_done(&task, idx);
+                                return true;
+                            }
+                            // Truncate failed with an overlong part: delete it
+                            // and fail the round so the shrunk range is
+                            // re-downloaded cleanly instead of merged corrupt.
+                            let _ = std::fs::remove_file(&seg.part);
+                            return false;
+                        }
+                        // Behind the cut (part shorter than `want`): keep the
+                        // partial bytes and fail softly; the next round resumes
+                        // from `have` and stops at the cut.
+                        return false;
                     }
 
                     if per_conn > 0 {
@@ -1109,8 +1445,15 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             mark_done(&task, idx);
             return true;
         }
-        // Connection dropped before finishing this segment — restart range from cursor.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Connection dropped/stall before finishing this segment — restart
+        // the range from the cursor with backoff. No bytes flowed, so the
+        // per-chunk attempt budget grows; it resets on any received bytes.
+        attempts += 1;
+        if attempts > MAX_CHUNK_ATTEMPTS {
+            task.set_error("Connection keeps dropping (chunk gave up)");
+            return false;
+        }
+        tokio::time::sleep(retry_backoff(attempts)).await;
     }
 
     true
@@ -1190,5 +1533,83 @@ fn part_of(save: &Path, index: usize) -> PathBuf {
 fn cleanup_parts(task: Arc<Task>) {
     for s in task.segments.lock().unwrap().iter() {
         let _ = fs::remove_file(&s.part);
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    #[test]
+    fn split_cut_partitions_exactly() {
+        // (vstart, vend, written) — union of [vstart..cut] + [cut+1..vend]
+        // must equal [vstart..vend], both halves >= 1 MB.
+        for (vs, ve, w) in [
+            (0u64, 32 * 1024 * 1024 - 1, 0u64),
+            (0, 32 * 1024 * 1024 - 1, 16 * 1024 * 1024),
+            (0, 32 * 1024 * 1024 - 1, 29 * 1024 * 1024),
+            (100 * 1024 * 1024, 132 * 1024 * 1024 - 1, 5 * 1024 * 1024),
+            (0, 4 * 1024 * 1024 - 1, 2 * 1024 * 1024),
+        ] {
+            let cut = split_cut(vs, ve, w).expect("should split");
+            assert!(cut >= vs && cut < ve);
+            assert_eq!((cut - vs + 1) + (ve - cut), ve - vs + 1);
+            assert!(ve - cut >= 1024 * 1024, "steal half too small");
+        }
+    }
+
+    #[test]
+    fn split_cut_refuses_gracefully() {
+        // Too little left.
+        assert!(split_cut(0, 32 * 1024 * 1024 - 1, 31 * 1024 * 1024).is_none());
+        // Degenerate / tiny ranges never panic.
+        assert!(split_cut(0, 0, 0).is_none());
+        assert!(split_cut(0, 100, 0).is_none());
+        assert!(split_cut(5, 4, 0).is_none());
+        // Complete chunk.
+        assert!(split_cut(0, 1024 * 1024 * 8, 1024 * 1024 * 8).is_none());
+        // written past the end (stale metadata) is clamped, not panicking.
+        assert!(split_cut(0, 8 * 1024 * 1024, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        let ms = |a: u64| retry_backoff(a).as_millis() as u64;
+        let bases = [1000u64, 2000, 4000, 8000, 16000, 30000, 30000];
+        for (i, base) in bases.iter().enumerate() {
+            for _ in 0..10 {
+                let m = ms(i as u64 + 1);
+                assert!(m >= base * 75 / 100 && m <= base * 125 / 100 + 1, "a={} m={m}", i + 1);
+            }
+        }
+        assert!(ms(0) >= 750); // saturating attempt arithmetic
+        assert!(ms(u64::MAX) <= 30000 * 125 / 100 + 1); // no shift overflow
+    }
+
+    #[test]
+    fn fatal_status_table() {
+        for code in [400u16, 404, 405, 410, 416, 501] {
+            assert!(is_fatal_status(StatusCode::from_u16(code).unwrap()), "{code} should be fatal");
+        }
+        for code in [200u16, 206, 403, 408, 429, 500, 502, 503] {
+            assert!(!is_fatal_status(StatusCode::from_u16(code).unwrap()), "{code} should be transient");
+        }
+    }
+
+    #[test]
+    fn split_range_tiles_without_gaps() {
+        // Steps 1+3 interplay: whatever split_range emits, chained splits +
+        // merge must cover every byte exactly once.
+        let dir = std::env::temp_dir();
+        for total in [1u64, 1024, 1024 * 1024, 40 * 1024 * 1024 + 7, 1024 * 1024 * 1024] {
+            let chunks = split_range(total, 8, &dir.join("probe.bin"));
+            assert!(!chunks.is_empty());
+            let mut cursor = 0u64;
+            for c in &chunks {
+                assert_eq!(c.start, cursor, "gap/overlap at total={total}");
+                cursor = c.end + 1;
+            }
+            assert_eq!(cursor, total, "tail loss at total={total}");
+        }
     }
 }

@@ -84,9 +84,22 @@ async function connectAsync() {
   const sock = new WebSocket(WS_ADDR);
   ws = sock;
   await new Promise((resolve, reject) => {
-    sock.onopen = () => resolve();
-    sock.onerror = reject;
-    sock.onclose = () => reject(new Error("closed"));
+    // Fail fast instead of hanging forever: a silent OS-level drop of the SYN
+    // used to make rpc() never settle, which surfaced as
+    // "No response from Vortex bridge (timed out)" in the popup.
+    const t = setTimeout(() => reject(new Error("Vortex bridge not listening")), 4000);
+    sock.onopen = () => {
+      clearTimeout(t);
+      resolve();
+    };
+    sock.onerror = () => {
+      clearTimeout(t);
+      reject(new Error("closed"));
+    };
+    sock.onclose = () => {
+      clearTimeout(t);
+      reject(new Error("closed"));
+    };
   });
 
   // ---- Authenticate with the desktop token (pairing key) ----
@@ -588,14 +601,19 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "download_media") {
     const url = msg.url || "";
-    return safeRespond(sendResponse, async () => {
-      if (url.startsWith("blob:") || isMediaSite(pageUrl)) {
-        if (online) return { ...(await handleAnalyze(pageUrl)), action: "analyze" };
-        await launchVortex("capture", { url: pageUrl, via: "yt" });
-        return { ok: false, action: "analyze", launched: true, title };
-      }
-      return handleStart({ type: "direct", url, filename: msg.filename, pageUrl });
-    });
+    // yt-dlp info probing can take 20-30s on slow/long pages — allow it.
+    return safeRespond(
+      sendResponse,
+      async () => {
+        if (url.startsWith("blob:") || isMediaSite(pageUrl)) {
+          if (online) return { ...(await handleAnalyze(pageUrl)), action: "analyze" };
+          await launchVortex("capture", { url: pageUrl, via: "yt" });
+          return { ok: false, action: "analyze", launched: true, title };
+        }
+        return handleStart({ type: "direct", url, filename: msg.filename, pageUrl });
+      },
+      30000
+    );
   }
 
   if (msg.type === "download_direct") {
@@ -609,7 +627,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "analyze") {
-    return safeRespond(sendResponse, () => handleAnalyze(msg.url, sender.tab));
+    return safeRespond(sendResponse, () => handleAnalyze(msg.url, sender.tab), 30000);
   }
 
   if (msg.type === "start_ytdl") {

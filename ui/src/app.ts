@@ -148,6 +148,7 @@ export class VortexApp {
       <div class="divider"></div>
       <button class="tbtn" id="tb-pause" ${active ? "" : "disabled"}>${icon("pause", 15)} Pause</button>
       <button class="tbtn" id="tb-resume" ${active ? "" : "disabled"}>${icon("play", 15)} Resume</button>
+      <button class="tbtn danger" id="tb-stop" ${active ? "" : "disabled"}>${icon("stop", 15)} Stop</button>
       <button class="tbtn" id="tb-retry">${icon("sync", 15)} Retry all</button>
       <div class="divider"></div>
       <button class="tbtn" id="tb-import">${icon("file", 15)} Import</button>
@@ -318,10 +319,10 @@ export class VortexApp {
       status: `<div class="dl-status"><span class="chip ${d.status}">${STATUS_LABEL[d.status]}${d.status === "error" && d.error ? ` • ${esc(d.error.slice(0, 28))}` : ""}</span></div>`,
       actions: `
         <div class="dl-actions">
-          ${d.status === "downloading" || d.status === "queued" ? `<button data-act="pause" data-id="${d.id}" title="Pause">${icon("pause", 15)}</button>` : d.status === "paused" ? `<button data-act="resume" data-id="${d.id}" title="Resume">${icon("play", 15)}</button>` : ""}
+          ${d.status === "downloading" || d.status === "queued" ? `<button data-act="pause" data-id="${d.id}" title="Pause">${icon("pause", 15)}</button>` : d.status === "paused" ? `<button data-act="resume" data-id="${d.id}" title="Resume">${icon("play", 15)}</button>` : ""}${d.status === "downloading" || d.status === "queued" || d.status === "paused" || d.status === "merging" ? `<button data-act="stop" data-id="${d.id}" title="Stop (keeps partial progress)">${icon("stop", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="folder" data-id="${d.id}" title="Show in folder">${icon("folder", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="open" data-id="${d.id}" title="Open file">${icon("play", 15)}</button>` : ""}
-          ${d.status === "completed" || d.status === "error" || d.status === "cancelled" || d.status === "needs_auth" ? `<button data-act="reload" data-id="${d.id}" title="Download again">${icon("redo", 15)}</button>` : ""}
+          ${d.source !== "youtube" && (d.status === "error" || d.status === "cancelled") ? `<button data-act="resume" data-id="${d.id}" title="Resume from partial progress">${icon("play", 15)}</button>` : ""}${d.status === "completed" || d.status === "needs_auth" || (d.source === "youtube" && (d.status === "error" || d.status === "cancelled")) ? `<button data-act="reload" data-id="${d.id}" title="Download again">${icon("redo", 15)}</button>` : ""}
           <button data-act="cancel" data-id="${d.id}" title="Remove">${icon("trash", 15)}</button>
         </div>`,
     };
@@ -452,8 +453,10 @@ export class VortexApp {
     const active = this.activeCount();
     const pa = this.root.querySelector<HTMLButtonElement>("#tb-pause");
     const re = this.root.querySelector<HTMLButtonElement>("#tb-resume");
+    const st = this.root.querySelector<HTMLButtonElement>("#tb-stop");
     if (pa) pa.disabled = !active;
     if (re) re.disabled = !active;
+    if (st) st.disabled = !active;
     // Emergency batch bar: visible whenever more than one download is live.
     const bat = this.root.querySelector<HTMLElement>("#batch-bar");
     const bcount = this.root.querySelector<HTMLElement>("#batch-active-count");
@@ -566,6 +569,12 @@ export class VortexApp {
         const n = await api.resumeAllDownloads();
         toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");
       };
+      const stop = this.root.querySelector<HTMLButtonElement>("#tb-stop");
+      if (stop) stop.onclick = async () => {
+        const n = await api.cancelAllActive();
+        toast(n ? `Stopped ${n} download(s)` : "Nothing active", n ? "ok" : "info");
+        await store.refresh();
+      };
       // Emergency batch bar actions (pause/resume/cancel everything at once).
       const bpause = this.root.querySelector<HTMLButtonElement>("#btn-batch-pause");
       const bresume = this.root.querySelector<HTMLButtonElement>("#btn-batch-resume");
@@ -642,21 +651,28 @@ export class VortexApp {
         if (!d) return;
         if (act === "pause") void api.pauseDownload(id);
         else if (act === "resume") void api.resumeDownload(id);
+        else if (act === "stop") void api.cancelDownload(id).then(() => store.refresh());
         else if (act === "folder") void api.openFolder(d.save_path);
         else if (act === "open") void api.openFile(d.save_path);
         else if (act === "reload") {
-          if (d.source === "youtube") {
-            const path = store.settings?.path || "";
-            if (d.format_id) {
-              void api.startYtdl(d.url, d.format_id, path, false, undefined);
+          if (d.source === "youtube" || d.status === "completed") {
+            if (d.source === "youtube") {
+              const path = store.settings?.path || "";
+              if (d.format_id) {
+                void api.startYtdl(d.url, d.format_id, path, false, undefined);
+              } else {
+                void api.fetchYtdlInfo(d.url).then((info) => {
+                  const best = info.formats.find((f) => f.note?.includes("Best")) ?? info.formats[0];
+                  if (best) return api.startYtdl(d.url, best.id, path, false, undefined);
+                });
+              }
             } else {
-              void api.fetchYtdlInfo(d.url).then((info) => {
-                const best = info.formats.find((f) => f.note?.includes("Best")) ?? info.formats[0];
-                if (best) return api.startYtdl(d.url, best.id, path, false, undefined);
-              });
+              void api.startDownload(d.url, store.settings?.path || "", store.settings?.segments ?? 8);
             }
           } else {
-            void api.startDownload(d.url, store.settings?.path || "", store.settings?.segments ?? 8);
+            // HTTP error/cancelled: resume the SAME task so kept part files
+            // continue instead of downloading from zero.
+            void api.resumeDownload(id);
           }
         } else if (act === "cancel") {
           if (d.status === "completed") {

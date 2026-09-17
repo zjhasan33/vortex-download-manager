@@ -310,7 +310,20 @@ async fn remove_credential(
 async fn resume_download(state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
     let m = state.http.lock().unwrap();
     if let Some(t) = m.get(&id) {
+        // Never double-run an already live task (two loops would corrupt).
+        let st = *t.status.read().unwrap();
+        if matches!(
+            st,
+            crate::download::DlStatus::Downloading | crate::download::DlStatus::Merging
+        ) {
+            return Ok(());
+        }
+        // Clear BOTH flags so resume works after pause AND after cancel/error:
+        // part files were kept, so the task continues from partial bytes.
+        t.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         t.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+        *t.error.lock().unwrap() = None;
+        *t.status.write().unwrap() = crate::download::DlStatus::Queued;
         let c = t.clone();
         drop(m);
         state.run_http(c);
@@ -375,12 +388,21 @@ async fn pause_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlManag
 
 #[tauri::command]
 async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
-    // Cancel: stop download but keep entry in history as cancelled
+    // Cancel: stop download but keep entry + part files so Resume continues
+    // from partial bytes. Idle (paused/queued) tasks flip to Cancelled right
+    // away; running ones transition via their run loop.
     let should_emit = {
         let m = state.http.lock().unwrap();
         if let Some(t) = m.get(&id) {
             t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             t.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+            let st = *t.status.read().unwrap();
+            if !matches!(
+                st,
+                crate::download::DlStatus::Downloading | crate::download::DlStatus::Merging
+            ) {
+                *t.status.write().unwrap() = crate::download::DlStatus::Cancelled;
+            }
             true
         } else {
             drop(m);
