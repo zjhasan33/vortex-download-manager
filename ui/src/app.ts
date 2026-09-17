@@ -189,6 +189,14 @@ export class VortexApp {
   private mainPanel() {
     return `
     <div class="main">
+      <div class="batch-emergency-bar" id="batch-bar">
+        <span class="batch-msg">⚡ Batch in progress: <strong id="batch-active-count">0</strong> files</span>
+        <div class="batch-actions">
+          <button id="btn-batch-pause" class="btn-warning">⏸ Pause All</button>
+          <button id="btn-batch-resume" class="btn-secondary">▶ Resume All</button>
+          <button id="btn-batch-cancel" class="btn-danger">⏹ Stop &amp; Cancel All</button>
+        </div>
+      </div>
       <div class="list-head">
         <label class="dl-check"><input type="checkbox" id="check-all" title="Select all" /></label>
         <span data-sort="name" class="dl-sorthdr" title="Sort by file name">File<span class="dl-dir"></span></span>
@@ -446,6 +454,13 @@ export class VortexApp {
     const re = this.root.querySelector<HTMLButtonElement>("#tb-resume");
     if (pa) pa.disabled = !active;
     if (re) re.disabled = !active;
+    // Emergency batch bar: visible whenever more than one download is live.
+    const bat = this.root.querySelector<HTMLElement>("#batch-bar");
+    const bcount = this.root.querySelector<HTMLElement>("#batch-active-count");
+    if (bat && bcount) {
+      bcount.textContent = String(active);
+      bat.classList.toggle("show", active > 1);
+    }
     const failed = store.downloads.filter((d) => d.status === "error" || d.status === "cancelled").length;
     const rt = this.root.querySelector<HTMLButtonElement>("#tb-retry");
     if (rt) rt.disabled = !failed;
@@ -551,6 +566,26 @@ export class VortexApp {
         const n = await api.resumeAllDownloads();
         toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");
       };
+      // Emergency batch bar actions (pause/resume/cancel everything at once).
+      const bpause = this.root.querySelector<HTMLButtonElement>("#btn-batch-pause");
+      const bresume = this.root.querySelector<HTMLButtonElement>("#btn-batch-resume");
+      const bcancel = this.root.querySelector<HTMLButtonElement>("#btn-batch-cancel");
+      if (bpause)
+        bpause.onclick = async () => {
+          const n = await api.pauseAllDownloads();
+          toast(n ? `${n} download(s) paused` : "Nothing to pause", n ? "ok" : "info");
+        };
+      if (bresume)
+        bresume.onclick = async () => {
+          const n = await api.resumeAllDownloads();
+          toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");
+        };
+      if (bcancel)
+        bcancel.onclick = async () => {
+          const n = await api.cancelAllActive();
+          toast(n ? `Stopped & cancelled ${n} download(s)` : "Nothing active", n ? "ok" : "info");
+          await store.refresh();
+        };
       const rt = this.root.querySelector<HTMLButtonElement>("#tb-retry");
       if (rt) rt.onclick = async () => {
         const n = await api.retryAllDownloads();

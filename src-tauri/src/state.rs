@@ -271,6 +271,34 @@ impl DlManager {
         n
     }
 
+    /// Emergency stop: cancel + remove every currently downloading/queued/
+    /// merging task (HTTP + youtube) so a bulk "Download Storm" is wiped
+    /// instantly. Already-finished, paused and failed entries are left alone.
+    /// Returns how many tasks were stopped.
+    pub fn cancel_all_active(self: &Arc<DlManager>) -> usize {
+        let active = |st: DlStatus| {
+            matches!(
+                st,
+                DlStatus::Downloading | DlStatus::Queued | DlStatus::Merging
+            )
+        };
+        let mut ids: Vec<String> = Vec::new();
+        for (_, t) in self.http.lock().unwrap().iter() {
+            if active(*t.status.read().unwrap()) {
+                ids.push(t.id.clone());
+            }
+        }
+        for (_, t) in self.yt.lock().unwrap().iter() {
+            if active(*t.status.read().unwrap()) {
+                ids.push(t.id.clone());
+            }
+        }
+        for id in &ids {
+            self.remove(id);
+        }
+        ids.len()
+    }
+
     /// Restart the given HTTP tasks. `only_failed` limits it to error/cancelled;
     /// otherwise paused tasks are resumed too.
     pub fn bulk_restart(self: &Arc<DlManager>, ids: &[String], only_failed: bool) -> usize {

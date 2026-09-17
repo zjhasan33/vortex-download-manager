@@ -337,6 +337,15 @@ async fn resume_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlMana
     Ok(n)
 }
 
+/// Emergency "Stop & Cancel All": instantly halts + removes every active and
+/// queued task (grabber batches, multi-downloads) to wipe a bandwidth storm.
+#[tauri::command]
+async fn cancel_all_active(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>) -> Result<usize, String> {
+    let n = state.cancel_all_active();
+    let _ = app.emit("downloads-changed", ());
+    Ok(n)
+}
+
 /// Pause every active (downloading/merging/queued) HTTP + youtube task.
 async fn pause_all_inner(app: &tauri::AppHandle, mgr: Arc<DlManager>) -> usize {
     let ids: Vec<String> = mgr
@@ -865,6 +874,7 @@ pub fn run() {
             retry_all_downloads,
             resume_all_downloads,
             pause_all_downloads,
+            cancel_all_active,
             cancel_download,
             remove_download,
             downloads_action,

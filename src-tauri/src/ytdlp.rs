@@ -868,54 +868,122 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    // read stdout for progress until EOF
-    if let Some(stdout) = child.stdout.take() {
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            if task.cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                break;
+    // yt-dlp writes `[download]` progress to STDOUT but diagnostics
+    // (extract, fragment, merge, ...) to STDERR. Both pipes are piped, so they
+    // must be drained CONCURRENTLY: leaving stderr unread fills its pipe buffer
+    // (~64KB) and stalls the process — which is what made the row hang at 0%.
+    // Two threads forward each line as (is_stderr, line) into one channel.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(bool, String)>(4096);
+    let mut readers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    for stderr_stream in [false, true] {
+        let stream: Box<dyn std::io::Read + Send> = if stderr_stream {
+            match child.stderr.take() {
+                Some(s) => Box::new(s),
+                None => continue,
             }
-            let Ok(line) = line else { continue };
-            if let Some(title) = line.strip_prefix("__VX_TITLE__:") {
-                let t = title.trim().to_string();
-                if !t.is_empty() {
-                    {
-                        let mut cur = task.title.lock().unwrap();
-                        if *cur != t {
-                            *cur = t.clone();
-                        }
-                    }
-                    *task.filename.lock().unwrap() = download::sanitize(&t);
-                    let _ = task.app.emit("downloads-changed", ());
+        } else {
+            match child.stdout.take() {
+                Some(s) => Box::new(s),
+                None => continue,
+            }
+        };
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stream);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if tx.send((stderr_stream, line)).is_err() {
+                    break;
                 }
-                continue;
             }
-            if let Some(sz) = line.strip_prefix("__VX_SIZE__:") {
-                if let Some(total) = parse_size_or_bytes(sz) {
-                    task.total.store(total, Ordering::Relaxed);
-                    let _ = task.app.emit("downloads-changed", ());
-                }
-                continue;
-            }
-            if let Some((pct, total, speed)) = parse_progress(&line) {
-                if total > 0 {
-                    task.total.store(total, Ordering::Relaxed);
-                    let done = (total as f64 * pct / 100.0) as u64;
-                    task.done.store(done, Ordering::Relaxed);
-                } else {
-                    task.done.store(task.done.load(Ordering::Relaxed).max(task.total.load(Ordering::Relaxed)), Ordering::Relaxed);
-                }
-                task.speed.store(speed, Ordering::Relaxed);
-                task.last_pct.store(pct as u64, Ordering::Relaxed);
-            }
+        }));
+    }
+    drop(tx);
+
+    let mut stderr_tail: Vec<String> = Vec::new();
+    let mut saw_progress = false;
+    for msg in rx {
+        if task.cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            break;
         }
+        let (is_err, line) = msg;
+        // Rust's lines() strips `\n` and a trailing `\r` already; trim again
+        // defensively so a bare `\r` (no `--newline`) never breaks the parse.
+        let line = line.trim_end_matches('\r').to_string();
+
+        if is_err {
+            if stderr_tail.len() >= 64 {
+                stderr_tail.remove(0);
+            }
+            stderr_tail.push(line.clone());
+            eprintln!("[yt-dlp stderr] {line}");
+        } else {
+            println!("[yt-dlp raw stdout] {line}");
+        }
+
+        if let Some(title) = line.strip_prefix("__VX_TITLE__:") {
+            let t = title.trim().to_string();
+            if !t.is_empty() {
+                {
+                    let mut cur = task.title.lock().unwrap();
+                    if *cur != t {
+                        *cur = t.clone();
+                    }
+                }
+                *task.filename.lock().unwrap() = download::sanitize(&t);
+                let _ = task.app.emit("downloads-changed", ());
+            }
+        } else if let Some(sz) = line.strip_prefix("__VX_SIZE__:") {
+            if let Some(total) = parse_size_or_bytes(sz) {
+                task.total.store(total, Ordering::Relaxed);
+                let _ = task.app.emit("downloads-changed", ());
+            }
+        } else if let Some((pct, total, speed)) = parse_progress(&line) {
+            saw_progress = true;
+            if total > 0 {
+                task.total.store(total, Ordering::Relaxed);
+                let done = (total as f64 * pct / 100.0) as u64;
+                task.done.store(done, Ordering::Relaxed);
+            } else {
+                task.done.store(task.done.load(Ordering::Relaxed).max(task.total.load(Ordering::Relaxed)), Ordering::Relaxed);
+            }
+            task.speed.store(speed, Ordering::Relaxed);
+            task.last_pct.store(pct as u64, Ordering::Relaxed);
+        }
+    }
+    for h in readers {
+        let _ = h.join();
     }
     let status = child.wait().map_err(|e| e.to_string())?;
     watch.abort();
 
+    if !saw_progress {
+        println!("[yt-dlp] WARNING: no [download] progress lines were streamed on stdout/stderr");
+    }
+
     if task.cancel.load(Ordering::Relaxed) {
         task.set_status(DlStatus::Cancelled);
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        return Ok(());
+    }
+
+    if !status.success() {
+        // Surface the real yt-dlp error instead of leaving the row in "Downloading".
+        let first_err = stderr_tail.iter().find(|l| l.starts_with("ERROR:")).cloned().unwrap_or_default();
+        let detail = if !first_err.is_empty() {
+            first_err
+        } else if let Some(last) = stderr_tail.last() {
+            last.clone()
+        } else {
+            String::new()
+        };
+        *task.error.lock().unwrap() = Some(if detail.is_empty() {
+            "Download failed".to_string()
+        } else {
+            format!("Download failed — {detail}")
+        });
+        task.set_status(DlStatus::Error);
         let _ = std::fs::remove_dir_all(&tmp_root);
         return Ok(());
     }

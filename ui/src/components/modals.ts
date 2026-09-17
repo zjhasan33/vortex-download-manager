@@ -445,11 +445,10 @@ export function openGrabber(initialUrl = "", autoStart = false) {
     </div>
     <div class="modal-foot" id="gb-foot" style="display:none">
       <button class="tbtn danger" id="gb-stop" style="display:none">${icon("stop", 14)} Stop</button>
-      <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer;margin-right:auto">
-        <input type="checkbox" id="gb-imm" checked /> Start downloading immediately
-      </label>
+      <div style="flex:1"></div>
       <button class="btn-ghost" id="gb-cancel">Cancel</button>
-      <button class="tbtn primary" id="gb-go">${icon("download", 15)} Download selected</button>
+      <button class="tbtn" id="gb-queue">${icon("pause", 14)} Add to Queue (Paused)</button>
+      <button class="tbtn primary" id="gb-now">${icon("download", 15)} Download Now</button>
     </div>
   </div>`,
     (root, close) => {
@@ -459,9 +458,8 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       const foot = root.querySelector<HTMLElement>("#gb-foot")!;
       const find = root.querySelector<HTMLButtonElement>("#gb-find")!;
       const stop = root.querySelector<HTMLButtonElement>("#gb-stop")!;
-      const immwrap = root.querySelector<HTMLElement>("#gb-imm")!.closest("label")!;
-      const go = root.querySelector<HTMLButtonElement>("#gb-go")!;
-      const imm = root.querySelector<HTMLInputElement>("#gb-imm")!;
+      const go = root.querySelector<HTMLButtonElement>("#gb-now")!;
+      const que = root.querySelector<HTMLButtonElement>("#gb-queue")!;
 
       if (initialUrl) urlInp.value = initialUrl;
 
@@ -474,7 +472,7 @@ export function openGrabber(initialUrl = "", autoStart = false) {
         stop.style.display = on ? "" : "none";
         if (on) {
           foot.style.display = "flex";
-          immwrap.style.display = "none";
+          que.style.display = "none";
           go.style.display = "none";
         }
       };
@@ -482,7 +480,7 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       const renderList = () => {
         stop.disabled = false;
         stop.innerHTML = `${icon("stop", 14)} Stop`;
-        immwrap.style.display = "";
+        que.style.display = "";
         go.style.display = "";
         if (!items.length) {
           body.innerHTML = stopped
@@ -555,12 +553,11 @@ export function openGrabber(initialUrl = "", autoStart = false) {
         e.key === "Enter" && root.querySelector<HTMLButtonElement>("#gb-find")!.click(),
       );
 
-      go.onclick = async () => {
+      const submit = async (paused: boolean) => {
         const checked = body.querySelectorAll<HTMLInputElement>("input[data-idx]:checked");
         if (!checked.length) return toast("Nothing selected", "err");
         const path = store.settings?.path ?? "";
         const segs = store.settings?.segments ?? 8;
-        const paused = !imm.checked;
         let n = 0;
         for (const c of checked) {
           const it = items[Number(c.dataset.idx)];
@@ -570,9 +567,11 @@ export function openGrabber(initialUrl = "", autoStart = false) {
             n++;
           } catch { /* keep going */ }
         }
-        toast(paused ? `${n} download(s) added — paused` : `${n} download(s) queued`, "ok");
+        toast(paused ? `${n} download(s) added — paused` : `${n} download(s) downloading`, "ok");
         close();
       };
+      que.onclick = () => void submit(true);
+      go.onclick = () => void submit(false);
 
       setTimeout(() => urlInp.focus(), 50);
 

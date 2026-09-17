@@ -68,6 +68,7 @@ export const api = {
   retryAllDownloads: () => cmd<number>("retry_all_downloads"),
   resumeAllDownloads: () => cmd<number>("resume_all_downloads"),
   pauseAllDownloads: () => cmd<number>("pause_all_downloads"),
+  cancelAllActive: () => cmd<number>("cancel_all_active"),
   cancelDownload: (id: string) => cmd<void>("cancel_download", { id }),
   removeDownload: (id: string, deleteFile?: boolean) => cmd<void>("remove_download", { id, deleteFile }),
   downloadsAction: (action: "pause" | "resume" | "retry" | "remove", ids: string[], deleteFile?: boolean) =>
