@@ -558,18 +558,20 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             Some((f, l)) => (f.to_string(), l.to_string()),
             None => ("srt".to_string(), spec),
         };
-        let sub_fmt = if sub_fmt.trim().is_empty() { "srt".to_string() } else { sub_fmt };
+        let sub_fmt = match sub_fmt.trim().to_lowercase().as_str() {
+            "vtt" => "vtt".to_string(),
+            _ => "srt".to_string(),
+        };
         args.push("--skip-download".into());
         args.push("--write-subs".into());
-        args.push("--write-auto-subs".into());
+        // Only manual/official subtitles — never auto-generated captions.
+        args.push("--no-write-auto-subs".into());
         args.push("--sub-langs".into());
         args.push(if langs.is_empty() || langs == "all" { "all".into() } else { langs });
         args.push("--sub-format".into());
-        args.push("srt/vtt/ass/best".into());
+        args.push(format!("{sub_fmt}/best"));
         args.push("--convert-subs".into());
         args.push(sub_fmt);
-        args.push("-f".into());
-        args.push("bestvideo/best".into());
     } else {
         args.push("-N".into());
         args.push("16".into());
@@ -589,11 +591,13 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             args.push("mp4".into());
             args.push("-f".into());
             args.push(task.format_id.clone());
-            // Auto-embed one subtitle track so the video is self-contained (IDM-like).
+            // Auto-embed one official/manual subtitle track so the video is self-contained (IDM-like).
+            // Auto-generated captions are always excluded.
             if task.embed_subs && !task.sub_langs.trim().is_empty() {
                 args.push("--sub-format".into());
-                args.push("srt/vtt/ass/best".into());
+                args.push("srt/vtt/best".into());
                 args.push("--embed-subs".into());
+                args.push("--no-write-auto-subs".into());
                 args.push("--sub-langs".into());
                 args.push(task.sub_langs.trim().to_string());
                 args.push("--convert-subs".into());

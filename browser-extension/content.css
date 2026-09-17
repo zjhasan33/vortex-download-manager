@@ -305,3 +305,26 @@
 .vx-hb-fmts .vx-fmt {
   margin-bottom: 4px;
 }
+
+/* subtitle format toggle inside the "▾ Subs" dropdown */
+.vx-subfmt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px 8px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid rgba(0, 229, 255, 0.18);
+}
+.vx-subfmt-lbl {
+  flex: 1;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #8fa3c8;
+}
+.vx-btn.vx-on {
+  background: linear-gradient(135deg, #00e5ff, #818cf8);
+  color: #04121f;
+  border-color: transparent;
+  font-weight: 700;
+}

@@ -222,13 +222,13 @@ export function openSettings() {
         <label>Subtitles</label>
         <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
-            <input type="checkbox" id="st-embed" ${s.embed_subs ? "checked" : ""} /> Auto-embed subtitles in videos
+            <input type="checkbox" id="st-embed" ${s.embed_subs ? "checked" : ""} /> Embed official subtitles into video downloads
           </label>
           <span style="font-size:12.5px;color:var(--text-2)">Language(s)</span>
           <input class="input" id="st-sublangs" value="${escapeAttr(s.sub_langs)}" placeholder="en" style="width:130px" spellcheck="false" />
         </div>
         <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          Videos download with one subtitle track embedded (e.g. <b>en</b> or <b>en,bn</b>). Separate .srt/.vtt/.ass downloads are available in the Download Video window.
+          ON = only manual/official subtitles are embedded (auto-generated captions are never used). OFF = video downloads with no subtitles at all. Down arrow <b>▾ Subs</b> in the extension downloads a standalone .srt/.vtt into the Subtitles folder.
         </div>
       </div>
     </div>

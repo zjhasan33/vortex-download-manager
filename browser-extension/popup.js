@@ -185,6 +185,85 @@ $("subs-toggle").addEventListener("change", async (e) => {
   await browser.storage.local.set({ vx_subs_embed: !!e.target.checked });
 });
 
+// ---- Standalone subtitle download (.srt / .vtt only) ----
+let popSubFmt = "srt";
+function setSubFmt(f) {
+  popSubFmt = f;
+  $("subfmt-srt").classList.toggle("on", f === "srt");
+  $("subfmt-vtt").classList.toggle("on", f === "vtt");
+  document.querySelectorAll("#subs-list [data-sub]").forEach((b) => (b.textContent = "." + f));
+}
+$("subfmt-srt").addEventListener("click", () => setSubFmt("srt"));
+$("subfmt-vtt").addEventListener("click", () => setSubFmt("vtt"));
+
+$("subs-fetch").addEventListener("click", async () => {
+  const btn = $("subs-fetch");
+  const box = $("subs-list");
+  btn.disabled = true;
+  btn.textContent = "Fetching…";
+  box.innerHTML = "";
+  const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs && tabs[0];
+  const url = tab && tab.url ? tab.url : "";
+  const reset = (t) => {
+    btn.disabled = false;
+    btn.textContent = t || "List subtitles for current tab";
+  };
+  if (!/^https?:/i.test(url)) {
+    box.innerHTML = '<div class="empty">Open a video page first.</div>';
+    reset();
+    return;
+  }
+  const res = await send({ type: "analyze", url }, 30000);
+  const subs = ((res && res.info && res.info.subtitles) || []).filter((s) => !s.auto);
+  if (!subs.length) {
+    box.innerHTML =
+      '<div class="empty">' +
+      (res && res.error ? "Error: " + esc(res.error) : "No official subtitles found.") +
+      "</div>";
+    reset();
+    return;
+  }
+  reset("Refresh subtitles");
+  for (const s of subs.slice(0, 20)) {
+    const row = document.createElement("div");
+    row.className = "cap";
+    const name = document.createElement("div");
+    name.className = "n";
+    name.textContent = s.label || s.lang;
+    name.title = s.lang;
+    const dl = document.createElement("button");
+    dl.className = "btn primary";
+    dl.style.padding = "5px 9px";
+    dl.style.fontSize = "11px";
+    dl.dataset.sub = s.lang;
+    dl.textContent = "." + popSubFmt;
+    dl.addEventListener("click", async () => {
+      dl.disabled = true;
+      dl.textContent = "Sending…";
+      const r = await send(
+        { type: "start_ytdl", url, format_id: "subs:" + popSubFmt + ":" + s.lang },
+        8000
+      );
+      if (r && r.error && !r.launched) {
+        dl.disabled = false;
+        dl.textContent = "Failed";
+        alert("Could not download subtitle:\n" + r.error);
+        setTimeout(() => (dl.textContent = "." + popSubFmt), 1600);
+        return;
+      }
+      dl.textContent = "Saved ✓";
+      setTimeout(() => {
+        dl.disabled = false;
+        dl.textContent = "." + popSubFmt;
+      }, 1600);
+    });
+    row.appendChild(name);
+    row.appendChild(dl);
+    box.appendChild(row);
+  }
+});
+
 refreshStatus();
 setInterval(() => {
   void refreshStatus();

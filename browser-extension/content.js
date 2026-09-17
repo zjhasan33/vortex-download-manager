@@ -60,8 +60,9 @@
   let hbar = null; // IDM-style hover bar over a <video>
   let hbarTarget = null;
   let hbarHideT = 0;
-  let hbarFmts = null; // formats dropdown
+  let hbarFmts = null; // formats/subs dropdown
   let fmtsOpen = false;
+  let hbarSubFmt = "srt"; // standalone subtitle output format
   const boundBarVideos = new WeakSet();
 
   function el(tag, cls, text) {
@@ -198,7 +199,7 @@
               '<span class="vx-fn">' + (f.size ? " • " + fmtBytes(f.size) : "") + "</span></span>" +
               '<button class="vx-btn vx-slim" data-fid="' + esc(f.id) + '">Download</button></div>';
           }
-          const subs = (res.info.subtitles || []).slice(0, 15);
+          const subs = (res.info.subtitles || []).filter((s) => !s.auto).slice(0, 15);
           if (subs.length) {
             html2 += '<div class="vx-empty" style="text-align:left;padding:8px 2px 4px">Subtitles / Captions</div>';
             for (const s of subs) {
@@ -222,9 +223,9 @@
               void send({ type: "start_ytdl", url, format_id: "subs:srt:" + btn.dataset.sub });
             });
           });
-        } else if (res && res.info && (res.info.subtitles || []).length) {
+        } else if (res && res.info && (res.info.subtitles || []).some((s) => !s.auto)) {
           let html2 = "";
-          for (const s of res.info.subtitles.slice(0, 15)) {
+          for (const s of res.info.subtitles.filter((s) => !s.auto).slice(0, 15)) {
             html2 +=
               '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label) +
               "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>SRT</button></div>";
@@ -341,7 +342,7 @@
     hbar.appendChild(makeHbarBtn("MP4 Best", () => hbarStart("bestvideo+bestaudio/best", "MP4 Best")));
     hbar.appendChild(makeHbarBtn("720p", () => hbarStart("bestvideo[height<=720]+bestaudio/best[height<=720]", "720p")));
     hbar.appendChild(makeHbarBtn("MP3", () => hbarStart("ba-mp3-320", "MP3")));
-    hbar.appendChild(makeHbarBtn("Subs", () => hbarStart("subs:srt:en", "Subs")));
+    hbar.appendChild(makeHbarBtn("▾ Subs", () => hbarSubs()));
     hbar.appendChild(el("span", "vx-hb-sep"));
     hbar.appendChild(makeHbarBtn("▾ Formats", () => hbarFormats()));
   }
@@ -454,7 +455,7 @@
     placeFmtsBelow();
     const u = pageUrl;
     const res = await send({ type: "analyze", url: u });
-    const subs = (res && res.info && res.info.subtitles || []).slice(0, 15);
+    const subs = (res && res.info && res.info.subtitles || []).filter((s) => !s.auto).slice(0, 15);
     if (!res || !res.info || !(res.info.formats || []).length) {
       if (!subs.length) {
         hbarFmts.innerHTML = '<div class="vx-empty">Error: ' + esc((res && res.error) || "no formats") + "</div>";
@@ -489,6 +490,55 @@
         btn.textContent = "Added ✓";
         btn.disabled = true;
         void send({ type: "start_ytdl", url: u, format_id: "subs:srt:" + btn.dataset.sub });
+      });
+    });
+    placeFmtsBelow();
+  }
+
+  // Dedicated "▾ Subs" dropdown: list official subtitle languages + choose SRT/VTT.
+  async function hbarSubs() {
+    fmtsOpen = true;
+    hbarFmts.classList.remove("vx-hide");
+    hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching subtitles…</div>';
+    placeFmtsBelow();
+    const u = pageUrl;
+    const res = await send({ type: "analyze", url: u });
+    const subs = ((res && res.info && res.info.subtitles) || []).filter((s) => !s.auto);
+    if (!subs.length) {
+      hbarFmts.innerHTML =
+        '<div class="vx-empty">' +
+        (res && res.error ? "Error: " + esc(res.error) : "No official subtitles available for this video") +
+        "</div>";
+      placeFmtsBelow();
+      return;
+    }
+    renderSubs(subs, u);
+  }
+
+  function renderSubs(subs, url) {
+    let html =
+      '<div class="vx-subfmt">' +
+      '<span class="vx-subfmt-lbl">Format</span>' +
+      '<button class="vx-btn vx-slim ' + (hbarSubFmt === "srt" ? "vx-on" : "") + '" data-subfmt="srt">SRT</button>' +
+      '<button class="vx-btn vx-slim ' + (hbarSubFmt === "vtt" ? "vx-on" : "") + '" data-subfmt="vtt">VTT</button>' +
+      "</div>";
+    for (const s of subs.slice(0, 20)) {
+      html +=
+        '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label || s.lang) +
+        "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>." + hbarSubFmt + "</button></div>";
+    }
+    hbarFmts.innerHTML = html;
+    hbarFmts.querySelectorAll("[data-subfmt]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        hbarSubFmt = btn.dataset.subfmt;
+        renderSubs(subs, url);
+      });
+    });
+    hbarFmts.querySelectorAll("[data-sub]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        btn.textContent = "Added ✓";
+        btn.disabled = true;
+        void send({ type: "start_ytdl", url, format_id: "subs:" + hbarSubFmt + ":" + btn.dataset.sub });
       });
     });
     placeFmtsBelow();

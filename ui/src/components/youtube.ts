@@ -47,7 +47,7 @@ export function openYoutube() {
             </label>
             <input class="input" id="yt-items" placeholder="Items (e.g. 1-10)" style="width:130px;display:none" />
             <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
-              <input type="checkbox" id="yt-embed" ${store.settings?.embed_subs !== false ? "checked" : ""} /> Embed subtitles in video
+              <input type="checkbox" id="yt-embed" ${store.settings?.embed_subs !== false ? "checked" : ""} /> Embed official subtitles
             </label>
           </div>
         </div>
@@ -106,7 +106,7 @@ export function openYoutube() {
                 ${info.subtitles.map((s) => `<option value="${s.lang}" ${s.lang === subSel ? "selected" : ""}>${esc(s.label)}</option>`).join("")}
               </select>
               <select class="input" id="yt-subfmt" style="flex:0 0 96px;width:96px">
-                ${["srt", "vtt", "ass"].map((f) => `<option value="${f}" ${f === subFmt ? "selected" : ""}>${f.toUpperCase()}</option>`).join("")}
+                ${["srt", "vtt"].map((f) => `<option value="${f}" ${f === subFmt ? "selected" : ""}>${f.toUpperCase()}</option>`).join("")}
               </select>
               <button class="tbtn primary" id="yt-subs-go">Download subs</button>
             </div>

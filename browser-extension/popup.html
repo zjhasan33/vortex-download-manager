@@ -26,8 +26,20 @@
       </label>
       <label class="toggle">
         <input type="checkbox" id="subs-toggle" checked />
-        <span>Embed subtitles in video downloads</span>
+        <span>Embed official subtitles into video downloads</span>
       </label>
+    </section>
+
+    <section class="subs">
+      <div class="cap-head">
+        <span>Subtitles ▾</span>
+        <span class="subfmt">
+          <button id="subfmt-srt" class="fmtbtn on">SRT</button>
+          <button id="subfmt-vtt" class="fmtbtn">VTT</button>
+        </span>
+      </div>
+      <button id="subs-fetch" class="btn ghost subs-fetch">List subtitles for current tab</button>
+      <div id="subs-list" class="subs-list"></div>
     </section>
 
     <section id="stats" class="stats hidden">

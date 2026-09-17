@@ -272,3 +272,36 @@ body {
 .foot .btn {
   flex: 1;
 }
+
+/* subtitles section */
+.subs {
+  padding: 10px 14px 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.subfmt {
+  display: flex;
+  gap: 4px;
+}
+.fmtbtn {
+  border: 1px solid rgba(0, 229, 255, 0.25);
+  background: rgba(255, 255, 255, 0.05);
+  color: #9fb3d8;
+  border-radius: 6px;
+  padding: 3px 8px;
+  font: 600 10px/1 "Segoe UI", Roboto, sans-serif;
+  cursor: pointer;
+}
+.fmtbtn.on {
+  background: linear-gradient(135deg, #00e5ff, #1f6bff);
+  color: #04121f;
+  border-color: transparent;
+}
+.subs-fetch {
+  width: 100%;
+  margin-bottom: 7px;
+}
+.subs-list {
+  max-height: 150px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
