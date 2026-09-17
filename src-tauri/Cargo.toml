@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "vortex"
 version = "1.0.0"
 description = "Vortex — next-gen download manager"
