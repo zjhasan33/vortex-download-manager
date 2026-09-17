@@ -63,7 +63,22 @@
   let hbarFmts = null; // formats/subs dropdown
   let fmtsOpen = false;
   let hbarSubFmt = "srt"; // standalone subtitle output format
+  const HBAR_POS_KEY = "vx_hbar_pos";
+  let hbarPos = null; // {x, y} — last dragged position (persisted)
+  let isDragging = false; // a drag is in progress: placeHbar() must not move the bar
+  let dragOffsetX = 0; // grab offset so the bar doesn't jump to the cursor
+  let dragOffsetY = 0;
   const boundBarVideos = new WeakSet();
+  browser.storage.local.get({ [HBAR_POS_KEY]: null }).then((r) => {
+    const p = r[HBAR_POS_KEY];
+    if (p && typeof p === "object" && typeof p.x === "number" && typeof p.y === "number") {
+      hbarPos = p;
+    }
+  });
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -316,8 +331,41 @@
     hbar = el("div", "vx-hbar vx-hide");
     hbar.addEventListener("pointerdown", (e) => e.stopPropagation());
     hbar.addEventListener("pointerenter", () => clearTimeout(hbarHideT));
-    hbar.addEventListener("pointerleave", () => { if (!fmtsOpen) hbarHide(350); });
+    hbar.addEventListener("pointerleave", () => { if (!fmtsOpen && !isDragging) hbarHide(350); });
     document.documentElement.appendChild(hbar);
+
+    // ---- Bulletproof drag (survives YouTube's player event capture) ----
+    // Drags start ONLY on the grip / logo / label — never on buttons — and
+    // mousemove/mouseup live on `window`, so the pointer can leave the bar
+    // (or the player) without breaking the drag. While dragging, placeHbar()
+    // is skipped, so the player/follow logic can never reset the position.
+    hbar.addEventListener("mousedown", (e) => {
+      if (e.button !== 0 || isDragging) return;
+      if (e.target.closest("button, a, input, select")) return; // let the real buttons work
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation(); // YouTube never sees the mousedown
+      const r = hbar.getBoundingClientRect();
+      dragOffsetX = e.clientX - r.left;
+      dragOffsetY = e.clientY - r.top;
+      isDragging = true;
+      hbar.classList.add("vx-hb-dragging");
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!isDragging) return;
+      e.preventDefault();
+      hbar.style.left = clamp(e.clientX - dragOffsetX, 2, window.innerWidth - (hbar.offsetWidth || 150) - 2) + "px";
+      hbar.style.top = clamp(e.clientY - dragOffsetY, 2, window.innerHeight - (hbar.offsetHeight || 40) - 2) + "px";
+    }, true);
+    window.addEventListener("mouseup", () => {
+      if (!isDragging) return;
+      isDragging = false;
+      hbar.classList.remove("vx-hb-dragging");
+      // Pinned: remember the final position so it survives re-shows + page scroll.
+      const r = hbar.getBoundingClientRect();
+      hbarPos = { x: Math.round(r.left), y: Math.round(r.top) };
+      void browser.storage.local.set({ [HBAR_POS_KEY]: hbarPos });
+    }, true);
     hbarFmts = el("div", "vx-hb-fmts vx-hide");
     hbarFmts.addEventListener("pointerenter", () => { clearTimeout(hbarHideT); fmtsOpen = true; });
     hbarFmts.addEventListener("pointerleave", () => hbarHide(350));
@@ -338,7 +386,7 @@
   }
 
   function barForMediaSite() {
-    hbar.innerHTML = '<span class="vx-logo"></span><span class="vx-hb-label">Download:</span>';
+    hbar.innerHTML = '<span class="vx-hb-grip" title="Drag to move">⋮⋮</span><span class="vx-logo"></span><span class="vx-hb-label">Download:</span>';
     hbar.appendChild(makeHbarBtn("MP4 Best", () => hbarStart("bestvideo+bestaudio/best", "MP4 Best")));
     hbar.appendChild(makeHbarBtn("720p", () => hbarStart("bestvideo[height<=720]+bestaudio/best[height<=720]", "720p")));
     hbar.appendChild(makeHbarBtn("MP3", () => hbarStart("ba-mp3-320", "MP3")));
@@ -348,7 +396,7 @@
   }
 
   function barForDirect(m) {
-    hbar.innerHTML = '<span class="vx-logo"></span><span class="vx-hb-label">Vortex</span>';
+    hbar.innerHTML = '<span class="vx-hb-grip" title="Drag to move">⋮⋮</span><span class="vx-logo"></span><span class="vx-hb-label">Vortex</span>';
     hbar.appendChild(
       makeHbarBtn("Download", () => {
         const btn = hbar.querySelector(".vx-hb-btn");
@@ -373,9 +421,20 @@
       hbarHide(0);
       return;
     }
+    // While a drag is in flight the bar owns its own position — the player /
+    // follow logic must never fight the user's hand.
+    if (isDragging) return;
+    const w = hbar.offsetWidth || 150;
+    // Pinned (dragged) position wins — the bar no longer follows the video,
+    // but stays clamped inside the viewport.
+    if (hbarPos) {
+      const h = hbar.offsetHeight || 40;
+      hbar.style.left = clamp(hbarPos.x, 2, window.innerWidth - w - 2) + "px";
+      hbar.style.top = clamp(hbarPos.y, 2, window.innerHeight - h - 2) + "px";
+      return;
+    }
     const r = hbarTarget.getBoundingClientRect();
     if (r.width < 60 || r.height < 30 || r.bottom < 0 || r.top > window.innerHeight) return;
-    const w = hbar.offsetWidth || 150;
     hbar.style.left = Math.max(4, r.right - 8 - w) + "px";
     hbar.style.top = (r.top + 8) + "px";
   }
@@ -408,6 +467,7 @@
 
   function hbarHide(ms) {
     clearTimeout(hbarHideT);
+    if (isDragging) return; // never hide while the user is dragging
     hbarHideT = setTimeout(() => {
       if (hbar) hbar.classList.add("vx-hide");
       if (hbarFmts) hbarFmts.classList.add("vx-hide");

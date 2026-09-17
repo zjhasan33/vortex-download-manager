@@ -2,6 +2,7 @@
 //! No extra crates — plain attribute scanning over the HTML.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -153,7 +154,14 @@ fn same_host(a: &reqwest::Url, b: &reqwest::Url) -> bool {
 }
 
 /// Crawl `start_url` (same host only) and collect files matching `want` kinds.
-pub async fn grab_site(start_url: &str, max_pages: usize, want: Vec<String>) -> Result<Vec<GrabItem>, String> {
+/// `cancel` is an external stop flag: when set, crawling aborts immediately
+/// and everything found so far is returned (used by the Stop button).
+pub async fn grab_site(
+    start_url: &str,
+    max_pages: usize,
+    want: Vec<String>,
+    cancel: &AtomicBool,
+) -> Result<Vec<GrabItem>, String> {
     let start = reqwest::Url::parse(start_url.trim()).map_err(|_| "Invalid URL".to_string())?;
     if start.scheme() != "http" && start.scheme() != "https" {
         return Err("Only http(s) URLs supported".to_string());
@@ -176,7 +184,7 @@ pub async fn grab_site(start_url: &str, max_pages: usize, want: Vec<String>) -> 
     let mut fetched = 0usize;
 
     while let Some(page) = queue.pop_front() {
-        if fetched >= max_pages {
+        if fetched >= max_pages || cancel.load(Ordering::Relaxed) {
             break;
         }
         if !seen_pages.insert(page.clone()) {
@@ -195,6 +203,9 @@ pub async fn grab_site(start_url: &str, max_pages: usize, want: Vec<String>) -> 
             Ok(r) => r,
             Err(_) => continue,
         };
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let ct = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -218,6 +229,9 @@ pub async fn grab_site(start_url: &str, max_pages: usize, want: Vec<String>) -> 
             Err(_) => continue,
         };
         fetched += 1;
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let capped = if bytes.len() > 3_000_000 { &bytes[..3_000_000] } else { &bytes[..] };
         let html = String::from_utf8_lossy(capped);
         for raw in extract_links(&html) {

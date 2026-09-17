@@ -4,12 +4,13 @@ import { api, store } from "../lib/api";
 import { formatBytes, formatDuration, formatNumber } from "../lib/format";
 import type { YtdlInfo } from "../types";
 
-export function openYoutube() {
+export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze?: boolean }) {
   let info: YtdlInfo | null = null;
   let selected: string | null = null;
   let loading = false;
   let subSel = "";
   let subFmt = "srt";
+  let autoChecked = false;
 
   const close = openModal(
     () => `
@@ -90,6 +91,7 @@ export function openYoutube() {
                 ${info.uploader ? `<span class="tag">👤 ${esc(info.uploader)}</span>` : ""}
                 <span class="tag">⏱ ${formatDuration(info.duration)}</span>
                 ${info.view_count ? `<span class="tag">👁 ${formatNumber(info.view_count)}</span>` : ""}
+                ${info.playlist ? `<span class="tag" style="background:var(--accent);color:#04121f">▶ ${info.playlist_count ? info.playlist_count + " videos" : "Playlist"}</span>` : ""}
               </div>
             </div>
           </div>
@@ -135,6 +137,12 @@ export function openYoutube() {
         pathwrap.style.display = "";
         optrow.style.display = "";
         foot.style.display = "";
+        // Whole-playlist links arrive pre-checked and show the item-range box.
+        if (info.playlist && !autoChecked) {
+          autoChecked = true;
+          plChk.checked = true;
+          itemsInp.style.display = "";
+        }
         refreshGo();
       };
 
@@ -188,6 +196,7 @@ export function openYoutube() {
           when,
           embed,
           subLangs,
+          store.settings?.embed_thumbnail !== false,
         );
         const msg = formatId.startsWith("subs:")
           ? "Subtitle download started"
@@ -202,6 +211,16 @@ export function openYoutube() {
         if (!selected) return;
         await goDownload(selected);
       };
+
+      // Preset (e.g. a playlist URL copied to the clipboard): fill + analyze.
+      if (preset?.url) {
+        urlInp.value = preset.url;
+        if (preset.playlist) {
+          plChk.checked = true;
+          itemsInp.style.display = "";
+        }
+        if (preset.analyze) setTimeout(() => root.querySelector<HTMLButtonElement>("#yt-fetch")!.click(), 80);
+      }
 
       setTimeout(() => urlInp.focus(), 50);
     },

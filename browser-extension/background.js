@@ -42,6 +42,19 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
 });
 
+// User preference: capture browser-initiated downloads and hand them to Vortex
+// (the IDM-style "default downloader" behaviour). DEFAULT: on.
+const INTERCEPT_KEY = "vx_intercept";
+let interceptEnabled = true;
+browser.storage.local.get({ [INTERCEPT_KEY]: true }).then((r) => {
+  interceptEnabled = r[INTERCEPT_KEY] !== false;
+});
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes[INTERCEPT_KEY]) {
+    interceptEnabled = changes[INTERCEPT_KEY].newValue !== false;
+  }
+});
+
 let ws = null;
 let wsReady = null; // promise controlling the current connection
 let online = false;
@@ -315,6 +328,76 @@ setInterval(() => {
   capturedUrls = new Set([...capturedUrls].slice(-300));
 }, 10 * 60 * 1000);
 
+// ---------------- browser download takeover (IDM-style) ----------------
+
+// A browser-initiated download counts as "ours" when the URL or suggested
+// filename matches a real media/archive extension.
+function isTakeoverUrl(item) {
+  if (!item || !item.url || !item.url.startsWith("http")) return false;
+  const fext = (item.filename || "").split(".").pop().toLowerCase().trim();
+  const ext = extOf(item.url);
+  return MEDIA_EXT.includes(ext) || FILE_EXT.includes(ext) ||
+    MEDIA_EXT.includes(fext) || FILE_EXT.includes(fext);
+}
+
+// Merge request cookies for a set of URLs (download URL + referrer/page URL).
+// More specific (longer) domains win for the same cookie name.
+async function cookieHeaderFor(urls) {
+  const seen = new Map();
+  for (const u of urls) {
+    if (!u || !u.startsWith("http")) continue;
+    let cs = [];
+    try {
+      cs = (await browser.cookies.getAll({ url: u })) || [];
+    } catch (e) { /* cookie access may fail for blob:/opaque origins */ }
+    for (const c of cs) {
+      const prev = seen.get(c.name);
+      const prevDomain = prev && prev.domain;
+      if (!prev || (c.domain && prevDomain && c.domain.length > prevDomain.length)) {
+        seen.set(c.name, { domain: c.domain, value: c.value });
+      } else if (!prev) {
+        seen.set(c.name, { domain: c.domain, value: c.value });
+      }
+    }
+  }
+  const parts = [];
+  for (const [name, c] of seen) if (c.value !== undefined && c.value !== "") parts.push(name + "=" + c.value);
+  return parts.join("; ");
+}
+
+async function takeOverDownload(item) {
+  const url = item.url;
+  const filename = item.filename ? item.filename.split(/[\\/]/).pop() : undefined;
+  const referrer = item.referrer || "";
+  const cookies = await cookieHeaderFor([url, referrer]);
+  // Cancel + erase the native browser download first so the page sees the
+  // browser didn't save it — Vortex becomes the handler (IDM-style).
+  try { await browser.downloads.cancel(item.id); } catch (e) {}
+  try { await browser.downloads.erase({ id: item.id }); } catch (e) {}
+  try { await browser.downloads.removeFile(item.id); } catch (e) {}
+  // Hand the download to Vortex (no-op when the desktop is offline: the
+  // browser naturally keeps its own download because we skip the handler).
+  await handleStart({ type: "direct", url, filename, pageUrl: referrer, referer: referrer || undefined, cookies });
+}
+
+if (browser.downloads) {
+  if (browser.downloads.onDeterminingFilename) {
+    // Chrome: fire before the file is written so we can cancel cleanly.
+    browser.downloads.onDeterminingFilename.addListener((item) => {
+      if (!interceptEnabled || !online) return; // let the browser download normally
+      if (!isTakeoverUrl(item)) return;
+      takeOverDownload(item);
+    });
+  } else {
+    // Firefox: no onDeterminingFilename — intercept just after creation.
+    browser.downloads.onCreated.addListener((item) => {
+      if (!interceptEnabled || !online) return;
+      if (!isTakeoverUrl(item)) return;
+      takeOverDownload(item);
+    });
+  }
+}
+
 // keep SW alive-ish: reconnect attempt every 15s when offline
 setInterval(() => {
   if (!online) connect().catch(() => {});
@@ -425,13 +508,16 @@ async function handleGrabAll(tab) {
 
 // ---------------- action dispatcher (used by content + popup + menus) ----------------
 
-async function handleStart({ type, url, filename, pageUrl }) {
+async function handleStart({ type, url, filename, pageUrl, referer, cookies }) {
   if (!url) return { error: "no url" };
   if (type === "direct" || isMediaSite(url) || type === "auto") {
     const isYT = isMediaSite(url);
     const isHLS = extOf(url) === "m3u8" || url.includes(".m3u8");
     const payload = { url, filename: filename || undefined };
     if (isYT || isHLS) payload.via = "yt";
+    // Browser-takeover metadata so the desktop can replay authenticated downloads.
+    if (referer) payload.referer = referer;
+    if (cookies) payload.cookies = cookies;
     const res = await rpc("download", payload);
     if (online) {
       // The desktop acks immediately with { success:true, action:... }.
@@ -442,8 +528,11 @@ async function handleStart({ type, url, filename, pageUrl }) {
       await launchVortex("capture", { url, via: "yt", filename: filename || "" });
       return { ok: true, launched: true };
     }
-    if (filename) await launchVortex("capture", { url, filename });
-    else await launchVortex("capture", { url });
+    const q = { url };
+    if (filename) q.filename = filename;
+    if (referer) q.referer = referer;
+    if (cookies) q.cookies = cookies;
+    await launchVortex("capture", q);
     return { ok: true, launched: true, fromCaptures: true };
   }
   return { error: "unsupported" };
@@ -540,6 +629,16 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "open_vortex") {
     return safeRespond(sendResponse, async () => ({ ok: await launchVortex("open", {}) }));
+  }
+
+  if (msg.type === "open_grabber") {
+    return safeRespond(sendResponse, async () => {
+      const url = msg.url || pageUrl || "";
+      if (!/^https?:/i.test(url)) return { ok: false, error: "no http(s) url" };
+      if (online) return rpc("open_grabber", { url });
+      await launchVortex("open", {});
+      return { ok: false, launched: true };
+    }, 20000);
   }
 
   if (msg.type === "get_stats") {

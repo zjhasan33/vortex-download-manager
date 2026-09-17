@@ -42,6 +42,9 @@ export interface YtdlInfo {
   view_count: number;
   formats: YtdlFormat[];
   subtitles: YtdlSub[];
+  playlist: boolean;
+  playlist_count?: number;
+  playlist_title?: string;
 }
 
 export interface YtdlSub {
@@ -110,5 +113,6 @@ export interface Settings {
   clipboard_monitor: boolean;
   embed_subs: boolean;
   sub_langs: string;
+  embed_thumbnail: boolean;
   credentials: { host: string; username: string; password: string }[];
 }

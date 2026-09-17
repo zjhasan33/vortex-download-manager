@@ -153,6 +153,8 @@ fn handle_capture(app: &tauri::AppHandle, cap: CapturePayload) {
                 start_at: None,
                 auto_retries: settings.auto_retries,
                 proxy: settings.proxy.clone(),
+                referer: None,
+                cookies: None,
             };
             match download::start(app.clone(), cap.url, settings.path, opts, mgr.limit.clone()).await {
                 Ok(task) => {
@@ -204,6 +206,7 @@ async fn launch_yt_from_capture(
         None,
         settings.embed_subs,
         settings.sub_langs,
+        settings.embed_thumbnail,
     )
     .await
     .ok()?;
@@ -225,6 +228,7 @@ async fn start_download(
     segments: usize,
     filename: Option<String>,
     start_at: Option<u64>,
+    start_paused: Option<bool>,
 ) -> Result<download::DlView, String> {
     let settings = state::load_settings(&app);
     let opts = download::StartOpts {
@@ -234,8 +238,15 @@ async fn start_download(
         start_at,
         auto_retries: settings.auto_retries,
         proxy: settings.proxy.clone(),
+        referer: None,
+        cookies: None,
     };
     let task = download::start(app.clone(), url, save_path, opts, state.limit.clone()).await?;
+    // Add in "Paused" state (Grabber "Start immediately" OFF) so the batch
+    // doesn't flood bandwidth at once; the user resumes individually/from toolbar.
+    if start_paused.unwrap_or(false) {
+        task.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let id = task.id.clone();
     state.add_http(task.clone());
     state.run_http(task);
@@ -473,8 +484,29 @@ async fn fetch_ytdl_info(app: tauri::AppHandle, url: String) -> Result<ytdlp::Yt
 }
 
 #[tauri::command]
-async fn grab_site(url: String, max_pages: Option<usize>, kinds: Option<Vec<String>>) -> Result<Vec<grabber::GrabItem>, String> {
-    grabber::grab_site(&url, max_pages.unwrap_or(10), kinds.unwrap_or_else(|| vec!["video".into(), "audio".into(), "document".into(), "archive".into(), "image".into()])).await
+async fn grab_site(
+    state: State<'_, Arc<DlManager>>,
+    url: String,
+    max_pages: Option<usize>,
+    kinds: Option<Vec<String>>,
+) -> Result<Vec<grabber::GrabItem>, String> {
+    // Each grab starts with a fresh cancel flag (the Stop button flips it).
+    let cancel = state.inner().grab_cancel.clone();
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    grabber::grab_site(
+        &url,
+        max_pages.unwrap_or(10),
+        kinds.unwrap_or_else(|| vec!["video".into(), "audio".into(), "document".into(), "archive".into(), "image".into()]),
+        cancel.as_ref(),
+    )
+    .await
+}
+
+/// Abort the in-progress Site Grabber crawl.
+#[tauri::command]
+async fn grab_stop(state: State<'_, Arc<DlManager>>) -> Result<(), String> {
+    state.inner().grab_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 #[tauri::command]
@@ -489,6 +521,7 @@ async fn start_ytdl(
     start_at: Option<u64>,
     embed_subs: Option<bool>,
     sub_langs: Option<String>,
+    embed_thumbnail: Option<bool>,
 ) -> Result<download::DlView, String> {
     let settings = state::load_settings(&app);
     let task = ytdlp::start(
@@ -503,6 +536,7 @@ async fn start_ytdl(
         start_at,
         embed_subs.unwrap_or(settings.embed_subs),
         sub_langs.unwrap_or_else(|| settings.sub_langs.clone()),
+        embed_thumbnail.unwrap_or(settings.embed_thumbnail),
     )
     .await?;
     let id = task.id.clone();
@@ -839,6 +873,7 @@ pub fn run() {
             fetch_ytdl_info,
             start_ytdl,
             grab_site,
+            grab_stop,
             get_tools_status,
             update_tools,
             get_settings,

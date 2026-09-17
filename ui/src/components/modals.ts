@@ -232,6 +232,17 @@ export function openSettings() {
         </div>
       </div>
       <div class="field">
+        <label>YouTube</label>
+        <div style="display:grid;gap:8px;padding-top:2px">
+          <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="st-thumb" ${s.embed_thumbnail ? "checked" : ""} /> Embed video thumbnail / album cover art
+          </label>
+        </div>
+        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
+          Muxes the video thumbnail (MP4 / MKV cover track) or album cover art (MP3 ID3 tag) into every video and audio download.
+        </div>
+      </div>
+      <div class="field">
         <label>Site logins (HTTP 401 authentication)</label>
         <div id="st-creds" style="display:flex;flex-direction:column;gap:5px">
           ${(s.credentials || []).length === 0
@@ -367,6 +378,7 @@ export function openSettings() {
           clipboard_monitor: root.querySelector<HTMLInputElement>("#st-clip")!.checked,
           embed_subs: root.querySelector<HTMLInputElement>("#st-embed")!.checked,
           sub_langs: root.querySelector<HTMLInputElement>("#st-sublangs")!.value.trim() || "en",
+          embed_thumbnail: root.querySelector<HTMLInputElement>("#st-thumb")!.checked,
           credentials: s.credentials || [],
           stop_at: (() => {
             const v = root.querySelector<HTMLInputElement>("#st-stopat")!.value;
@@ -383,9 +395,12 @@ export function openSettings() {
   );
 }
 
-export function openGrabber() {
+export function openGrabber(initialUrl = "", autoStart = false) {
+  // String-guard: the toolbar binds this as a click handler; never accept a DOM Event.
+  if (typeof initialUrl !== "string") initialUrl = "";
   let items: GrabItem[] = [];
   let finding = false;
+  let stopped = false;
 
   const kinds: Array<[string, string, boolean]> = [
     ["video", "Videos", true],
@@ -429,10 +444,11 @@ export function openGrabber() {
       </div>
     </div>
     <div class="modal-foot" id="gb-foot" style="display:none">
+      <button class="tbtn danger" id="gb-stop" style="display:none">${icon("stop", 14)} Stop</button>
       <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer;margin-right:auto">
-        <input type="checkbox" id="gb-all" checked /> Select all
+        <input type="checkbox" id="gb-imm" checked /> Start downloading immediately
       </label>
-      <button class="btn-ghost" data-close>Cancel</button>
+      <button class="btn-ghost" id="gb-cancel">Cancel</button>
       <button class="tbtn primary" id="gb-go">${icon("download", 15)} Download selected</button>
     </div>
   </div>`,
@@ -441,17 +457,44 @@ export function openGrabber() {
       const urlInp = root.querySelector<HTMLInputElement>("#gb-url")!;
       const body = root.querySelector<HTMLElement>("#gb-body")!;
       const foot = root.querySelector<HTMLElement>("#gb-foot")!;
+      const find = root.querySelector<HTMLButtonElement>("#gb-find")!;
+      const stop = root.querySelector<HTMLButtonElement>("#gb-stop")!;
+      const immwrap = root.querySelector<HTMLElement>("#gb-imm")!.closest("label")!;
+      const go = root.querySelector<HTMLButtonElement>("#gb-go")!;
+      const imm = root.querySelector<HTMLInputElement>("#gb-imm")!;
+
+      if (initialUrl) urlInp.value = initialUrl;
 
       const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+      const setFinding = (on: boolean) => {
+        finding = on;
+        find.disabled = on;
+        stop.style.display = on ? "" : "none";
+        if (on) {
+          foot.style.display = "flex";
+          immwrap.style.display = "none";
+          go.style.display = "none";
+        }
+      };
+
       const renderList = () => {
+        stop.disabled = false;
+        stop.innerHTML = `${icon("stop", 14)} Stop`;
+        immwrap.style.display = "";
+        go.style.display = "";
         if (!items.length) {
-          body.innerHTML = `<div class="center-box"><span>No downloadable files found. Try more pages or other types.</span></div>`;
+          body.innerHTML = stopped
+            ? `<div class="center-box"><span>Grab stopped — no files were found yet.</span></div>`
+            : `<div class="center-box"><span>No downloadable files found. Try more pages or other types.</span></div>`;
           foot.style.display = "none";
           return;
         }
-        body.innerHTML = `<div style="font-size:12px;color:var(--text-3);margin-bottom:8px">${items.length} file(s) found</div>
+        body.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--text-3);margin-bottom:8px">
+            <span>${items.length} file(s) found</span>
+            <label style="display:flex;gap:6px;align-items:center;color:var(--text-2);cursor:pointer"><input type="checkbox" id="gb-all" checked /> Select all</label>
+          </div>
           <div class="yt-formats" style="max-height:300px;overflow-y:auto;display:grid;gap:6px">
           ${items.map((it, i) => `
             <label class="fmt" style="cursor:pointer">
@@ -462,13 +505,25 @@ export function openGrabber() {
               </span>
             </label>`).join("")}
           </div>`;
-        foot.style.display = "";
+        foot.style.display = "flex";
         const all = root.querySelector<HTMLInputElement>("#gb-all")!;
         all.checked = true;
         all.onchange = () => body.querySelectorAll<HTMLInputElement>("input[data-idx]").forEach((c) => (c.checked = all.checked));
       };
 
-      root.querySelector<HTMLButtonElement>("#gb-find")!.onclick = async () => {
+      root.querySelector<HTMLButtonElement>("#gb-cancel")!.onclick = () => {
+        if (finding) void api.grabStop();
+        close();
+      };
+
+      stop.onclick = () => {
+        stopped = true;
+        stop.disabled = true;
+        stop.innerHTML = `${icon("stop", 14)} Stopping…`;
+        void api.grabStop();
+      };
+
+      const startGrab = async () => {
         const url = urlInp.value.trim();
         if (!url) return toast("Paste a page URL", "err");
         const sel: string[] = [];
@@ -477,42 +532,57 @@ export function openGrabber() {
         });
         if (!sel.length) return toast("Select at least one file type", "err");
         const pages = Math.min(50, Math.max(1, Number(root.querySelector<HTMLInputElement>("#gb-pages")!.value) || 10));
-        finding = true;
-        foot.style.display = "none";
+        stopped = false;
+        setFinding(true);
         body.innerHTML = `<div class="center-box"><div class="spinner"></div><span>Crawling pages, please wait…</span></div>`;
         try {
           items = await api.grabSite(url, pages, sel);
-          finding = false;
+          setFinding(false);
           renderList();
+          if (stopped) toast(items.length ? `Grab stopped — ${items.length} file(s) found so far` : "Grab stopped.", "info");
         } catch (e: unknown) {
-          finding = false;
-          body.innerHTML = `<div class="center-box" style="color:var(--bad)">Grab failed: ${esc(String(e))}</div>`;
+          setFinding(false);
+          renderList();
+          if (!stopped) body.innerHTML = `<div class="center-box" style="color:var(--bad)">Grab failed: ${esc(String(e))}</div>`;
         }
+      };
+
+      find.onclick = () => {
+        void startGrab();
       };
 
       urlInp.addEventListener("keydown", (e) =>
         e.key === "Enter" && root.querySelector<HTMLButtonElement>("#gb-find")!.click(),
       );
 
-      root.querySelector<HTMLButtonElement>("#gb-go")!.onclick = async () => {
+      go.onclick = async () => {
         const checked = body.querySelectorAll<HTMLInputElement>("input[data-idx]:checked");
         if (!checked.length) return toast("Nothing selected", "err");
         const path = store.settings?.path ?? "";
         const segs = store.settings?.segments ?? 8;
+        const paused = !imm.checked;
         let n = 0;
         for (const c of checked) {
           const it = items[Number(c.dataset.idx)];
           if (!it) continue;
           try {
-            await api.startDownload(it.url, path, segs, it.filename);
+            await api.startDownload(it.url, path, segs, it.filename, undefined, paused);
             n++;
           } catch { /* keep going */ }
         }
-        toast(`${n} download(s) queued`, "ok");
+        toast(paused ? `${n} download(s) added — paused` : `${n} download(s) queued`, "ok");
         close();
       };
 
       setTimeout(() => urlInp.focus(), 50);
+
+      // Extension "Grab This Page": open the modal pre-filled AND start crawling
+      // automatically so the user doesn't have to click "Find files" again.
+      if (initialUrl && autoStart) {
+        setTimeout(() => {
+          void startGrab();
+        }, 120);
+      }
     },
   );
   void finding;

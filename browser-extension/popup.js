@@ -10,6 +10,20 @@ function $(id) {
   return document.getElementById(id);
 }
 
+// Tiny inline toast (bottom of the popup).
+function toast(msg, ms = 2800) {
+  let el = $("vx-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "vx-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), ms);
+}
+
 // Send a message to the background event page. Always resolves (never hangs):
 // a timeout guards against a missing/closed bridge.
 function send(msg, timeoutMs = 8000) {
@@ -131,6 +145,46 @@ $("url").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("addbtn").click();
 });
 
+// ---- Grab all links on the active page → opens Vortex's Site Grabber ----
+$("grab-page").addEventListener("click", async () => {
+  const btn = $("grab-page");
+  btn.disabled = true;
+  btn.textContent = "Grabbing links from page…";
+  const reset = () => {
+    btn.disabled = false;
+    btn.textContent = "🔗 Grab All Links on This Page";
+  };
+  let pageUrl = "";
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    pageUrl = (tabs && tabs[0] && tabs[0].url) || "";
+  } catch (e) { /* ignore */ }
+  if (!/^https?:/i.test(pageUrl)) {
+    toast("Open a page you want to grab first.");
+    reset();
+    return;
+  }
+  toast("Grabbing links from page…");
+  try {
+    const r = await send({ type: "open_grabber", url: pageUrl }, 15000);
+    reset();
+    const ok = !!(r && (r.success || r.launched));
+    if (!ok) {
+      toast("Could not open Grabber: " + ((r && r.error) || "unknown"));
+      return;
+    }
+    try {
+      const host = new URL(pageUrl).hostname;
+      toast("Grabber opened for " + host);
+    } catch (e) {
+      toast("Grabber opened — check the Vortex window.");
+    }
+  } catch (e) {
+    reset();
+    toast("Could not reach Vortex.");
+  }
+});
+
 $("open").addEventListener("click", () => void send({ type: "open_vortex" }));
 $("refresh").addEventListener("click", () => void refreshStatus());
 $("clear").addEventListener("click", () => {
@@ -173,6 +227,16 @@ $("pair-clear").addEventListener("click", async () => {
 
 $("notify-toggle").addEventListener("change", async (e) => {
   await browser.storage.local.set({ vx_notify: !!e.target.checked });
+});
+
+// ---- Intercept toggle (DEFAULT: on — Vortex becomes the default downloader) ----
+(async () => {
+  const { vx_intercept } = await browser.storage.local.get({ vx_intercept: true });
+  $("intercept-toggle").checked = vx_intercept !== false;
+})();
+
+$("intercept-toggle").addEventListener("change", async (e) => {
+  await browser.storage.local.set({ vx_intercept: !!e.target.checked });
 });
 
 // ---- Subtitle embed toggle ----

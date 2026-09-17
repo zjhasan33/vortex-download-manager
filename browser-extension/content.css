@@ -239,9 +239,33 @@
   color: #dbf4ff;
   font: 600 11.5px/1 "Segoe UI", Roboto, sans-serif;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
-  cursor: pointer;
+  cursor: grab;
   user-select: none;
   pointer-events: auto;
+  touch-action: none;
+}
+.vx-hbar.vx-hb-dragging {
+  cursor: grabbing;
+  box-shadow: 0 12px 32px rgba(0, 229, 255, 0.35);
+}
+.vx-hbar .vx-hb-grip {
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  padding: 0 3px;
+  color: rgba(219, 244, 255, 0.6);
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  flex: none;
+  line-height: 1;
+  touch-action: none;
+}
+.vx-hbar .vx-hb-grip:hover {
+  color: rgba(219, 244, 255, 0.95);
+}
+.vx-hbar.vx-hb-dragging,
+.vx-hbar.vx-hb-dragging .vx-hb-grip {
+  cursor: grabbing;
 }
 .vx-hbar.vx-hide {
   display: none;

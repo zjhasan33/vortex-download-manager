@@ -43,6 +43,28 @@ pub struct YtdlInfo {
     pub view_count: u64,
     pub formats: Vec<YtdlFormat>,
     pub subtitles: Vec<YtdlSub>,
+    /// True when the analyzed URL refers to a YouTube playlist.
+    #[serde(default)]
+    pub playlist: bool,
+    /// Number of videos in the playlist (best-effort).
+    #[serde(default)]
+    pub playlist_count: Option<u64>,
+    /// Playlist title (best-effort).
+    #[serde(default)]
+    pub playlist_title: Option<String>,
+}
+
+/// True when `url` is a YouTube/YouTube-mirror playlist link:
+/// a `/playlist` page or any watch URL carrying the `list` query param.
+fn is_playlist_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.contains("youtube.com")
+        || lower.contains("youtu.be")
+        || lower.contains("youtube-nocookie.com"))
+    {
+        return false;
+    }
+    lower.contains("/playlist?") || lower.contains("&list=") || lower.contains("?list=")
 }
 
 #[derive(Deserialize)]
@@ -80,9 +102,9 @@ fn parse_progress(line: &str) -> Option<(f64, u64, u64)> {
     if let Some(idx) = line.find(" of ") {
         let rest = &line[idx + 4..];
         let tail = rest.split(" at ").next().unwrap_or(rest).trim();
-        // tail like "~25.00MiB" or "25.00MiB"
-        let t = tail.trim_start_matches('~');
-        let dt = parse_size(t);
+        // tail like "~25.00MiB" (approximate) or "25.00MiB" — the leading `~`
+        // is informational; parse the size either way.
+        total = parse_size(tail.trim_start_matches('~'));
         if let Some(at) = rest.find(" at ") {
             let sp = &rest[at + 4..];
             let sp = sp.split_whitespace().next().unwrap_or("");
@@ -90,8 +112,6 @@ fn parse_progress(line: &str) -> Option<(f64, u64, u64)> {
             let (num, unit) = split_num_unit(spnum);
             speed = (num * unit_mult(unit)) as u64;
         }
-        let _ = dt;
-        total = if tail.starts_with('~') { 0 } else { parse_size(tail) };
     }
     // Ignore implausibly tiny totals (e.g. mis-parsed informational lines).
     if total > 0 && total < 1024 {
@@ -103,6 +123,67 @@ fn parse_progress(line: &str) -> Option<(f64, u64, u64)> {
 fn parse_size(s: &str) -> u64 {
     let (num, unit) = split_num_unit(s);
     (num * unit_mult(unit)) as u64
+}
+
+/// Parse a size yt-dlp printed as either raw bytes or a human string like
+/// "250.50MiB" / "~250.50MiB" (approximate). None when empty/unparseable.
+fn parse_size_or_bytes(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(b) = t.parse::<u64>() {
+        return Some(b);
+    }
+    let v = parse_size(t.trim_start_matches('~'));
+    if v > 0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Drop a trailing " [<video-id>]" disambiguator ("Title [AbC123XYZ].mp4" ->
+/// "Title.mp4") so the final file name is a clean title. The temporary
+/// `vx_<id>_` prefix is expected to already be stripped by the caller.
+fn clean_output_name(name: &str) -> String {
+    let dot = name.rfind('.');
+    let (stem, ext) = match dot {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    if let Some(rest) = stem.strip_suffix(']') {
+        if let Some(open) = rest.rfind(" [") {
+            let id = &rest[open + 2..];
+            if !id.is_empty()
+                && id.len() <= 64
+                && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return format!("{}{}", rest[..open].trim_end(), ext);
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// Move `src` into `dir` under `clean`, appending " (n)" when the target exists.
+fn finalize_file(src: &std::path::Path, dir: &std::path::Path, clean: &str) -> Option<std::path::PathBuf> {
+    let dot = clean.rfind('.');
+    let mut target = dir.join(clean);
+    let mut n = 1;
+    while target.exists() {
+        let (stem, ext) = match dot {
+            Some(i) if i > 0 => (&clean[..i], &clean[i..]),
+            _ => (clean, ""),
+        };
+        target = dir.join(format!("{} ({}){}", stem, n, ext));
+        n += 1;
+    }
+    if std::fs::rename(src, &target).is_ok() {
+        Some(target)
+    } else {
+        None
+    }
 }
 
 fn split_num_unit(s: &str) -> (f64, &str) {
@@ -140,9 +221,19 @@ pub async fn fetch_info(app: AppHandle, url: String) -> Result<YtdlInfo, String>
     let bin = tools::ensure_ytdlp(&app).await?;
     let settings = crate::state::load_settings(&app);
     let cooks = cookie_args(settings.use_cookies, &settings.cookies);
+    let playlist = is_playlist_url(&url);
     let out = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let mut cmd = crate::tools::silent(Command::new(&bin));
-        cmd.args(["--dump-single-json", "--no-warnings", "--no-playlist"]);
+        cmd.arg("--newline").arg("--dump-single-json").arg("--no-warnings");
+        if playlist {
+            // Pull the FIRST entry of the playlist so the video information
+            // (esp. the full format ladder) is actually present. The old
+            // --no-playlist call returned the playlist wrapper which has no
+            // per-video `formats`, so only audio-only entries were offered.
+            cmd.args(["--playlist-items", "1"]);
+        } else {
+            cmd.arg("--no-playlist");
+        }
         cmd.args(&cooks);
         cmd.arg(&url);
         let o = cmd.output().map_err(|e| e.to_string())?;
@@ -154,7 +245,12 @@ pub async fn fetch_info(app: AppHandle, url: String) -> Result<YtdlInfo, String>
     .await
     .map_err(|e| e.to_string())??;
 
-    let v: Value = serde_json::from_str(&out).map_err(|_| "Could not parse video info".to_string())?;
+    let root: Value = serde_json::from_str(&out).map_err(|_| "Could not parse video info".to_string())?;
+
+    // --playlist-items 1 usually unwraps to the entry dict, but for bare
+    // playlist URLs yt-dlp may still wrap it in { "entries": [...], "title": ... }.
+    let entries = root.get("entries").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+    let v: &Value = if entries { &root["entries"][0] } else { &root };
 
     let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("Unknown").to_string();
     let thumbnail = v
@@ -210,7 +306,86 @@ pub async fn fetch_info(app: AppHandle, url: String) -> Result<YtdlInfo, String>
         view_count,
         formats,
         subtitles,
+        playlist,
+        playlist_count: v
+            .get("playlist_count")
+            .and_then(|x| x.as_u64())
+            .or_else(|| root.get("playlist_count").and_then(|x| x.as_u64())),
+        playlist_title: v
+            .get("playlist_title")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.get("playlist").and_then(|x| x.get("title")).and_then(|x| x.as_str()))
+            // For wrapped playlist dumps the wrapper's own `title` is the playlist title.
+            .or_else(|| if entries { root.get("title").and_then(|x| x.as_str()) } else { None })
+            .map(|s| s.to_string()),
     })
+}
+
+/// Lightweight info fetch used to resolve dynamic output templates
+/// (e.g. `%(playlist_title)s`) right before a download starts.
+async fn dynamic_info(app: &AppHandle, bin: &std::path::Path, url: &str) -> YtdlInfo {
+    let settings = crate::state::load_settings(app);
+    let cooks = cookie_args(settings.use_cookies, &settings.cookies);
+    let url = url.to_string();
+    let bin = bin.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let mut cmd = crate::tools::silent(Command::new(&bin));
+        cmd.arg("--newline").arg("--dump-single-json").arg("--no-warnings");
+        cmd.args(["--playlist-items", "1"]);
+        cmd.args(&cooks);
+        cmd.arg(&url);
+        let o = cmd.output().map_err(|e| e.to_string())?;
+        if !o.status.success() {
+            return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
+
+    let Ok(root) = serde_json::from_str::<Value>(&out) else {
+        return YtdlInfo {
+            title: "YouTube playlist".into(),
+            thumbnail: String::new(),
+            duration: 0,
+            uploader: String::new(),
+            view_count: 0,
+            formats: vec![],
+            subtitles: vec![],
+            playlist: true,
+            playlist_count: None,
+            playlist_title: None,
+        };
+    };
+    let entries = root.get("entries").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+    let v = if entries { &root["entries"][0] } else { &root };
+    YtdlInfo {
+        title: v.get("title").and_then(|x| x.as_str()).unwrap_or("YouTube playlist").to_string(),
+        thumbnail: v.get("thumbnail").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        duration: v.get("duration").and_then(|x| x.as_u64()).unwrap_or(0),
+        uploader: v.get("uploader").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        view_count: v.get("view_count").and_then(|x| x.as_u64()).unwrap_or(0),
+        formats: vec![],
+        subtitles: vec![],
+        playlist: true,
+        playlist_count: v
+            .get("playlist_count")
+            .and_then(|x| x.as_u64())
+            .or_else(|| root.get("playlist_count").and_then(|x| x.as_u64())),
+        playlist_title: v
+            .get("playlist_title")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                if entries {
+                    root.get("title").and_then(|x| x.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            }),
+    }
 }
 
 fn build_formats(raw: Vec<RawFormat>) -> Vec<YtdlFormat> {
@@ -344,10 +519,13 @@ pub struct YtTask {
     pub start_at: Option<u64>,
     pub embed_subs: bool,
     pub sub_langs: String,
+    pub embed_thumbnail: bool,
     pub title: Mutex<String>,
     pub filename: Mutex<String>,
     pub category: String,
     pub save_path: Mutex<PathBuf>,
+    /// Base output directory (before any sub-folder template like the playlist title).
+    pub save_base: Mutex<PathBuf>,
     pub total: AtomicU64,
     pub done: AtomicU64,
     pub speed: AtomicU64,
@@ -432,6 +610,7 @@ pub async fn start(
     start_at: Option<u64>,
     embed_subs: bool,
     sub_langs: String,
+    embed_thumbnail: bool,
 ) -> Result<Arc<YtTask>, String> {
     let bin = tools::ensure_ytdlp(&app).await?;
     let _ = &bin;
@@ -443,7 +622,8 @@ pub async fn start(
     let is_audio = audio_fmt.is_some() || format_id.starts_with("bestaudio");
     let is_video = !is_subs && !is_audio;
     let wants_embed = is_video && embed_subs && !sub_langs.trim().is_empty();
-    if use_merge || audio_fmt.is_some() || wants_embed {
+    // Embedding a thumbnail also remuxes with ffmpeg (mp4/mkv/mp3 cover art).
+    if use_merge || audio_fmt.is_some() || wants_embed || (embed_thumbnail && !is_subs) {
         let _ = tools::ensure_ffmpeg(&app).await?;
     }
     // mp3 conversion also needs a final container rename to .mp3; ensure we handle it.
@@ -460,7 +640,13 @@ pub async fn start(
     };
     std::fs::create_dir_all(&eff_dir).map_err(|e| e.to_string())?;
     let prefix = format!("vx_{}", id);
-    let tmpl = if include_playlist || !playlist_items.trim().is_empty() {
+    // Whole-playlist jobs get an IDM/Parabolic-style layout:
+    //   <Videos>/Downloads/<Playlist Title>/NN - Title.mp4
+    // Hidden (non-playlist) single-video downloads keep the vx_ prefix so the
+    // completion step can find and rename the produced files.
+    let tmpl = if include_playlist {
+        eff_dir.join("%(playlist_title)s").join("%(playlist_index)02d - %(title)s.%(ext)s")
+    } else if !playlist_items.trim().is_empty() {
         eff_dir.join(format!("{0}_%(playlist_index)03d_%(title).80s [%(id)s].%(ext)s", prefix))
     } else if is_subs {
         // Subs are per-language; keep the language in the filename template.
@@ -485,6 +671,7 @@ pub async fn start(
         filename: Mutex::new("downloading…".into()),
         category: cat.into(),
         save_path: Mutex::new(tmpl),
+        save_base: Mutex::new(eff_dir),
         total: AtomicU64::new(0),
         done: AtomicU64::new(0),
         speed: AtomicU64::new(0),
@@ -502,6 +689,7 @@ pub async fn start(
         start_at,
         embed_subs,
         sub_langs,
+        embed_thumbnail,
         app,
         created_at,
         completed_at: Mutex::new(None),
@@ -539,6 +727,12 @@ pub async fn launch(task: Arc<YtTask>) {
 
 /// Run yt-dlp and stream progress from its stdout.
 pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Result<(), String> {
+    let started = std::time::SystemTime::now();
+    // Stage every intermediate artifact (fragments, .part, .ytdl, thumbnails,
+    // unmerged streams) in a task-specific dir under the system temp folder so
+    // nothing clutters the user's Downloads; it is deleted at the end.
+    let tmp_root = std::env::temp_dir().join("vortex").join(&task.id);
+    let _ = std::fs::create_dir_all(&tmp_root);
     let watch = tokio::spawn(progress_watch(task.clone()));
     let audio_fmt = parse_audio_fmt(&task.format_id);
     let is_subs = task.format_id.starts_with("subs:");
@@ -548,6 +742,13 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         "--progress-delta".into(),
         "0.2".into(),
         "--no-warnings".into(),
+        // Emit the real video title + resolved size on dedicated lines the
+        // moment the download starts (before_dl hook) so the row updates
+        // immediately instead of staying as "YouTube video".
+        "--print".into(),
+        "before_dl:__VX_TITLE__:%(title)s".into(),
+        "--print".into(),
+        "before_dl:__VX_SIZE__:%(filesize,filesize_approx)s".into(),
     ];
     if task.include_playlist {
         args.push("--yes-playlist".into());
@@ -613,14 +814,51 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             }
         }
     }
+    if task.embed_thumbnail && !is_subs {
+        // IDM-style: mux the video thumbnail / album cover art into the file
+        // (MP4/MKV cover track, MP3 ID3 cover). Requires ffmpeg (ensured above);
+        // yt-dlp converts the webp poster to jpg for maximum compatibility.
+        args.push("--embed-thumbnail".into());
+        args.push("--convert-thumbnails".into());
+        args.push("jpg".into());
+    }
     if !task.proxy.trim().is_empty() {
         args.push("--proxy".into());
         args.push(task.proxy.trim().to_string());
     }
     let settings = crate::state::load_settings(&task.app);
     args.extend(cookie_args(settings.use_cookies, &settings.cookies));
+    // Keep temp/thumbnail artifacts out of the Downloads folder.
+    args.push("--paths".into());
+    args.push(format!("temp:{}", tmp_root.display()));
+    args.push("--paths".into());
+    args.push(format!("thumbnail:{}", tmp_root.display()));
+
+    // Whole-playlist jobs use a `%(playlist_title)s` folder which must be
+    // resolved to a real, sanitized name before spawning yt-dlp.
+    let tmpl = if task.include_playlist {
+        let raw = task.save_path.lock().unwrap().display().to_string();
+        if raw.contains("%(playlist_title)s") {
+            let info = dynamic_info(&task.app, bin, &task.url).await;
+            let ptitle = info
+                .playlist_title
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| download::sanitize(&s))
+                .unwrap_or_else(|| "Playlist".to_string());
+            let base = task.save_base.lock().unwrap().join(&ptitle);
+            *task.save_base.lock().unwrap() = base;
+            if let Some(n) = info.playlist_count {
+                *task.filename.lock().unwrap() = format!("0 / {} videos", n);
+            }
+            raw.replace("%(playlist_title)s", &ptitle)
+        } else {
+            raw
+        }
+    } else {
+        task.save_path.lock().unwrap().display().to_string()
+    };
     args.push("-o".into());
-    args.push(task.save_path.lock().unwrap().to_string_lossy().into_owned());
+    args.push(tmpl);
     args.push(task.url.clone());
 
     let mut child = crate::tools::silent(std::process::Command::new(bin))
@@ -639,6 +877,27 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                 break;
             }
             let Ok(line) = line else { continue };
+            if let Some(title) = line.strip_prefix("__VX_TITLE__:") {
+                let t = title.trim().to_string();
+                if !t.is_empty() {
+                    {
+                        let mut cur = task.title.lock().unwrap();
+                        if *cur != t {
+                            *cur = t.clone();
+                        }
+                    }
+                    *task.filename.lock().unwrap() = download::sanitize(&t);
+                    let _ = task.app.emit("downloads-changed", ());
+                }
+                continue;
+            }
+            if let Some(sz) = line.strip_prefix("__VX_SIZE__:") {
+                if let Some(total) = parse_size_or_bytes(sz) {
+                    task.total.store(total, Ordering::Relaxed);
+                    let _ = task.app.emit("downloads-changed", ());
+                }
+                continue;
+            }
             if let Some((pct, total, speed)) = parse_progress(&line) {
                 if total > 0 {
                     task.total.store(total, Ordering::Relaxed);
@@ -657,65 +916,88 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
 
     if task.cancel.load(Ordering::Relaxed) {
         task.set_status(DlStatus::Cancelled);
-        let sp = task.save_path.lock().unwrap();
-        if let Some(f) = sp.parent().map(|p| p.join(format!("{}.part", sp.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))) {
-            let _ = std::fs::remove_file(f);
-        }
+        let _ = std::fs::remove_dir_all(&tmp_root);
         return Ok(());
     }
 
     if status.success() {
-        // Locate the built output file(s) via the unique prefix and record the real path.
-        let dir = task.save_path.lock().unwrap().parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let prefix = format!("vx_{}_", task.id);
-        let outputs = find_outputs(&dir, &prefix);
-        if !outputs.is_empty() {
-            // Strip the temporary prefix from final filename(s).
-            let mut real_names: Vec<String> = Vec::new();
-            for real in &outputs {
-                let clean = real.file_name().map(|s| s.to_string_lossy()[prefix.len()..].to_string()).unwrap_or_default();
-                if !clean.is_empty() {
-                    let new_path = real.with_file_name(&clean);
-                    if std::fs::rename(&real, &new_path).is_ok() {
-                        real_names.push(new_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        if task.include_playlist {
+            // Whole-playlist job: locate the videos inside a "NN - Title.ext"
+            // folder (or any sub-folder) and summarize them on the row.
+            let base = task.save_base.lock().unwrap().clone();
+            let outputs = find_playlist_outputs(&base, started);
+            if !outputs.is_empty() {
+                let folder = outputs[0].parent().map(|p| p.to_path_buf()).unwrap_or(base);
+                let count = outputs.len();
+                let sum: u64 = outputs.iter().filter_map(|p| p.metadata().ok()).map(|m| m.len()).sum();
+                let folder_name = folder.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                *task.filename.lock().unwrap() = format!("{} videos", count);
+                *task.title.lock().unwrap() = folder_name;
+                *task.save_path.lock().unwrap() = folder;
+                if sum > 0 {
+                    task.total.store(sum, Ordering::Relaxed);
+                    task.done.store(sum, Ordering::Relaxed);
+                } else {
+                    task.done.store(task.total.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                let _ = task.app.emit("downloads-changed", ());
+            } else {
+                *task.error.lock().unwrap() = Some("Output file not found".into());
+            }
+        } else {
+            // Locate the built output file(s) via the unique prefix and record the real path.
+            let dir = task.save_path.lock().unwrap().parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let prefix = format!("vx_{}_", task.id);
+            let outputs = find_outputs(&dir, &prefix);
+            if !outputs.is_empty() {
+                // Strip the temporary prefix from final filename(s).
+                let mut real_names: Vec<String> = Vec::new();
+                for real in &outputs {
+                    let raw = real.file_name().map(|s| s.to_string_lossy()[prefix.len()..].to_string()).unwrap_or_default();
+                    if !raw.is_empty() {
+                        if let Some(fp) = finalize_file(real, &dir, &clean_output_name(&raw)) {
+                            real_names.push(fp.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+                        }
                     }
                 }
-            }
-            let first = dir.join(real_names.first().cloned().unwrap_or_default());
-            if real_names.len() == 1 {
-                let fname = real_names[0].clone();
-                *task.filename.lock().unwrap() = fname.clone();
-                *task.title.lock().unwrap() = first
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                *task.save_path.lock().unwrap() = first.clone();
+                let first = dir.join(real_names.first().cloned().unwrap_or_default());
+                if real_names.len() == 1 {
+                    let fname = real_names[0].clone();
+                    *task.filename.lock().unwrap() = fname.clone();
+                    *task.title.lock().unwrap() = first
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    *task.save_path.lock().unwrap() = first.clone();
+                } else {
+                    *task.filename.lock().unwrap() = format!("{} subtitles", outputs.len());
+                    *task.title.lock().unwrap() = dir
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    *task.save_path.lock().unwrap() = dir.join(real_names.join(", "));
+                }
+                let _ = task.app.emit("downloads-changed", ());
             } else {
-                *task.filename.lock().unwrap() = format!("{} subtitles", outputs.len());
-                *task.title.lock().unwrap() = dir
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                *task.save_path.lock().unwrap() = dir.join(real_names.join(", "));
+                *task.error.lock().unwrap() = Some("Output file not found".into());
             }
-            let _ = task.app.emit("downloads-changed", ());
-        } else {
-            *task.error.lock().unwrap() = Some("Output file not found".into());
-        }
-        let sz = std::fs::metadata(&*task.save_path.lock().unwrap())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if sz > 0 {
-            task.total.store(sz, Ordering::Relaxed);
-            task.done.store(sz, Ordering::Relaxed);
-        } else {
-            task.done.store(task.total.load(Ordering::Relaxed), Ordering::Relaxed);
+            let sz = std::fs::metadata(&*task.save_path.lock().unwrap())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if sz > 0 {
+                task.total.store(sz, Ordering::Relaxed);
+                task.done.store(sz, Ordering::Relaxed);
+            } else {
+                task.done.store(task.total.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
         }
         task.set_status(DlStatus::Completed);
     } else {
         *task.error.lock().unwrap() = Some("Download failed".into());
         task.set_status(DlStatus::Error);
     }
+    // Remove the per-task staging dir (fragments, .part, thumbnails, …).
+    let _ = std::fs::remove_dir_all(&tmp_root);
     Ok(())
 }
 
@@ -735,6 +1017,48 @@ fn find_outputs(dir: &std::path::Path, prefix: &str) -> Vec<std::path::PathBuf> 
         .collect();
     out.sort();
     out
+}
+
+/// Recursively find playlist outputs (files named "NN - <Title>.<ext>") under
+/// `dir` that were created after `since`.
+fn find_playlist_outputs(dir: &std::path::Path, since: std::time::SystemTime) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(find_playlist_outputs(&p, since));
+            } else if is_playlist_output_name(&p) {
+                let fresh = p
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| t >= since)
+                    .unwrap_or(true);
+                if fresh {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// File name matches the "NN - Title.ext" playlist convention.
+fn is_playlist_output_name(p: &std::path::Path) -> bool {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| {
+            let b = s.as_bytes();
+            b.len() > 4
+                && b[0].is_ascii_digit()
+                && b[1].is_ascii_digit()
+                && b[2] == b' '
+                && b[3] == b'-'
+                && b[4] == b' '
+        })
+        .unwrap_or(false)
 }
 
 pub async fn progress_watch(task: Arc<YtTask>) {

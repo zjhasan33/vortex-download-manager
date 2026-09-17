@@ -274,11 +274,12 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let start_at = p["start_at"].as_u64();
                         let embed_subs = p["embed_subs"].as_bool();
                         let sub_langs = p["sub_langs"].as_str().map(|s| s.to_string());
+                        let embed_thumbnail = p["embed_thumbnail"].as_bool();
                         let sp = settings_path(app);
                         let app2 = app.clone();
                         let mgr2 = mgr.clone();
                         tokio::spawn(async move {
-                            let _ = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs).await;
+                            let _ = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail).await;
                         });
                         json!({"type":"ack","ok":true,"success":true,"action":"ytdl_started"}).to_string()
                     }
@@ -315,10 +316,27 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     let url = p["url"].as_str().unwrap_or("").to_string();
                     let pages = p["max_pages"].as_u64().map(|n| n as usize).unwrap_or(10);
                     let kinds: Vec<String> = p["kinds"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
-                    match grabber::grab_site(&url, pages, kinds).await {
+                    let cancel = std::sync::atomic::AtomicBool::new(false);
+                    match grabber::grab_site(&url, pages, kinds, &cancel).await {
                         Ok(items) => json!({"type":"grabbed","ok":true,"items":items}).to_string(),
                         Err(e) => err(&e),
                     }
+                }
+                "open_grabber" => {
+                    let p = &v["payload"];
+                    let url = p["url"].as_str().unwrap_or("").to_string();
+                    // Bring Vortex to the front and open the Site Grabber modal
+                    // pre-filled with the active tab's URL.
+                    let app2 = app.clone();
+                    tokio::spawn(async move {
+                        if let Some(win) = app2.get_webview_window("main") {
+                            let _ = win.show();
+                            let _ = win.unminimize();
+                            let _ = win.set_focus();
+                        }
+                        let _ = app2.emit("grabber-open", serde_json::json!({ "url": url }));
+                    });
+                    json!({"type":"ack","ok":true,"success":true,"action":"grabber_opened"}).to_string()
                 }
                 "remove" => {
                     let p = &v["payload"];
@@ -382,7 +400,7 @@ async fn download_op(app: &AppHandle, mgr: &Arc<DlManager>, p: &Value) -> String
             .or_else(|| info.formats.iter().find(|f| f.has_video && f.has_audio))
             .or_else(|| info.formats.iter().find(|f| f.has_video));
         let Some(fmt) = fmt else { return err("no suitable format") };
-        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None, None, None).await;
+        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None, None, None, None).await;
     }
     let opts = download::StartOpts {
         segments,
@@ -391,6 +409,8 @@ async fn download_op(app: &AppHandle, mgr: &Arc<DlManager>, p: &Value) -> String
         start_at: p["start_at"].as_u64(),
         auto_retries: settings.auto_retries,
         proxy: settings.proxy.clone(),
+        referer: p["referer"].as_str().map(|s| s.to_string()),
+        cookies: p["cookies"].as_str().map(|s| s.to_string()),
     };
     match download::start(app.clone(), url.clone(), settings.path.clone(), opts, mgr.limit.clone()).await {
         Ok(task) => {
@@ -420,10 +440,12 @@ async fn start_ytdl(
     start_at: Option<u64>,
     embed_subs: Option<bool>,
     sub_langs: Option<String>,
+    embed_thumbnail: Option<bool>,
 ) -> String {
     let settings = crate::state::load_settings(app);
     let embed = embed_subs.unwrap_or(settings.embed_subs);
     let langs = sub_langs.unwrap_or_else(|| settings.sub_langs.clone());
+    let embed_thumb = embed_thumbnail.unwrap_or(settings.embed_thumbnail);
     match ytdlp::start(
         app.clone(),
         url,
@@ -436,6 +458,7 @@ async fn start_ytdl(
         start_at,
         embed,
         langs,
+        embed_thumb,
     )
     .await
     {

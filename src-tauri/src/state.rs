@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -20,6 +20,8 @@ pub struct DlManager {
     pub slot: tokio::sync::Notify,
     /// Terminal entries shown in the list (survive restart).
     pub history: Mutex<Vec<DlView>>,
+    /// Stop flag for the Site Grabber crawl (set by the Stop button).
+    pub grab_cancel: Arc<AtomicBool>,
 }
 
 impl Default for DlManager {
@@ -38,6 +40,7 @@ impl DlManager {
             active: AtomicUsize::new(0),
             slot: tokio::sync::Notify::new(),
             history: Mutex::new(Vec::new()),
+            grab_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -374,6 +377,8 @@ pub struct Settings {
     pub embed_subs: bool,
     /// Preferred subtitle language(s) for embedding, e.g. "en" or "en,bn".
     pub sub_langs: String,
+    /// Auto-embed the video's thumbnail / cover art into downloads (MP4, MKV, MP3).
+    pub embed_thumbnail: bool,
     /// Saved site logins used to auto-authenticate HTTP downloads (Basic/Digest).
     #[serde(default)]
     pub credentials: Vec<crate::auth::Cred>,
@@ -400,6 +405,7 @@ impl Default for Settings {
             clipboard_monitor: false,
             embed_subs: true,
             sub_langs: "en".into(),
+            embed_thumbnail: true,
             credentials: Vec::new(),
         }
     }
@@ -696,6 +702,27 @@ fn urls_in_text(text: &str) -> Vec<String> {
     out
 }
 
+/// True when `url` is a YouTube/YouTube-mirror playlist link.
+/// Matches with or without `www` (e.g. `https://youtube.com/playlist?list=…`,
+/// `https://m.youtube.com/playlist?list=…`, `https://youtu.be/abc?list=…`).
+fn is_youtube_playlist_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    // Host is a YouTube family domain (www / m. / no-www all contain the bare domain).
+    if !(lower.contains("youtube.com")
+        || lower.contains("youtu.be")
+        || lower.contains("youtube-nocookie.com"))
+    {
+        return false;
+    }
+    // Bare playlist pages: /playlist or /playlists (with or without query).
+    if lower.contains("/playlist") {
+        return true;
+    }
+    // A real `list=` query parameter: watch?v=…&list=…, youtu.be/…?list=….
+    let Some(qi) = lower.find('?') else { return false };
+    lower[qi + 1..].split('&').any(|kv| kv.starts_with("list="))
+}
+
 /// Spawn the clipboard watcher. While `clipboard_monitor` is enabled it polls the
 /// clipboard and auto-queues any new http(s) URL it finds (like IDM).
 pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
@@ -727,6 +754,21 @@ pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
                 last = Some(url.clone());
                 last_seen_ms = now;
 
+                if is_youtube_playlist_url(&url) {
+                    let app = app.clone();
+                    let url = url.clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Bring Vortex to the front so the playlist modal is immediately visible.
+                        if let Some(win) = app.get_webview_window("main") {
+                            let _ = win.show();
+                            let _ = win.unminimize();
+                            let _ = win.set_focus();
+                        }
+                        let _ = app.emit("playlist-clip", serde_json::json!({ "url": url }));
+                    });
+                    continue;
+                }
+
                 let app = app.clone();
                 let mgr = mgr.clone();
                 let settings = settings.clone();
@@ -739,6 +781,8 @@ pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
                             start_at: None,
                             auto_retries: settings.auto_retries,
                             proxy: settings.proxy.clone(),
+                            referer: None,
+                            cookies: None,
                         };
                         if let Ok(task) = crate::download::start(app.clone(), url.clone(), settings.path.clone(), opts, mgr.limit.clone()).await {
                             let id = task.id.clone();

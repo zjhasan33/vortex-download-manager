@@ -19,10 +19,18 @@
       <button id="addbtn" class="btn primary">Add URL</button>
     </section>
 
+    <section class="grabpage">
+      <button id="grab-page" class="btn primary grabpage-btn">🔗 Grab All Links on This Page</button>
+    </section>
+
     <section class="notify">
       <label class="toggle">
         <input type="checkbox" id="notify-toggle" />
         <span>Show notification when download link detected</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="intercept-toggle" checked />
+        <span>Intercept browser downloads (Vortex as default downloader)</span>
       </label>
       <label class="toggle">
         <input type="checkbox" id="subs-toggle" checked />

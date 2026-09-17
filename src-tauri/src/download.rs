@@ -31,17 +31,27 @@ pub fn log_net_err(e: &reqwest::Error, ctx: &str) {
 }
 
 pub fn build_client(proxy: &str) -> Result<Client, String> {
-    build_client_with_ua(proxy, crate::tools::BROWSER_UA)
+    build_client_with_ua(proxy, crate::tools::BROWSER_UA, &[])
+}
+
+/// Like `build_client`, but with extra default request headers (e.g. cookies
+/// and referer captured from a browser download takeover).
+pub fn build_client_with_headers(proxy: &str, headers: &[(String, String)]) -> Result<Client, String> {
+    build_client_with_ua(proxy, crate::tools::BROWSER_UA, headers)
 }
 
 /// Client that presents a neutral tool UA (e.g. `Wget/x`). Some mirror
 /// anti-hotlinking guards bounce browser-like UAs in an endless 302 loop;
 /// a curl/wget-grade UA gets served normally.
 pub fn build_tool_client(proxy: &str) -> Result<Client, String> {
-    build_client_with_ua(proxy, crate::tools::TOOL_UA)
+    build_client_with_ua(proxy, crate::tools::TOOL_UA, &[])
 }
 
-fn build_client_with_ua(proxy: &str, ua: &str) -> Result<Client, String> {
+pub fn build_tool_client_with_headers(proxy: &str, headers: &[(String, String)]) -> Result<Client, String> {
+    build_client_with_ua(proxy, crate::tools::TOOL_UA, headers)
+}
+
+fn build_client_with_ua(proxy: &str, ua: &str, extra: &[(String, String)]) -> Result<Client, String> {
     let mut cb = Client::builder()
         .user_agent(ua)
         // Small TTFB chunks: disable Nagle so range requests stream immediately.
@@ -64,6 +74,20 @@ fn build_client_with_ua(proxy: &str, ua: &str) -> Result<Client, String> {
     } else {
         // Never fall back to system/HTTP(S)_PROXY env (e.g. BurpSuite 127.0.0.1:8080).
         cb = cb.no_proxy();
+    }
+    if !extra.is_empty() {
+        let mut hdrs = reqwest::header::HeaderMap::new();
+        for (k, v) in extra {
+            if let (Ok(k), Ok(v)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(v),
+            ) {
+                hdrs.insert(k, v);
+            }
+        }
+        if !hdrs.is_empty() {
+            cb = cb.default_headers(hdrs);
+        }
     }
     cb.build().map_err(|e| format!("Client error: {e}"))
 }
@@ -212,18 +236,43 @@ pub struct StartOpts {
     pub start_at: Option<u64>,
     pub auto_retries: u32,
     pub proxy: String,
+    /// Referer header to send (the page that initiated the browser download).
+    pub referer: Option<String>,
+    /// Cookie header string (e.g. "sid=abc; pref=1") for authenticated downloads.
+    pub cookies: Option<String>,
 }
 
 impl Default for StartOpts {
     fn default() -> Self {
+        Self::new(8)
+    }
+}
+
+impl StartOpts {
+    pub fn new(segments: usize) -> Self {
         StartOpts {
-            segments: 8,
+            segments,
             filename: None,
             categorize: true,
             start_at: None,
             auto_retries: 3,
             proxy: String::new(),
+            referer: None,
+            cookies: None,
         }
+    }
+
+    /// Extra request headers a download should carry
+    /// (Cookie/Referer captured from a browser download takeover).
+    pub fn extra_headers(&self) -> Vec<(String, String)> {
+        let mut h = Vec::new();
+        if let Some(c) = self.cookies.as_deref().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+            h.push(("Cookie".into(), c.to_string()));
+        }
+        if let Some(r) = self.referer.as_deref().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+            h.push(("Referer".into(), r.to_string()));
+        }
+        h
     }
 }
 
@@ -520,7 +569,12 @@ pub async fn start(
     let base = PathBuf::from(save_path.trim());
     let mut url = url;
 
-    let mut client = build_client(&opts.proxy)?;
+    let extra = opts.extra_headers();
+    let mut client = if extra.is_empty() {
+        build_client(&opts.proxy)?
+    } else {
+        build_client_with_headers(&opts.proxy, &extra)?
+    };
 
     // Auto-login with any credential already saved for this host (Basic/Digest).
     let settings = crate::state::load_settings(&app);
@@ -539,7 +593,11 @@ pub async fn start(
             // 302 loop (e.g. mirrors.nju.edu.cn redirects to itself); retry once
             // with a neutral tool UA like IDM/wget do.
             log_net_err(&e, "probe redirect-loop; retrying with tool UA");
-            client = build_tool_client(&opts.proxy)?;
+            client = if extra.is_empty() {
+                build_tool_client(&opts.proxy)?
+            } else {
+                build_tool_client_with_headers(&opts.proxy, &extra)?
+            };
             let (p, a) = send_authorized(&client, &url, Some("bytes=0-0"), &mut auth)
                 .await
                 .map_err(|e2| {

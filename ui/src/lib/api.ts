@@ -44,6 +44,15 @@ export async function initApi() {
     await listen<AuthRequiredPayload>("auth-required", (e) => {
       api.onAuthRequired?.(e.payload);
     }),
+    await listen<{ url: string }>("playlist-clip", (e) => {
+      api.onPlaylistClip?.(e.payload.url);
+    }),
+    await listen("grabber-open", (e) => {
+      // Accept both `{ url: "…" }` and a bare string payload.
+      const p = e.payload as unknown;
+      const url = typeof p === "string" ? p : (p as { url?: string } | null)?.url;
+      if (url) api.onGrabberOpen?.(url);
+    }),
   );
 }
 
@@ -52,8 +61,8 @@ async function cmd<T>(name: string, args?: Record<string, unknown>): Promise<T> 
 }
 
 export const api = {
-  startDownload: (url: string, savePath: string, segments: number, filename?: string, startAt?: number) =>
-    cmd<Download>("start_download", { url, savePath, segments, filename, startAt }),
+  startDownload: (url: string, savePath: string, segments: number, filename?: string, startAt?: number, startPaused?: boolean) =>
+    cmd<Download>("start_download", { url, savePath, segments, filename, startAt, startPaused }),
   pauseDownload: (id: string) => cmd<void>("pause_download", { id }),
   resumeDownload: (id: string) => cmd<void>("resume_download", { id }),
   retryAllDownloads: () => cmd<number>("retry_all_downloads"),
@@ -68,7 +77,8 @@ export const api = {
 
   fetchYtdlInfo: (url: string) => cmd<YtdlInfo>("fetch_ytdl_info", { url }),
   grabSite: (url: string, maxPages?: number, kinds?: string[]) =>
-    cmd<GrabItem[]>("grab_site", { url, maxPages, kinds }),  startYtdl: (
+    cmd<GrabItem[]>("grab_site", { url, maxPages, kinds }),
+  grabStop: () => cmd<void>("grab_stop"),  startYtdl: (
     url: string,
     formatId: string,
     savePath: string,
@@ -77,6 +87,7 @@ export const api = {
     startAt?: number,
     embedSubs?: boolean,
     subLangs?: string,
+    embedThumbnail?: boolean,
   ) =>
     cmd<Download>("start_ytdl", {
       url,
@@ -87,6 +98,7 @@ export const api = {
       startAt,
       embedSubs,
       subLangs,
+      embed_thumbnail: embedThumbnail,
     }),
 
   openFolder: (path: string) => cmd<void>("open_folder", { path }),
@@ -107,6 +119,10 @@ export const api = {
     cmd<void>("window_action", { action }),
   /** Set by app.ts to open the login dialog when a download needs credentials. */
   onAuthRequired: null as ((p: AuthRequiredPayload) => void) | null,
+  /** Set by app.ts to open the YouTube modal when a playlist URL is copied. */
+  onPlaylistClip: null as ((url: string) => void) | null,
+  /** Set by app.ts to open the Site Grabber modal (extension "Grab This Page"). */
+  onGrabberOpen: null as ((url: string) => void) | null,
 };
 
 // ---- Lightweight reactive store ----

@@ -9,6 +9,13 @@ import { openYoutube } from "./components/youtube";
 
 // When a download hits HTTP 401, pop the login dialog.
 api.onAuthRequired = (p) => openAuthDialog(p);
+// A playlist URL copied to the clipboard (with clipboard watch ON) opens the
+// YouTube modal pre-filled — but does NOT auto-analyze: users often copy a
+// link just to share it, so they decide with Analyze / Download / Cancel.
+api.onPlaylistClip = (url) => openYoutube({ url, playlist: true });
+// "Grab All Links on This Page" from the browser extension popup opens the
+// Site Grabber modal pre-filled and starts the crawl automatically.
+api.onGrabberOpen = (url) => openGrabber(url || "", true);
 
 const CATS: { id: CategoryId; label: string; icon: "video" | "audio" | "doc" | "program" | "zip" | "other" }[] = [
   { id: "all", label: "All Downloads", icon: "other" },
@@ -29,6 +36,29 @@ const STATUS_LABEL: Record<Download["status"], string> = {
   error: "Error",
   cancelled: "Cancelled",
   needs_auth: "Login required",
+};
+
+/** Row-sort keys tied to the clickable list headers + the quick date toggle. */
+type SortColumn = "date" | "name" | "size" | "status";
+
+/** Deterministic rank so STATUS sorts intuitively (active → merging → … → cancelled). */
+const STATUS_RANK: Record<Download["status"], number> = {
+  downloading: 0,
+  merging: 1,
+  queued: 2,
+  needs_auth: 3,
+  paused: 4,
+  error: 5,
+  completed: 6,
+  cancelled: 7,
+};
+
+/** First-click default order per column (name A–Z, size largest, status by rank, date newest). */
+const SORT_DEFAULT: Record<SortColumn, "asc" | "desc"> = {
+  date: "desc",
+  name: "asc",
+  size: "desc",
+  status: "asc",
 };
 
 function esc(s: string): string {
@@ -63,6 +93,7 @@ export class VortexApp {
   private lastRowKey = "";
   private r1 = () => {};
   private r2 = () => {};
+  private sort: { column: SortColumn; order: "asc" | "desc" } = { column: "date", order: "desc" };
 
   constructor() {
     this.root = document.getElementById("app")!;
@@ -122,6 +153,7 @@ export class VortexApp {
       <button class="tbtn" id="tb-import">${icon("file", 15)} Import</button>
       <button class="tbtn" id="tb-settings">${icon("gear", 15)} Settings</button>
       <div class="grow"></div>
+      <button class="tbtn" id="tb-sort" title="Sort by date (Newest / Oldest)">⇅ Newest</button>
       <div class="searchbox">
         ${icon("search", 14)}
         <input id="tb-search" placeholder="Search downloads…" spellcheck="false" value="${this.search}" />
@@ -159,7 +191,11 @@ export class VortexApp {
     <div class="main">
       <div class="list-head">
         <label class="dl-check"><input type="checkbox" id="check-all" title="Select all" /></label>
-        <span>File</span><span>Size</span><span>Progress</span><span class="dl-head-speed">Speed</span><span class="dl-head-eta">Time Left</span><span>Status</span><span></span>
+        <span data-sort="name" class="dl-sorthdr" title="Sort by file name">File<span class="dl-dir"></span></span>
+        <span data-sort="size" class="dl-sorthdr" title="Sort by size">Size<span class="dl-dir"></span></span>
+        <span>Progress</span><span class="dl-head-speed">Speed</span><span class="dl-head-eta">Time Left</span>
+        <span data-sort="status" class="dl-sorthdr" title="Sort by status">Status<span class="dl-dir"></span></span>
+        <span></span>
       </div>
       <div class="bulkbar" id="bulkbar">
         <span class="bulk-count" id="bulk-count">0 selected</span>
@@ -204,7 +240,46 @@ export class VortexApp {
     return store.downloads
       .filter((d) => (this.cat === "all" ? true : d.category === this.cat))
       .filter((d) => !q || (d.title + d.filename + d.url).toLowerCase().includes(q))
-      .sort((a, b) => b.created_at - a.created_at);
+      .sort((a, b) => this.compare(a, b));
+  }
+
+  private compare(a: Download, b: Download): number {
+    const dir = this.sort.order === "asc" ? 1 : -1;
+    let cmp = 0;
+    switch (this.sort.column) {
+      case "date":
+        cmp = (a.completed_at ?? a.created_at) - (b.completed_at ?? b.created_at);
+        break;
+      case "name":
+        cmp = (a.title || a.filename).localeCompare(b.title || b.filename, undefined, { numeric: true });
+        break;
+      case "size":
+        cmp = (a.total_size || a.downloaded) - (b.total_size || b.downloaded);
+        break;
+      case "status":
+        cmp = STATUS_RANK[a.status] - STATUS_RANK[b.status];
+        break;
+    }
+    return cmp * dir;
+  }
+
+  private setSort(col: SortColumn) {
+    // Same column toggles direction; a new column uses its sensible first-click default.
+    this.sort =
+      this.sort.column === col
+        ? { column: col, order: this.sort.order === "asc" ? "desc" : "asc" }
+        : { column: col, order: SORT_DEFAULT[col] };
+    this.updateSortChrome();
+    this.render();
+  }
+
+  private updateSortChrome() {
+    this.root.querySelectorAll<HTMLElement>(".list-head [data-sort] .dl-dir").forEach((el) => (el.textContent = ""));
+    const arrow = this.root.querySelector<HTMLElement>(`.list-head [data-sort="${this.sort.column}"] .dl-dir`);
+    if (arrow) arrow.textContent = this.sort.order === "asc" ? "▲" : "▼";
+    const t = this.root.querySelector<HTMLButtonElement>("#tb-sort");
+    if (t)
+      t.textContent = this.sort.column === "date" && this.sort.order === "asc" ? "⇅ Oldest" : "⇅ Newest";
   }
 
   private row(d: Download): string {
@@ -254,7 +329,7 @@ export class VortexApp {
           [d.id, d.status, d.source, d.category, d.filename, d.total_size, d.segments, d.error ?? "", d.completed_at ?? 0, d.created_at].join("~"),
       )
       .join("|");
-    return `${this.cat}|${this.search}|${sel}|${rows}`;
+    return `${this.cat}|${this.search}|${this.sort.column}:${this.sort.order}|${sel}|${rows}`;
   }
 
   /** Update only live metrics on already-rendered rows (no innerHTML rebuild → no flicker). */
@@ -450,8 +525,8 @@ export class VortexApp {
         b.onclick = () => api.windowAction(b.dataset.win as "minimize" | "toggle" | "close");
       });
       this.root.querySelector<HTMLButtonElement>("#tb-add")!.onclick = openAddUrl;
-      this.root.querySelector<HTMLButtonElement>("#tb-yt")!.onclick = openYoutube;
-      this.root.querySelector<HTMLButtonElement>("#tb-grab")!.onclick = openGrabber;
+      this.root.querySelector<HTMLButtonElement>("#tb-yt")!.onclick = () => openYoutube(undefined);
+      this.root.querySelector<HTMLButtonElement>("#tb-grab")!.onclick = () => openGrabber(undefined);
       this.root.querySelector<HTMLButtonElement>("#tb-import")!.onclick = async () => {
         const urls = await api.readUrls();
         if (!urls.length) return toast("No URLs found", "err");
@@ -461,6 +536,11 @@ export class VortexApp {
         toast(`${urls.length} download(s) queued`, "ok");
       };
       this.root.querySelector<HTMLButtonElement>("#tb-settings")!.onclick = openSettings;
+      this.root.querySelector<HTMLButtonElement>("#tb-sort")!.onclick = () => this.setSort("date");
+      this.root.querySelectorAll<HTMLElement>(".list-head [data-sort]").forEach((el) => {
+        el.onclick = () => this.setSort(el.dataset.sort as SortColumn);
+      });
+      this.updateSortChrome();
       const pa = this.root.querySelector<HTMLButtonElement>("#tb-pause");
       const re = this.root.querySelector<HTMLButtonElement>("#tb-resume");
       if (pa) pa.onclick = async () => {

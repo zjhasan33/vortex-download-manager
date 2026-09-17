@@ -65,6 +65,37 @@ body {
   border-color: rgba(0, 229, 255, 0.7);
 }
 
+.grabpage {
+  padding: 0 14px 8px;
+}
+.grabpage .btn {
+  width: 100%;
+  padding: 9px 13px;
+}
+
+#vx-toast {
+  position: fixed;
+  left: 14px;
+  right: 14px;
+  bottom: 12px;
+  z-index: 99;
+  background: rgba(4, 18, 31, 0.94);
+  border: 1px solid rgba(0, 229, 255, 0.35);
+  color: #e6f4ff;
+  font-size: 12px;
+  padding: 9px 12px;
+  border-radius: 9px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+#vx-toast.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 .notify {
   padding: 0 14px 10px;
   display: flex;
