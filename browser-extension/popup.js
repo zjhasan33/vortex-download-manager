@@ -1,35 +1,26 @@
 // Vortex companion popup.
 
+// Dual-browser support (see background.js): alias the Firefox `browser.*`
+// namespace for Chrome so the same code runs on both.
+if (typeof browser === "undefined" && typeof globalThis.chrome !== "undefined") {
+  var browser = globalThis.chrome;
+}
+
 function $(id) {
   return document.getElementById(id);
 }
 
-// Send a message to the background service worker. Always resolves (never hangs):
-// a timeout + chrome.runtime.lastError guard guarantees a result.
+// Send a message to the background event page. Always resolves (never hangs):
+// a timeout guards against a missing/closed bridge.
 function send(msg, timeoutMs = 8000) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (res) => {
-      if (settled) return;
-      settled = true;
-      resolve(res || {});
-    };
-    const timer = setTimeout(
-      () => done({ error: "No response from Vortex bridge (timed out)" }),
-      timeoutMs
-    );
-    try {
-      chrome.runtime.sendMessage(msg, (res) => {
-        clearTimeout(timer);
-        const err = chrome.runtime.lastError;
-        if (err) return done({ error: err.message || "bridge error" });
-        done(res);
-      });
-    } catch (e) {
-      clearTimeout(timer);
-      done({ error: String(e) });
-    }
-  });
+  const timeout = new Promise((resolve) =>
+    setTimeout(() => resolve({ error: "No response from Vortex bridge (timed out)" }), timeoutMs)
+  );
+  const call = browser.runtime.sendMessage(msg).then(
+    (res) => res || {},
+    (e) => ({ error: (e && e.message) || String(e) })
+  );
+  return Promise.race([call, timeout]);
 }
 
 function fmtBytes(n) {
@@ -149,7 +140,7 @@ $("clear").addEventListener("click", () => {
 
 // ---- Pairing key ----
 (async () => {
-  const stored = (await chrome.storage.local.get({ vx_token: "" })).vx_token;
+  const stored = (await browser.storage.local.get({ vx_token: "" })).vx_token;
   const pairInput = $("pair-key");
   if (stored) {
     pairInput.value = stored;
@@ -160,7 +151,7 @@ $("clear").addEventListener("click", () => {
 $("pair-save").addEventListener("click", async () => {
   const key = $("pair-key").value.trim();
   if (!key) return;
-  await chrome.storage.local.set({ vx_token: key });
+  await browser.storage.local.set({ vx_token: key });
   $("pair-key").placeholder = "Key saved ✓";
   // Force reconnection with the new key
   $("pair-save").textContent = "Saved ✓";
@@ -169,19 +160,29 @@ $("pair-save").addEventListener("click", async () => {
 });
 
 $("pair-clear").addEventListener("click", async () => {
-  await chrome.storage.local.remove("vx_token");
+  await browser.storage.local.remove("vx_token");
   $("pair-key").value = "";
   $("pair-key").placeholder = "Paste key from Vortex → Settings";
 });
 
-// ---- Notification toggle ----
+// ---- Notification toggle (DEFAULT: off — link detection is silent) ----
 (async () => {
-  const { vx_notify } = await chrome.storage.local.get({ vx_notify: true });
-  $("notify-toggle").checked = vx_notify !== false;
+  const { vx_notify } = await browser.storage.local.get({ vx_notify: false });
+  $("notify-toggle").checked = vx_notify === true;
 })();
 
 $("notify-toggle").addEventListener("change", async (e) => {
-  await chrome.storage.local.set({ vx_notify: !!e.target.checked });
+  await browser.storage.local.set({ vx_notify: !!e.target.checked });
+});
+
+// ---- Subtitle embed toggle ----
+(async () => {
+  const { vx_subs_embed } = await browser.storage.local.get({ vx_subs_embed: true });
+  $("subs-toggle").checked = vx_subs_embed !== false;
+})();
+
+$("subs-toggle").addEventListener("change", async (e) => {
+  await browser.storage.local.set({ vx_subs_embed: !!e.target.checked });
 });
 
 refreshStatus();

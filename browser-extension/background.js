@@ -1,7 +1,13 @@
-// Vortex Companion — background service worker.
+// Vortex Companion — background event page.
 // Bridges the page/content-script with the desktop Vortex app over a local WebSocket.
 // Also acts like an IDM extension: watches network traffic, grabs media/file URLs,
 // context menus, and notifications.
+
+// Dual-browser support: Firefox provides `browser.*` natively; on Chrome alias the
+// same promise-based namespace so one codebase runs on both.
+if (typeof browser === "undefined" && typeof globalThis.chrome !== "undefined") {
+  var browser = globalThis.chrome;
+}
 
 const WS_ADDR = "ws://127.0.0.1:17190";
 const MEDIA_EXT = ["mp4", "webm", "mov", "m4v", "mkv", "flv", "avi", "m4a", "mp3", "ogg", "oga", "opus", "wav", "aac", "flac", "m3u8", "mpd"];
@@ -13,13 +19,26 @@ const CAPTURES_KEY = "vx_captures";
 const NOTIFY_KEY = "vx_notify";
 
 // User preference: show desktop/browser notification on detected link.
-let notifyEnabled = true;
-chrome.storage.local.get({ [NOTIFY_KEY]: true }).then((r) => {
-  notifyEnabled = r[NOTIFY_KEY] !== false;
+// DEFAULT: disabled — notifications for link detection are off unless the user opts in.
+let notifyEnabled = false;
+browser.storage.local.get({ [NOTIFY_KEY]: false }).then((r) => {
+  notifyEnabled = r[NOTIFY_KEY] === true;
 });
-chrome.storage.onChanged.addListener((changes, area) => {
+browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[NOTIFY_KEY]) {
-    notifyEnabled = changes[NOTIFY_KEY].newValue !== false;
+    notifyEnabled = changes[NOTIFY_KEY].newValue === true;
+  }
+});
+
+// User preference: embed subtitles into yt-dlp video downloads (IDM-like).
+const SUB_EMBED_KEY = "vx_subs_embed";
+let subsEnabled = true;
+browser.storage.local.get({ [SUB_EMBED_KEY]: true }).then((r) => {
+  subsEnabled = r[SUB_EMBED_KEY] !== false;
+});
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes[SUB_EMBED_KEY]) {
+    subsEnabled = changes[SUB_EMBED_KEY].newValue !== false;
   }
 });
 
@@ -31,7 +50,7 @@ let autoAuthed = false;
 const pending = new Map(); // req -> {resolve, reject, timer}
 
 const tabTitles = new Map();
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.title) tabTitles.set(tabId, changeInfo.title);
   if (changeInfo.status === "loading" && tab.url) tabTitles.set(tabId, tab.title || "");
 });
@@ -59,7 +78,7 @@ async function connectAsync() {
 
   // ---- Authenticate with the desktop token (pairing key) ----
   try {
-    const token = (await chrome.storage.local.get({ vx_token: "" })).vx_token;
+    const token = (await browser.storage.local.get({ vx_token: "" })).vx_token;
     if (!token) throw new Error("Not paired yet: open the Vortex extension popup and paste the connection key");
     const authResp = await new Promise((resolve) => {
       const t = setTimeout(() => resolve(null), 5000);
@@ -125,7 +144,7 @@ function isOnline() {
 function launchVortex(cmd, params) {
   // cmd: "capture"; params: object of url/filename[... ] -> percent-encoded query
   const q = new URLSearchParams(params).toString();
-  return chrome.tabs.create({ url: "vortex://" + cmd + (q ? "?" + q : ""), active: false }).then(() => true);
+  return browser.tabs.create({ url: "vortex://" + cmd + (q ? "?" + q : ""), active: false }).then(() => true);
 }
 
 // ---------------- media / filename helpers ----------------
@@ -152,7 +171,9 @@ function isMediaSite(url) {
 
 function extOf(url) {
   try {
-    const path = new URL(url).pathname.toLowerCase();
+    // Strip query/hash first so "file.txt?key=123" can't bypass extension filters.
+    const clean = String(url).split("?")[0].split("#")[0];
+    const path = new URL(clean).pathname.toLowerCase();
     const m = path.match(/\.([a-z0-9]{2,5})$/);
     return m ? m[1] : "";
   } catch (e) { return ""; }
@@ -161,7 +182,7 @@ function extOf(url) {
 // ---------------- network capture (IDM-like) ----------------
 
 function addCapture(cap) {
-  chrome.storage.local.get({ [CAPTURES_KEY]: [] }).then((r) => {
+  browser.storage.local.get({ [CAPTURES_KEY]: [] }).then((r) => {
     let list = r[CAPTURES_KEY] || [];
     const dup = list.find((c) => c.url === cap.url);
     if (dup) list = list.map((c) => (c.url === cap.url ? { ...cap, at: Date.now() } : c));
@@ -169,9 +190,9 @@ function addCapture(cap) {
       list.unshift(cap);
       list = list.slice(0, 50);
     }
-    chrome.storage.local.set({ [CAPTURES_KEY]: list });
+    browser.storage.local.set({ [CAPTURES_KEY]: list });
     const last = list[0];
-    chrome.runtime.sendMessage({ type: "file_captured", capture: last }).catch(() => {});
+    browser.runtime.sendMessage({ type: "file_captured", capture: last }).catch(() => {});
     lastHud = last;
   });
 }
@@ -198,24 +219,11 @@ function maybeNotify(cap) {
     for (const [k, t] of notifiedAt) if (now - t > 60000) notifiedAt.delete(k);
   }
 
-  try {
-    chrome.notifications.create({
-      type: "basic",
-      iconUrl: "icons/icon128.png",
-      title: "Vortex — link detected",
-      message: (cap.filename || fileNameFromUrl(cap.url)) + " — click the Vortex button to download",
-      priority: 1,
-      buttons: [{ title: "Download with Vortex" }],
-    });
-  } catch (e) { /* no notifications permission */ }
+  // SILENT: IDM never shows OS toasts for detected links. Link detection only
+  // updates the popup capture list — no OS notification is created here.
+  // (Previous code calling browser.notifications.create(opts) is intentionally removed.)
+  void (now, urlKey, hostKey, host);
 }
-
-chrome.notifications.onButtonClicked.addListener((notifId, btnIdx) => {
-  chrome.notifications.clear(notifId);
-  if (btnIdx === 0 && lastHud) {
-    handleStart({ type: "direct", url: lastHud.url, filename: lastHud.filename });
-  }
-});
 
 function looksDownloadable(url, headers) {
   const ext = extOf(url);
@@ -247,7 +255,7 @@ function filenameFromDisposition(cd) {
 
 let capturedUrls = new Set();
 
-chrome.webRequest.onBeforeRequest.addListener(
+browser.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (!(details.type === "media" || details.type === "object")) return;
     const url = details.url;
@@ -267,13 +275,12 @@ chrome.webRequest.onBeforeRequest.addListener(
       viaHtml: false,
       at: Date.now(),
     });
-    if (tab) maybeNotify({ url, filename: fileNameFromUrl(url) });
   },
   { urls: ["<all_urls>"], types: ["media", "object"] },
   []
 );
 
-chrome.webRequest.onHeadersReceived.addListener(
+browser.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.url.startsWith("data:") || details.url.startsWith("blob:")) return;
     const headers = {};
@@ -299,10 +306,9 @@ chrome.webRequest.onHeadersReceived.addListener(
       viaHtml: false,
       at: Date.now(),
     });
-    if (tabId) maybeNotify({ url: details.url, filename: cdFilename || fileNameFromUrl(details.url) });
   },
   { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "other", "xmlhttprequest", "object"] },
-  ["responseHeaders", "extraHeaders"]
+  ["responseHeaders"]
 );
 
 setInterval(() => {
@@ -316,32 +322,31 @@ setInterval(() => {
 
 // ---------------- context menus ----------------
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: "vx-download-link",
-      title: "Download link with Vortex",
-      contexts: ["link"],
-    });
-    chrome.contextMenus.create({
-      id: "vx-download-media",
-      title: "Download this video/audio with Vortex",
-      contexts: ["video", "audio"],
-    });
-    chrome.contextMenus.create({
-      id: "vx-download-page",
-      title: "Download this page's video with Vortex",
-      contexts: ["page"],
-    });
-    chrome.contextMenus.create({
-      id: "vx-grab-all",
-      title: "Grab all links on this page with Vortex",
-      contexts: ["page"],
-    });
+browser.runtime.onInstalled.addListener(async () => {
+  await browser.contextMenus.removeAll();
+  browser.contextMenus.create({
+    id: "vx-download-link",
+    title: "Download link with Vortex",
+    contexts: ["link"],
+  });
+  browser.contextMenus.create({
+    id: "vx-download-media",
+    title: "Download this video/audio with Vortex",
+    contexts: ["video", "audio"],
+  });
+  browser.contextMenus.create({
+    id: "vx-download-page",
+    title: "Download this page's video with Vortex",
+    contexts: ["page"],
+  });
+  browser.contextMenus.create({
+    id: "vx-grab-all",
+    title: "Grab all links on this page with Vortex",
+    contexts: ["page"],
   });
 });
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
+browser.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "vx-download-link" && info.linkUrl) {
     if (isMediaSite(info.linkUrl)) handleAnalyze(info.linkUrl, tab);
     else handleStart({ type: "direct", url: info.linkUrl });
@@ -378,13 +383,13 @@ function collectPageLinks() {
 async function handleGrabAll(tab) {
   let links = [];
   try {
-    const res = await chrome.scripting.executeScript({
+    const res = await browser.scripting.executeScript({
       target: { tabId: tab.id },
       func: collectPageLinks,
     });
     links = (res && res[0] && res[0].result) || [];
   } catch (e) {
-    chrome.notifications.create({
+    browser.notifications.create({
       type: "basic",
       iconUrl: "icons/icon128.png",
       title: "Vortex — grab all links",
@@ -395,7 +400,7 @@ async function handleGrabAll(tab) {
   }
   links = links.slice(0, 100);
   if (!links.length) {
-    chrome.notifications.create({
+    browser.notifications.create({
       type: "basic",
       iconUrl: "icons/icon128.png",
       title: "Vortex — grab all links",
@@ -409,7 +414,7 @@ async function handleGrabAll(tab) {
     const r = await handleStart({ type: "direct", url: l.url, filename: fileNameFromUrl(l.url) });
     if (r && !r.error) queued++;
   }
-  chrome.notifications.create({
+  browser.notifications.create({
     type: "basic",
     iconUrl: "icons/icon128.png",
     title: "Vortex — grab all links",
@@ -482,7 +487,7 @@ function safeRespond(sendResponse, work, fallbackMs = 10000) {
   return true;
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tab = sender.tab;
   const pageUrl = (tab && tab.url) || "";
   const title = (tab && tab.title) || tabTitles.get(tab && tab.id) || "";
@@ -519,7 +524,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "start_ytdl") {
-    if (online) return safeRespond(sendResponse, () => rpc("start_ytdl", { url: msg.url, format_id: msg.format_id }));
+    if (online) {
+      return safeRespond(sendResponse, () => {
+        // Explicit embed override so the popup toggle works both ways
+        // (when OFF, we must send false — otherwise the desktop uses its own settings).
+        const payload = { url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled };
+        return rpc("start_ytdl", payload);
+      });
+    }
     return safeRespond(sendResponse, async () => {
       await launchVortex("capture", { url: msg.url, via: "yt", format: msg.format_id });
       return { ok: false, launched: true };
@@ -536,14 +548,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "list_captures") {
     return safeRespond(sendResponse, async () => {
-      const r = await chrome.storage.local.get({ [CAPTURES_KEY]: [] });
+      const r = await browser.storage.local.get({ [CAPTURES_KEY]: [] });
       return { captures: r[CAPTURES_KEY] || [], online };
     });
   }
 
   if (msg.type === "clear_captures") {
     return safeRespond(sendResponse, async () => {
-      await chrome.storage.local.set({ [CAPTURES_KEY]: [] });
+      await browser.storage.local.set({ [CAPTURES_KEY]: [] });
       return { ok: true };
     });
   }
@@ -553,7 +565,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // wake the worker on tab navigation to keep WS fresh
-chrome.tabs.onUpdated.addListener((tabId) => {
+browser.tabs.onUpdated.addListener((tabId) => {
   void tabId;
   if (!online) connect().catch(() => {});
 });

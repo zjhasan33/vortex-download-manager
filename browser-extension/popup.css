@@ -67,6 +67,9 @@ body {
 
 .notify {
   padding: 0 14px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .toggle {
   display: flex;

@@ -6,6 +6,12 @@
   if (window.__vortexContentInstalled) return;
   window.__vortexContentInstalled = true;
 
+  // Dual-browser support (see background.js): alias the Firefox `browser.*`
+  // namespace for Chrome so the same code runs on both.
+  if (typeof browser === "undefined" && typeof globalThis.chrome !== "undefined") {
+    var browser = globalThis.chrome;
+  }
+
   const MEDIA_EXT = ["mp4", "webm", "mov", "m4v", "mkv", "flv", "m4a", "mp3", "ogg", "oga", "opus", "wav", "aac", "flac", "m3u8"];
   const MEDIA_SITES = ["youtube.com", "youtu.be", "youtube-nocookie.com", "tiktok.com", "instagram.com", "facebook.com", "fb.watch", "twitter.com", "x.com", "dailymotion.com", "vimeo.com", "soundcloud.com", "bilibili.com", "twitch.tv", "reddit.com"];
 
@@ -20,7 +26,9 @@
   }
   function extOf(url) {
     try {
-      const p = new URL(url).pathname.toLowerCase();
+      // Strip query/hash first so "file.txt?key=123" can't bypass extension filters.
+      const clean = String(url).split("?")[0].split("#")[0];
+      const p = new URL(clean).pathname.toLowerCase();
       const m = p.match(/\.([a-z0-9]{2,5})$/);
       return m ? m[1] : "";
     } catch (e) { return ""; }
@@ -110,16 +118,13 @@
     renderPanel();
   }
 
-  // ---------------- chrome messaging ----------------
+  // ---------------- browser messaging ----------------
 
   function send(msg) {
-    return new Promise((resolve) => {
-      try {
-        chrome.runtime.sendMessage(msg, (res) => resolve(res || {}));
-      } catch (e) {
-        resolve({ error: String(e) });
-      }
-    });
+    return browser.runtime.sendMessage(msg).then(
+      (res) => res || {},
+      (e) => ({ error: (e && e.message) || String(e) })
+    );
   }
 
   // ---------------- UI ----------------
@@ -184,7 +189,7 @@
         const url = pageUrl;
         const res = await send({ type: "analyze", url });
         fetchBusy = false;
-        if (res && res.info && res.info.formats && res.info.formats.length) {
+        if (res && res.info && (res.info.formats || []).length) {
           const list = res.info.formats;
           let html2 = "";
           for (const f of list) {
@@ -193,12 +198,43 @@
               '<span class="vx-fn">' + (f.size ? " • " + fmtBytes(f.size) : "") + "</span></span>" +
               '<button class="vx-btn vx-slim" data-fid="' + esc(f.id) + '">Download</button></div>';
           }
+          const subs = (res.info.subtitles || []).slice(0, 15);
+          if (subs.length) {
+            html2 += '<div class="vx-empty" style="text-align:left;padding:8px 2px 4px">Subtitles / Captions</div>';
+            for (const s of subs) {
+              html2 +=
+                '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label) +
+                "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>SRT</button></div>";
+            }
+          }
           body.innerHTML = html2;
           body.querySelectorAll("[data-fid]").forEach((btn) => {
             btn.addEventListener("click", () => {
               btn.textContent = "Added ✓";
               btn.disabled = true;
               void send({ type: "start_ytdl", url, format_id: btn.dataset.fid });
+            });
+          });
+          body.querySelectorAll("[data-sub]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+              btn.textContent = "Added ✓";
+              btn.disabled = true;
+              void send({ type: "start_ytdl", url, format_id: "subs:srt:" + btn.dataset.sub });
+            });
+          });
+        } else if (res && res.info && (res.info.subtitles || []).length) {
+          let html2 = "";
+          for (const s of res.info.subtitles.slice(0, 15)) {
+            html2 +=
+              '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label) +
+              "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>SRT</button></div>";
+          }
+          body.innerHTML = html2;
+          body.querySelectorAll("[data-sub]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+              btn.textContent = "Added ✓";
+              btn.disabled = true;
+              void send({ type: "start_ytdl", url, format_id: "subs:srt:" + btn.dataset.sub });
             });
           });
         } else {
@@ -305,6 +341,7 @@
     hbar.appendChild(makeHbarBtn("MP4 Best", () => hbarStart("bestvideo+bestaudio/best", "MP4 Best")));
     hbar.appendChild(makeHbarBtn("720p", () => hbarStart("bestvideo[height<=720]+bestaudio/best[height<=720]", "720p")));
     hbar.appendChild(makeHbarBtn("MP3", () => hbarStart("ba-mp3-320", "MP3")));
+    hbar.appendChild(makeHbarBtn("Subs", () => hbarStart("subs:srt:en", "Subs")));
     hbar.appendChild(el("span", "vx-hb-sep"));
     hbar.appendChild(makeHbarBtn("▾ Formats", () => hbarFormats()));
   }
@@ -417,16 +454,27 @@
     placeFmtsBelow();
     const u = pageUrl;
     const res = await send({ type: "analyze", url: u });
-    if (!res || !res.info || !res.info.formats || !res.info.formats.length) {
-      hbarFmts.innerHTML = '<div class="vx-empty">Error: ' + esc((res && res.error) || "no formats") + "</div>";
-      return;
+    const subs = (res && res.info && res.info.subtitles || []).slice(0, 15);
+    if (!res || !res.info || !(res.info.formats || []).length) {
+      if (!subs.length) {
+        hbarFmts.innerHTML = '<div class="vx-empty">Error: ' + esc((res && res.error) || "no formats") + "</div>";
+        return;
+      }
     }
     let html = "";
-    for (const f of res.info.formats) {
+    for (const f of res.info.formats || []) {
       html +=
         '<div class="vx-fmt"><span class="vx-fq">' + esc(f.label) +
         '<span class="vx-fn">' + (f.size ? " • " + fmtBytes(f.size) : "") + "</span></span>" +
         '<button class="vx-btn vx-slim" data-fid="' + esc(f.id) + '">Download</button></div>';
+    }
+    if (subs.length) {
+      html += '<div class="vx-empty" style="text-align:left;padding:8px 2px 4px">Subtitles / Captions</div>';
+      for (const s of subs) {
+        html +=
+          '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label) +
+          "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>SRT</button></div>";
+      }
     }
     hbarFmts.innerHTML = html;
     hbarFmts.querySelectorAll("[data-fid]").forEach((btn) => {
@@ -434,6 +482,13 @@
         btn.textContent = "Added ✓";
         btn.disabled = true;
         void send({ type: "start_ytdl", url: u, format_id: btn.dataset.fid });
+      });
+    });
+    hbarFmts.querySelectorAll("[data-sub]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        btn.textContent = "Added ✓";
+        btn.disabled = true;
+        void send({ type: "start_ytdl", url: u, format_id: "subs:srt:" + btn.dataset.sub });
       });
     });
     placeFmtsBelow();
@@ -457,7 +512,7 @@
 
   // ---------------- runtime hooks ----------------
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  browser.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "file_captured" && msg.capture) showToast(msg.capture);
   });
 

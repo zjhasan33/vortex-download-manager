@@ -272,11 +272,13 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let playlist = p["playlist"].as_bool().unwrap_or(false);
                         let playlist_items = p["playlist_items"].as_str().unwrap_or("").to_string();
                         let start_at = p["start_at"].as_u64();
+                        let embed_subs = p["embed_subs"].as_bool();
+                        let sub_langs = p["sub_langs"].as_str().map(|s| s.to_string());
                         let sp = settings_path(app);
                         let app2 = app.clone();
                         let mgr2 = mgr.clone();
                         tokio::spawn(async move {
-                            let _ = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at).await;
+                            let _ = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs).await;
                         });
                         json!({"type":"ack","ok":true,"success":true,"action":"ytdl_started"}).to_string()
                     }
@@ -365,7 +367,7 @@ async fn download_op(app: &AppHandle, mgr: &Arc<DlManager>, p: &Value) -> String
             .or_else(|| info.formats.iter().find(|f| f.has_video && f.has_audio))
             .or_else(|| info.formats.iter().find(|f| f.has_video));
         let Some(fmt) = fmt else { return err("no suitable format") };
-        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None).await;
+        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None, None, None).await;
     }
     let opts = download::StartOpts {
         segments,
@@ -401,8 +403,12 @@ async fn start_ytdl(
     playlist: bool,
     playlist_items: String,
     start_at: Option<u64>,
+    embed_subs: Option<bool>,
+    sub_langs: Option<String>,
 ) -> String {
     let settings = crate::state::load_settings(app);
+    let embed = embed_subs.unwrap_or(settings.embed_subs);
+    let langs = sub_langs.unwrap_or_else(|| settings.sub_langs.clone());
     match ytdlp::start(
         app.clone(),
         url,
@@ -413,8 +419,8 @@ async fn start_ytdl(
         playlist,
         playlist_items,
         start_at,
-        settings.embed_subs,
-        settings.sub_langs.clone(),
+        embed,
+        langs,
     )
     .await
     {
