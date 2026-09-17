@@ -205,7 +205,7 @@ impl DlManager {
             .filter(|(_, t)| {
                 matches!(
                     *t.status.read().unwrap(),
-                    DlStatus::Error | DlStatus::Cancelled
+                    DlStatus::Error | DlStatus::Cancelled | DlStatus::NeedsAuth
                 )
             })
             .map(|(id, _)| id.clone())
@@ -274,9 +274,15 @@ impl DlManager {
             if let Some(t) = t {
                 let st = *t.status.read().unwrap();
                 let wanted = if only_failed {
-                    matches!(st, DlStatus::Error | DlStatus::Cancelled)
+                    matches!(
+                        st,
+                        DlStatus::Error | DlStatus::Cancelled | DlStatus::NeedsAuth
+                    )
                 } else {
-                    matches!(st, DlStatus::Paused | DlStatus::Error | DlStatus::Cancelled)
+                    matches!(
+                        st,
+                        DlStatus::Paused | DlStatus::Error | DlStatus::Cancelled | DlStatus::NeedsAuth
+                    )
                 };
                 if wanted {
                     t.cancel.store(false, Ordering::Relaxed);
@@ -289,6 +295,50 @@ impl DlManager {
             }
         }
         n
+    }
+
+    /// Store a login (optional) and (re)start every matching task waiting for it.
+    /// Stored credentials are re-used automatically on future downloads.
+    pub fn apply_credentials(
+        self: &Arc<DlManager>,
+        id: &str,
+        cred: crate::auth::Cred,
+        remember: bool,
+        app: &AppHandle,
+    ) -> usize {
+        if remember {
+            let mut settings = load_settings(app);
+            settings.credentials.retain(|c| c.host != cred.host);
+            settings.credentials.push(cred.clone());
+            save_settings(app, &settings);
+        }
+        let ids: Vec<String> = {
+            let map = self.http.lock().unwrap();
+            map.iter()
+                .filter(|(tid, t)| {
+                    let st = *t.status.read().unwrap();
+                    *tid == id
+                        || (st == DlStatus::NeedsAuth && crate::auth::host_of(&t.url) == cred.host)
+                })
+                .map(|(tid, _)| tid.clone())
+                .collect()
+        };
+        let mut restarted = 0;
+        for tid in ids {
+            if let Some(t) = self.http.lock().unwrap().get(&tid).cloned() {
+                t.set_auth_ctx(cred.clone());
+                self.run_http(t);
+                restarted += 1;
+            }
+        }
+        restarted
+    }
+
+    /// Forget a saved site login.
+    pub fn remove_credential(&self, host: &str, app: &AppHandle) {
+        let mut settings = load_settings(app);
+        settings.credentials.retain(|c| c.host != host);
+        save_settings(app, &settings);
     }
 }
 
@@ -321,6 +371,9 @@ pub struct Settings {
     pub embed_subs: bool,
     /// Preferred subtitle language(s) for embedding, e.g. "en" or "en,bn".
     pub sub_langs: String,
+    /// Saved site logins used to auto-authenticate HTTP downloads (Basic/Digest).
+    #[serde(default)]
+    pub credentials: Vec<crate::auth::Cred>,
 }
 
 impl Default for Settings {
@@ -344,6 +397,7 @@ impl Default for Settings {
             clipboard_monitor: false,
             embed_subs: true,
             sub_langs: "en".into(),
+            credentials: Vec::new(),
         }
     }
 }

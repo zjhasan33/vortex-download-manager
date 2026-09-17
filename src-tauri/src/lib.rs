@@ -5,8 +5,10 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
+mod auth;
 mod download;
 mod grabber;
+mod md5;
 mod state;
 mod tools;
 mod ws_server;
@@ -252,6 +254,44 @@ async fn pause_download(state: State<'_, Arc<DlManager>>, id: String) -> Result<
     if let Some(t) = m2.get(&id) {
         t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    Ok(())
+}
+
+/// Supply login credentials for downloads that hit HTTP 401/407.
+/// `remember` saves the login for this host so future downloads auto-authenticate.
+#[tauri::command]
+async fn set_auth(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<DlManager>>,
+    id: String,
+    host: String,
+    username: String,
+    password: String,
+    remember: bool,
+) -> Result<usize, String> {
+    let mut realm_host = host.trim().to_string();
+    if realm_host.is_empty() {
+        let u = state
+            .http
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|t| t.url.clone())
+            .unwrap_or_default();
+        realm_host = crate::auth::host_of(&u);
+    }
+    let cred = crate::auth::Cred { host: realm_host, username, password };
+    Ok(state.apply_credentials(&id, cred, remember, &app))
+}
+
+/// Forget a saved site login.
+#[tauri::command]
+async fn remove_credential(
+    state: State<'_, Arc<DlManager>>,
+    app: tauri::AppHandle,
+    host: String,
+) -> Result<(), String> {
+    state.remove_credential(&host, &app);
     Ok(())
 }
 
@@ -667,6 +707,8 @@ pub fn run() {
             start_download,
             pause_download,
             resume_download,
+            set_auth,
+            remove_credential,
             retry_all_downloads,
             resume_all_downloads,
             cancel_download,

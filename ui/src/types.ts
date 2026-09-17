@@ -5,7 +5,8 @@ export type DownloadStatus =
   | "completed"
   | "merging"
   | "error"
-  | "cancelled";
+  | "cancelled"
+  | "needs_auth";
 
 export type CategoryId = "all" | "video" | "audio" | "document" | "program" | "zip" | "other";
 
@@ -101,4 +102,5 @@ export interface Settings {
   clipboard_monitor: boolean;
   embed_subs: boolean;
   sub_langs: string;
+  credentials: { host: string; username: string; password: string }[];
 }

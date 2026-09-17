@@ -4,8 +4,11 @@ import { toast } from "./lib/ui";
 import { formatBytes, formatSpeed, formatEta } from "./lib/format";
 import { SpeedChart } from "./lib/chart";
 import type { CategoryId, Download } from "./types";
-import { openAddUrl, openSettings, openConfirmRemove, openConfirmBulkRemove, openGrabber } from "./components/modals";
+import { openAddUrl, openSettings, openConfirmRemove, openConfirmBulkRemove, openGrabber, openAuthDialog } from "./components/modals";
 import { openYoutube } from "./components/youtube";
+
+// When a download hits HTTP 401, pop the login dialog.
+api.onAuthRequired = (p) => openAuthDialog(p);
 
 const CATS: { id: CategoryId; label: string; icon: "video" | "audio" | "doc" | "program" | "zip" | "other" }[] = [
   { id: "all", label: "All Downloads", icon: "other" },
@@ -25,6 +28,7 @@ const STATUS_LABEL: Record<Download["status"], string> = {
   merging: "Merging",
   error: "Error",
   cancelled: "Cancelled",
+  needs_auth: "Login required",
 };
 
 function esc(s: string): string {
@@ -208,7 +212,7 @@ export class VortexApp {
           ${d.status === "downloading" || d.status === "queued" ? `<button data-act="pause" data-id="${d.id}" title="Pause">${icon("pause", 15)}</button>` : d.status === "paused" ? `<button data-act="resume" data-id="${d.id}" title="Resume">${icon("play", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="folder" data-id="${d.id}" title="Show in folder">${icon("folder", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="open" data-id="${d.id}" title="Open file">${icon("play", 15)}</button>` : ""}
-          ${d.status === "completed" || d.status === "error" || d.status === "cancelled" ? `<button data-act="reload" data-id="${d.id}" title="Download again">${icon("redo", 15)}</button>` : ""}
+          ${d.status === "completed" || d.status === "error" || d.status === "cancelled" || d.status === "needs_auth" ? `<button data-act="reload" data-id="${d.id}" title="Download again">${icon("redo", 15)}</button>` : ""}
           <button data-act="cancel" data-id="${d.id}" title="Remove">${icon("trash", 15)}</button>
         </div>`,
     };

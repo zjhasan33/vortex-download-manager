@@ -291,6 +291,21 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                 "retry_all" => {
                     let n = mgr.retry_all();
                     json!({"type":"retried","ok":true,"count":n}).to_string()
+                }
+                "set_auth" => {
+                    let p = &v["payload"];
+                    let id = p["id"].as_str().unwrap_or("").to_string();
+                    let host = p["host"].as_str().unwrap_or("").to_string();
+                    let username = p["username"].as_str().unwrap_or("").to_string();
+                    let password = p["password"].as_str().unwrap_or("").to_string();
+                    let remember = p["remember"].as_bool().unwrap_or(true);
+                    let n = mgr.apply_credentials(
+                        &id,
+                        crate::auth::Cred { host, username, password },
+                        remember,
+                        app,
+                    );
+                    json!({"type":"auth_updated","ok":true,"restarted":n}).to_string()
                 }                "resume_all" => {
                     let n = mgr.resume_all();
                     json!({"type":"resumed","ok":true,"count":n}).to_string()

@@ -231,6 +231,26 @@ export function openSettings() {
           ON = only manual/official subtitles are embedded (auto-generated captions are never used). OFF = video downloads with no subtitles at all. Down arrow <b>▾ Subs</b> in the extension downloads a standalone .srt/.vtt into the Subtitles folder.
         </div>
       </div>
+      <div class="field">
+        <label>Site logins (HTTP 401 authentication)</label>
+        <div id="st-creds" style="display:flex;flex-direction:column;gap:5px">
+          ${(s.credentials || []).length === 0
+            ? '<span style="font-size:11.5px;color:var(--text-3)">No saved logins. When a download needs a password, a login box appears automatically.</span>'
+            : (s.credentials || [])
+                .map(
+                  (c) =>
+                    `<div style="display:flex;align-items:center;gap:8px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);border-radius:7px;padding:6px 8px">
+                      <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--text-1)">${escapeAttr(c.host)}</span>
+                      <span style="font-size:11px;color:var(--text-3)">${escapeAttr(c.username)}</span>
+                      <button class="tbtn" data-cred-rm="${escapeAttr(c.host)}" title="Forget this login">${icon("close", 12)}</button>
+                    </div>`,
+                )
+                .join("")}
+        </div>
+        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
+          Logins for a site are reused automatically on every download from that host. Supports Basic and Digest auth.
+        </div>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn-ghost" data-close>Cancel</button>
@@ -254,6 +274,17 @@ export function openSettings() {
         if (p) ckPath.value = p;
       };
       root.querySelector<HTMLButtonElement>("#st-cookieclear")!.onclick = () => (ckPath.value = "");
+
+      // Saved site logins: forget a login
+      root.querySelectorAll<HTMLElement>("[data-cred-rm]").forEach((b) => {
+        b.addEventListener("click", async () => {
+          const host = b.dataset.credRm!;
+          await api.removeCredential(host);
+          store.settings = { ...store.settings!, credentials: (store.settings!.credentials || []).filter((c) => c.host !== host) };
+          b.closest("div")?.remove();
+          toast("Login forgotten for " + host, "ok");
+        });
+      });
 
       // Browser extension pairing key
       const keyInp = root.querySelector<HTMLInputElement>("#st-key")!;
@@ -288,6 +319,7 @@ export function openSettings() {
           clipboard_monitor: root.querySelector<HTMLInputElement>("#st-clip")!.checked,
           embed_subs: root.querySelector<HTMLInputElement>("#st-embed")!.checked,
           sub_langs: root.querySelector<HTMLInputElement>("#st-sublangs")!.value.trim() || "en",
+          credentials: s.credentials || [],
           stop_at: (() => {
             const v = root.querySelector<HTMLInputElement>("#st-stopat")!.value;
             return v ? new Date(v).getTime() || null : null;
@@ -511,4 +543,77 @@ function toLocalInput(ms: number): string {
   const d = new Date(ms);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** Login prompt shown when a download hits HTTP 401/407. */
+export function openAuthDialog(p: { id: string; url: string; host: string }) {
+  const close = openModal(
+    () => `
+  <div class="modal" style="width:460px">
+    <div class="modal-head">
+      <span style="color:var(--acc-3)">${icon("key", 17)}</span>
+      <h3>Login required</h3>
+      <div class="spacer"></div>
+      <button class="x" data-close>${icon("close", 16)}</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:12px;color:var(--text-2);margin-bottom:2px">
+        This download requests a username & password:
+      </div>
+      <div class="field">
+        <label>Site</label>
+        <div class="auth-host">${escapeAttr(p.host)}</div>
+      </div>
+      <div class="field">
+        <label>Username</label>
+        <input class="input" id="au-user" autocomplete="off" spellcheck="false" style="font-family:var(--mono)" />
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input class="input" id="au-pass" type="password" autocomplete="off" spellcheck="false" style="font-family:var(--mono)" />
+      </div>
+      <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer;padding-top:2px">
+        <input type="checkbox" id="au-remember" checked /> Remember for this site (auto-login next time)
+      </label>
+      <div style="font-size:11px;color:var(--text-3);padding-top:6px">URL: <span class="auth-url">${escapeAttr(p.url)}</span></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" data-close>Cancel</button>
+      <button class="tbtn primary" id="au-login">Login & retry</button>
+    </div>
+  </div>`,
+    (root, doClose) => {
+      root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = doClose));
+      const userInp = root.querySelector<HTMLInputElement>("#au-user")!;
+      const passInp = root.querySelector<HTMLInputElement>("#au-pass")!;
+      const rememberInp = root.querySelector<HTMLInputElement>("#au-remember")!;
+      const loginBtn = root.querySelector<HTMLButtonElement>("#au-login")!;
+      userInp.focus();
+      const submit = async () => {
+        const username = userInp.value.trim();
+        const password = passInp.value;
+        if (!username) {
+          userInp.focus();
+          return;
+        }
+        loginBtn.disabled = true;
+        loginBtn.textContent = "Logging in…";
+        try {
+          await api.setAuth(p.id, p.host, username, password, rememberInp.checked);
+          toast("Credentials saved — retrying download", "ok");
+        } catch (e) {
+          toast("Could not apply login: " + String(e), "err");
+        }
+        doClose();
+      };
+      loginBtn.onclick = submit;
+      passInp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") void submit();
+      });
+      userInp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") passInp.focus();
+      });
+    },
+  );
+  return close;
 }

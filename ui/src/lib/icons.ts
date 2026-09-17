@@ -3,7 +3,7 @@ export type IconName =
   | "search" | "youtube" | "gear" | "download" | "close" | "video"
   | "audio" | "doc" | "program" | "zip" | "other" | "check" | "speed"
   | "link" | "minimize" | "maximize" | "sync" | "file" | "bell" | "redo"
-  | "copy";
+  | "copy" | "key";
 
 const PATHS: Record<IconName, string> = {
   logo: `<path d="M12 2 3 7v10l9 5 9-5V7l-9-5z"/><path d="M12 22V12" stroke="#06080f" stroke-width="1.6"/><path d="M3 7l9 5 9-5M12 12v10" stroke="#06080f" stroke-width="1.6"/>`,
@@ -32,6 +32,7 @@ const PATHS: Record<IconName, string> = {
   sync: `<path d="M20 11a8 8 0 0 0-14-4.5L4 9m0-5v5h5M4 13a8 8 0 0 0 14 4.5L20 15m0 5v-5h-5" stroke-linecap="round" stroke-linejoin="round"/>`,
   file: `<path d="M5 21h14V7l-6-4H5v18z" stroke-linejoin="round"/><path d="M13 3v5h6" stroke-linejoin="round"/><path d="M8.5 13h7M8.5 17h4" stroke-linecap="round"/>`,
   copy: `<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke-linecap="round" stroke-linejoin="round"/>`,
+  key: `<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.8 12.2 20 3M15 8l3 3M17.5 5.5l2 2" stroke-linecap="round" stroke-linejoin="round"/>`,
   bell: `<path d="M6 16v-5a6 6 0 1 1 12 0v5l2 2H4l2-2z" stroke-linejoin="round"/><path d="M10 20a2 2 0 0 0 4 0" stroke-linecap="round"/>`,
   redo: `<path d="M3 8a5 5 0 0 1 8.5-3.5L13 6m5 0c-3.5-3.5-9-3.5-11 2M18 4v4h-4M21 16a5 5 0 0 1-8.5 3.5L11 18m-5 0c3.5 3.5 9 3.5 11-2M6 20v-4h4" stroke-linecap="round" stroke-linejoin="round"/>`,
 };

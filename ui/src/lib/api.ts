@@ -21,6 +21,15 @@ export interface ProgressPayload {
 
 const events: UnlistenFn[] = [];
 
+export interface AuthRequiredPayload {
+  id: string;
+  url: string;
+  host: string;
+}
+
+/** Set by app.ts to open the login dialog when a download needs credentials. */
+export let onAuthRequired: ((p: AuthRequiredPayload) => void) | null = null;
+
 export async function initApi() {
   if (events.length) return;
   events.push(
@@ -32,6 +41,9 @@ export async function initApi() {
       (e) => store.updateStatus(e.payload),
     ),
     await listen("downloads-changed", () => store.refresh()),
+    await listen<AuthRequiredPayload>("auth-required", (e) => {
+      onAuthRequired?.(e.payload);
+    }),
   );
 }
 
@@ -84,6 +96,9 @@ export const api = {
   saveSettings: (s: Settings) => cmd<void>("save_settings", { settings: s }),
   chooseFolder: () => cmd<string | null>("choose_folder"),
   chooseCookiesFile: () => cmd<string | null>("choose_cookies_file"),
+  setAuth: (id: string, host: string, username: string, password: string, remember: boolean) =>
+    cmd<number>("set_auth", { id, host, username, password, remember }),
+  removeCredential: (host: string) => cmd<void>("remove_credential", { host }),
   getDownloadPath: () => cmd<string>("get_download_path"),
   getWsToken: () => cmd<string>("get_ws_token"),
   windowAction: (action: "minimize" | "toggle" | "close" | "hide" | "show") =>

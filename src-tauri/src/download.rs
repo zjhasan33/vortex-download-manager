@@ -8,11 +8,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{ACCEPT_RANGES, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE, WWW_AUTHENTICATE};
 use reqwest::{Client, Proxy, StatusCode};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
+
+use crate::auth::{self, Cred};
 
 const PART_EXT: &str = ".vtx.part";
 
@@ -48,6 +50,70 @@ pub fn build_client(proxy: &str) -> Result<Client, String> {
     cb.build().map_err(|e| format!("Client error: {e}"))
 }
 
+/// First `WWW-Authenticate` header value (e.g. `Basic realm="x"`, `Digest ...`).
+fn challenge_of(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Send a range GET through the task's auth context. If the server answers 401
+/// with a Digest challenge the request is retried once with the computed header
+/// and the winning header is stored back into `auth`.
+async fn send_authorized(
+    client: &Client,
+    url: &str,
+    range: Option<&str>,
+    auth: &mut Option<AuthCtx>,
+) -> Result<(reqwest::Response, Option<AuthCtx>), reqwest::Error> {
+    let hdr = auth.as_ref().map(|a| a.hdr.clone());
+    let mut req = client.get(url);
+    if let Some(r) = range {
+        req = req.header(RANGE, r);
+    }
+    if let Some(h) = &hdr {
+        req = req.header(AUTHORIZATION, h);
+    }
+    let resp = req.send().await?;
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        if let (Some(ctx), Some(ch)) = (auth.as_ref(), challenge_of(&resp)) {
+            if ch.trim_start().to_ascii_lowercase().starts_with("digest") {
+                if let Some(dh) = auth::digest_auth_value("GET", url, &ctx.cred, &ch) {
+                    let prev = auth.clone();
+                    let ctx2 = AuthCtx { hdr: dh.clone(), cred: ctx.cred.clone() };
+                    let mut req2 = client.get(url);
+                    if let Some(r) = range {
+                        req2 = req2.header(RANGE, r);
+                    }
+                    req2 = req2.header(AUTHORIZATION, dh);
+                    let resp2 = req2.send().await?;
+                    if resp2.status() != StatusCode::UNAUTHORIZED {
+                        return Ok((resp2, Some(ctx2)));
+                    }
+                    return Ok((resp2, prev));
+                }
+            }
+        }
+    }
+    let next = auth.clone();
+    Ok((resp, next))
+}
+
+/// Put a task into the waiting-for-login state and ask the UI to show a dialog.
+pub fn flag_needs_auth(task: &Task) {
+    task.set_error("Authentication required (HTTP 401)");
+    task.set_status(DlStatus::NeedsAuth);
+    let _ = task.app.emit(
+        "auth-required",
+        serde_json::json!({
+            "id": task.id,
+            "url": task.url,
+            "host": auth::host_of(&task.url),
+        }),
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DlStatus {
@@ -58,6 +124,8 @@ pub enum DlStatus {
     Merging,
     Error,
     Cancelled,
+    /// Waiting for the user to supply login credentials (HTTP 401/407).
+    NeedsAuth,
 }
 
 impl DlStatus {
@@ -70,6 +138,7 @@ impl DlStatus {
             Self::Merging => "merging",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+            Self::NeedsAuth => "needs_auth",
         }
     }
 }
@@ -99,10 +168,17 @@ pub struct DlView {
 }
 
 #[derive(Clone)]
-struct Segment {
+pub struct Segment {
     start: u64,
     end: u64,
     part: PathBuf,
+}
+
+/// Login + the current Authorization header value for a task's requests.
+#[derive(Clone)]
+pub struct AuthCtx {
+    pub cred: Cred,
+    pub hdr: String,
 }
 
 #[derive(Clone)]
@@ -159,6 +235,7 @@ pub struct Task {
     pub retries: AtomicU64,
     pub auto_retries: u32,
     pub start_at: Option<u64>,
+    pub auth: Mutex<Option<AuthCtx>>,
     segments: Mutex<Vec<Segment>>,
     done_flags: Mutex<Vec<bool>>,
     /// Which chunk each worker has currently claimed (for dynamic work-stealing).
@@ -390,6 +467,15 @@ impl Task {
     pub fn set_error(&self, msg: &str) {
         *self.error.lock().unwrap() = Some(msg.to_string());
     }
+
+    /// Apply a fresh login and queue for retry. Digest auth is negotiated
+    /// automatically against the server's challenge on the next request.
+    pub fn set_auth_ctx(&self, cred: Cred) {
+        let hdr = auth::basic_auth_value(&cred.username, &cred.password);
+        *self.auth.lock().unwrap() = Some(AuthCtx { cred, hdr });
+        *self.error.lock().unwrap() = None;
+        *self.status.write().unwrap() = DlStatus::Queued;
+    }
 }
 
 pub async fn start(
@@ -403,10 +489,14 @@ pub async fn start(
 
     let client = build_client(&opts.proxy)?;
 
-    let probe = client
-        .get(&url)
-        .header(RANGE, "bytes=0-0")
-        .send()
+    // Auto-login with any credential already saved for this host (Basic/Digest).
+    let settings = crate::state::load_settings(&app);
+    let mut auth = auth::find_cred(&settings.credentials, &url).map(|cred| AuthCtx {
+        hdr: auth::basic_auth_value(&cred.username, &cred.password),
+        cred,
+    });
+
+    let (probe, mut auth) = send_authorized(&client, &url, Some("bytes=0-0"), &mut auth)
         .await
         .map_err(|e| {
             log_net_err(&e, "probe failed");
@@ -425,10 +515,12 @@ pub async fn start(
     // Some servers reply 200 to `bytes=0-0` but still honour real ranges; re-probe once.
     let mut ranged = got_206;
     if !ranged && accept_ranges && total > 0 {
-        if let Ok(p2) = client.get(&url).header(RANGE, "bytes=0-1").send().await {
+        let mut auth2 = auth.clone();
+        if let Ok((p2, a2)) = send_authorized(&client, &url, Some("bytes=0-1"), &mut auth2).await {
             if p2.status() == StatusCode::PARTIAL_CONTENT {
                 ranged = true;
             }
+            auth = a2;
         }
     }
 
@@ -493,6 +585,7 @@ pub async fn start(
         retries: AtomicU64::new(0),
         auto_retries: opts.auto_retries,
         start_at: opts.start_at,
+        auth: Mutex::new(auth),
     });
 
     Ok(task)
@@ -516,6 +609,11 @@ pub fn restore(
         DlStatus::Completed => DlStatus::Completed,
         _ => DlStatus::Paused,
     };
+    let settings = crate::state::load_settings(&app);
+    let auth = auth::find_cred(&settings.credentials, &view.url).map(|cred| AuthCtx {
+        hdr: auth::basic_auth_value(&cred.username, &cred.password),
+        cred,
+    });
     let task = Arc::new(Task {
         id: view.id.clone(),
         url: view.url.clone(),
@@ -540,6 +638,7 @@ pub fn restore(
         retries: AtomicU64::new(0),
         auto_retries: 3,
         start_at: None,
+        auth: Mutex::new(auth),
         segments: Mutex::new(segs),
         done_flags: Mutex::new(vec![false; num_segments]),
         claimed: Mutex::new(vec![false; num_segments]),
@@ -632,6 +731,11 @@ pub async fn run(task: Arc<Task>) {
             // Workers drained but chunks remain (paused mid-chunk); loop again.
             task.retries.store(0, Ordering::Relaxed);
             continue;
+        }
+
+        // Login needed: stay in this state until credentials are supplied.
+        if *task.status.read().unwrap() == DlStatus::NeedsAuth {
+            break;
         }
 
         // Some chunk failed — retry after short backoff, capped by auto_retries.
@@ -799,15 +903,23 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
         } else {
             format!("bytes={cursor}-{}", seg.end)
         };
-        let resp = match client.get(&task.url).header(RANGE, range).send().await {
-            Ok(r) => r,
+        let mut auth = task.auth.lock().unwrap().clone();
+        let (resp, auth) = match send_authorized(&client, &task.url, Some(&range), &mut auth).await {
+            Ok(v) => v,
             Err(e) => {
                 log_net_err(&e, &format!("segment {idx} send"));
                 tokio::time::sleep(Duration::from_millis(900)).await;
                 continue;
             }
         };
+        *task.auth.lock().unwrap() = auth;
         let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED
+            || (status == StatusCode::FORBIDDEN && challenge_of(&resp).is_some())
+        {
+            flag_needs_auth(&task);
+            return false;
+        }
         if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
             task.set_error(&format!("HTTP {}", status.as_u16()));
             return false;
