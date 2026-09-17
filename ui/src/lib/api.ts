@@ -48,13 +48,33 @@ export const api = {
   resumeAllDownloads: () => cmd<number>("resume_all_downloads"),
   cancelDownload: (id: string) => cmd<void>("cancel_download", { id }),
   removeDownload: (id: string, deleteFile?: boolean) => cmd<void>("remove_download", { id, deleteFile }),
+  downloadsAction: (action: "pause" | "resume" | "retry" | "remove", ids: string[], deleteFile?: boolean) =>
+    cmd<number>("downloads_action", { action, ids, deleteFile }),
   listDownloads: () => cmd<Download[]>("list_downloads"),
   getStats: () => cmd<AppStats>("get_stats"),
 
   fetchYtdlInfo: (url: string) => cmd<YtdlInfo>("fetch_ytdl_info", { url }),
   grabSite: (url: string, maxPages?: number, kinds?: string[]) =>
-    cmd<GrabItem[]>("grab_site", { url, maxPages, kinds }),  startYtdl: (url: string, formatId: string, savePath: string, playlist?: boolean, playlistItems?: string, startAt?: number) =>
-    cmd<Download>("start_ytdl", { url, formatId, savePath, includePlaylist: playlist, playlistItems, startAt }),
+    cmd<GrabItem[]>("grab_site", { url, maxPages, kinds }),  startYtdl: (
+    url: string,
+    formatId: string,
+    savePath: string,
+    playlist?: boolean,
+    playlistItems?: string,
+    startAt?: number,
+    embedSubs?: boolean,
+    subLangs?: string,
+  ) =>
+    cmd<Download>("start_ytdl", {
+      url,
+      formatId,
+      savePath,
+      includePlaylist: playlist,
+      playlistItems,
+      startAt,
+      embedSubs,
+      subLangs,
+    }),
 
   openFolder: (path: string) => cmd<void>("open_folder", { path }),
   openFile: (path: string) => cmd<void>("open_saved_file", { path }),
@@ -65,6 +85,7 @@ export const api = {
   chooseFolder: () => cmd<string | null>("choose_folder"),
   chooseCookiesFile: () => cmd<string | null>("choose_cookies_file"),
   getDownloadPath: () => cmd<string>("get_download_path"),
+  getWsToken: () => cmd<string>("get_ws_token"),
   windowAction: (action: "minimize" | "toggle" | "close" | "hide" | "show") =>
     cmd<void>("window_action", { action }),
 };

@@ -28,6 +28,7 @@ export interface Download {
   source: "http" | "youtube";
   save_path: string;
   created_at: number;
+  format_id?: string;
 }
 
 export interface YtdlInfo {
@@ -37,6 +38,13 @@ export interface YtdlInfo {
   uploader: string;
   view_count: number;
   formats: YtdlFormat[];
+  subtitles: YtdlSub[];
+}
+
+export interface YtdlSub {
+  lang: string;
+  label: string;
+  auto: boolean;
 }
 
 export interface YtdlFormat {
@@ -90,4 +98,7 @@ export interface Settings {
   on_complete: string;
   stop_at?: number | null;
   show_dropbox: boolean;
+  clipboard_monitor: boolean;
+  embed_subs: boolean;
+  sub_langs: string;
 }

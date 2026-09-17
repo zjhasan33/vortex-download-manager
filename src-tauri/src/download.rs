@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::error::Error as StdError;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,8 +12,41 @@ use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTEN
 use reqwest::{Client, Proxy, StatusCode};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
 
 const PART_EXT: &str = ".vtx.part";
+
+/// Print the full network error chain (incl. cert/proxy causes) to stdout.
+pub fn log_net_err(e: &reqwest::Error, ctx: &str) {
+    eprintln!("[vortex-net] {ctx}: {e}");
+    let mut src = e.source();
+    let mut i = 0usize;
+    while let Some(s) = src {
+        eprintln!("[vortex-net]   cause[{i}]: {s}");
+        src = s.source();
+        i += 1;
+    }
+}
+
+pub fn build_client(proxy: &str) -> Result<Client, String> {
+    let mut cb = Client::builder()
+        // A browser-like UA avoids per-client/CDN throttling (IDM does the same).
+        .user_agent(crate::tools::BROWSER_UA)
+        // Small TTFB chunks: disable Nagle so range requests stream immediately.
+        .tcp_nodelay(true)
+        .tcp_keepalive(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15))
+        // Keep a pooled connection per segment alive for retries/resume.
+        .pool_max_idle_per_host(64);
+    if !proxy.trim().is_empty() {
+        let p = Proxy::all(proxy.trim()).map_err(|e| format!("Bad proxy: {e}"))?;
+        cb = cb.proxy(p);
+    } else {
+        // Never fall back to system/HTTP(S)_PROXY env (e.g. BurpSuite 127.0.0.1:8080).
+        cb = cb.no_proxy();
+    }
+    cb.build().map_err(|e| format!("Client error: {e}"))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +146,8 @@ pub struct Task {
     pub total: AtomicU64,
     pub done: AtomicU64,
     pub num_segments: usize,
+    /// Max simultaneous connections (segments are split into smaller chunks than this).
+    pub max_conns: usize,
     pub status: RwLock<DlStatus>,
     pub error: Mutex<Option<String>>,
     pub cancel: AtomicBool,
@@ -125,6 +161,8 @@ pub struct Task {
     pub start_at: Option<u64>,
     segments: Mutex<Vec<Segment>>,
     done_flags: Mutex<Vec<bool>>,
+    /// Which chunk each worker has currently claimed (for dynamic work-stealing).
+    claimed: Mutex<Vec<bool>>,
 }
 
 pub fn now_ms() -> u64 {
@@ -132,6 +170,28 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Heuristic: is this URL likely a downloadable file (vs a plain webpage)?
+pub fn url_is_downloadable(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    const EXTS: &[&str] = &[
+        // media
+        "mp4", "mkv", "webm", "avi", "mov", "flv", "m4v", "wmv", "mpg", "mpeg", "3gp", "m4a", "aac", "flac", "wav", "ogg", "opus", "mp3",
+        // archives / programs / docs
+        "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "cab", "exe", "msi", "apk", "appimage", "whl", "deb", "rpm", "pdf", "epub", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "ttf", "otf", "bin", "img", "ipa", "torrent",
+        // subtitles
+        "srt", "vtt",
+    ];
+    if let Some(dot) = path.rfind('.') {
+        let ext = &path[dot + 1..];
+        let ext: &str = ext.trim_end_matches('/');
+        if EXTS.contains(&ext) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn sanitize(name: &str) -> String {
@@ -285,7 +345,7 @@ impl Task {
     }
 
     fn connections(&self) -> usize {
-        if self.source == "youtube" { 1 } else { self.num_segments.max(1) }
+        if self.source == "youtube" { 1 } else { self.max_conns.max(1) }
     }
 
     fn peek_speed(&self) -> u64 {
@@ -341,28 +401,36 @@ pub async fn start(
 ) -> Result<Arc<Task>, String> {
     let base = PathBuf::from(save_path.trim());
 
-    let mut cb = Client::builder();
-    if !opts.proxy.trim().is_empty() {
-        let proxy = Proxy::all(opts.proxy.trim()).map_err(|e| format!("Bad proxy: {e}"))?;
-        cb = cb.proxy(proxy);
-    }
-    let client = cb.build().map_err(|e| format!("Client error: {e}"))?;
+    let client = build_client(&opts.proxy)?;
 
     let probe = client
         .get(&url)
         .header(RANGE, "bytes=0-0")
         .send()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| {
+            log_net_err(&e, "probe failed");
+            format!("Connection failed: {e}")
+        })?;
 
     let accept_ranges = probe
         .headers()
         .get(ACCEPT_RANGES)
-        .and_then(|v| v.to_str().ok().map(|s| s.to_lowercase() == "bytes"))
+        .and_then(|v| v.to_str().ok().map(|s| s.to_lowercase().contains("bytes")))
         .unwrap_or(false);
 
     let got_206 = probe.status() == StatusCode::PARTIAL_CONTENT;
-    let total = if got_206 { parse_total(&probe) } else { 0 };
+    let total = parse_total(&probe);
+
+    // Some servers reply 200 to `bytes=0-0` but still honour real ranges; re-probe once.
+    let mut ranged = got_206;
+    if !ranged && accept_ranges && total > 0 {
+        if let Ok(p2) = client.get(&url).header(RANGE, "bytes=0-1").send().await {
+            if p2.status() == StatusCode::PARTIAL_CONTENT {
+                ranged = true;
+            }
+        }
+    }
 
     let name = opts
         .filename
@@ -376,10 +444,12 @@ pub async fn start(
     let save_path_final = unique_path(&eff_dir, &name);
 
     let segs;
-    if got_206 && total > 0 && accept_ranges && opts.segments > 1 {
-        let n = opts.segments.clamp(1, 32);
-        segs = split_range(total, n, &save_path_final);
+    let max_conns;
+    if ranged && total > 0 && opts.segments > 1 {
+        max_conns = opts.segments.clamp(2, 32);
+        segs = split_range(total, max_conns, &save_path_final);
     } else {
+        max_conns = 1;
         segs = vec![Segment { start: 0, end: u64::MAX, part: part_of(&save_path_final, 0) }];
     }
     let num_segments = segs.len();
@@ -409,7 +479,9 @@ pub async fn start(
         done: AtomicU64::new(done0),
         segments: Mutex::new(segs),
         done_flags: Mutex::new(vec![false; num_segments]),
+        claimed: Mutex::new(vec![false; num_segments]),
         num_segments,
+        max_conns,
         status: RwLock::new(DlStatus::Queued),
         error: Mutex::new(None),
         cancel: AtomicBool::new(false),
@@ -456,6 +528,7 @@ pub fn restore(
         total: AtomicU64::new(view.total_size),
         done: AtomicU64::new(view.downloaded),
         num_segments,
+        max_conns: view.connections.clamp(1, 32),
         status: RwLock::new(status),
         error: Mutex::new(view.error.clone()),
         cancel: AtomicBool::new(false),
@@ -463,12 +536,13 @@ pub fn restore(
         history: Mutex::new(VecDeque::new()),
         limit,
         app,
-        client: Client::new(),
+        client: build_client("").unwrap_or_else(|_| Client::new()),
         retries: AtomicU64::new(0),
         auto_retries: 3,
         start_at: None,
         segments: Mutex::new(segs),
         done_flags: Mutex::new(vec![false; num_segments]),
+        claimed: Mutex::new(vec![false; num_segments]),
     });
     Ok(task)
 }
@@ -520,67 +594,18 @@ pub async fn run(task: Arc<Task>) {
             break;
         }
 
-        let segs = task.segments.lock().unwrap().clone();
+        // Re-open every unfinished chunk for claiming (covers retries after failure).
+        reset_claims(&task);
+
+        // Spin up to `max_conns` workers; each one pulls the next available chunk
+        // until none are left, so fast connections take over slow connections' work.
         let mut workers = Vec::new();
-        for (idx, seg) in segs.iter().enumerate() {
+        for _ in 0..task.max_conns {
             if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
                 break;
             }
-            if segment_done(&task, seg, idx) {
-                continue;
-            }
             let t = task.clone();
-            let s = seg.clone();
-            workers.push(tokio::spawn(async move { download_segment(t, s, idx).await }));
-            if segs.len() == 1 {
-                break;
-            }
-        }
-
-        if workers.is_empty() {
-            // All segments already present; finalize.
-            task.set_status(DlStatus::Merging);
-            let out = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&task.save_path);
-            if let Ok(mut f) = out {
-                let mut ok = true;
-                let mut parts: Vec<PathBuf> = {
-                    let mut segs = task.segments.lock().unwrap().clone();
-                    segs.retain(|s| s.end != u64::MAX);
-                    segs.sort_by_key(|s| s.start);
-                    segs.into_iter().map(|s| s.part).collect()
-                };
-                if parts.is_empty() {
-                    parts = vec![part_of(&task.save_path, 0)];
-                }
-                for p in &parts {
-                    match fs::read(p) {
-                        Ok(data) => {
-                            if std::io::Write::write_all(&mut f, &data).is_err() {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        Err(_) => { ok = false; }
-                    }
-                }
-                let _ = f.flush();
-                drop(f);
-                if ok {
-                    cleanup_parts(task.clone());
-                    let sz = fs::metadata(&task.save_path).map(|m| m.len()).unwrap_or(0);
-                    task.total.store(sz.max(task.total.load(Ordering::Relaxed)), Ordering::Relaxed);
-                    task.done.store(sz, Ordering::Relaxed);
-                    task.set_status(DlStatus::Completed);
-                } else {
-                    task.set_error("Failed to merge parts");
-                    task.set_status(DlStatus::Error);
-                }
-            }
-            break;
+            workers.push(tokio::spawn(async move { worker_loop(t).await }));
         }
 
         let mut all_ok = true;
@@ -598,13 +623,18 @@ pub async fn run(task: Arc<Task>) {
             continue;
         }
 
+        if all_chunks_done(&task) {
+            finalize(&task);
+            break;
+        }
+
         if all_ok {
-            // Loop again; remaining segments (if any) continue; when empty, finalize.
+            // Workers drained but chunks remain (paused mid-chunk); loop again.
             task.retries.store(0, Ordering::Relaxed);
             continue;
         }
 
-        // Some segment failed — retry after short backoff, capped by auto_retries.
+        // Some chunk failed — retry after short backoff, capped by auto_retries.
         let r = task.retries.fetch_add(1, Ordering::Relaxed) + 1;
         if r > task.auto_retries as u64 {
             task.set_error("Too many consecutive failures");
@@ -615,6 +645,100 @@ pub async fn run(task: Arc<Task>) {
     }
 
     monitor.abort();
+}
+
+/// A worker claims chunks one after another until the queue is empty.
+async fn worker_loop(task: Arc<Task>) -> bool {
+    loop {
+        if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
+            return true;
+        }
+        let (idx, seg) = match claim_chunk(&task) {
+            Some(c) => c,
+            None => return true,
+        };
+        if !download_segment(task.clone(), seg, idx).await {
+            return false;
+        }
+    }
+}
+
+/// Atomically hand out the next unclaimed, unfinished chunk.
+fn claim_chunk(task: &Task) -> Option<(usize, Segment)> {
+    let segs = task.segments.lock().unwrap();
+    let mut claimed = task.claimed.lock().unwrap();
+    for (i, seg) in segs.iter().enumerate() {
+        if claimed.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        claimed[i] = true;
+        if segment_done(task, seg, i) {
+            continue;
+        }
+        return Some((i, seg.clone()));
+    }
+    None
+}
+
+/// Mark finished chunks as taken; leave failed/partial chunks claimable again.
+fn reset_claims(task: &Task) {
+    let segs = task.segments.lock().unwrap();
+    let mut claimed = task.claimed.lock().unwrap();
+    for (i, seg) in segs.iter().enumerate() {
+        if claimed.get(i).is_some() {
+            claimed[i] = segment_done(task, seg, i);
+        }
+    }
+}
+
+fn all_chunks_done(task: &Task) -> bool {
+    let segs = task.segments.lock().unwrap();
+    (0..segs.len()).all(|i| segment_done(task, &segs[i], i))
+}
+
+fn finalize(task: &Arc<Task>) {
+    task.set_status(DlStatus::Merging);
+    let out = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&task.save_path);
+    if let Ok(mut f) = out {
+        let mut ok = true;
+        let mut parts: Vec<PathBuf> = {
+            let mut segs = task.segments.lock().unwrap().clone();
+            segs.retain(|s| s.end != u64::MAX);
+            segs.sort_by_key(|s| s.start);
+            segs.into_iter().map(|s| s.part).collect()
+        };
+        if parts.is_empty() {
+            parts = vec![part_of(&task.save_path, 0)];
+        }
+        for p in &parts {
+            match fs::File::open(p) {
+                Ok(src) => {
+                    let mut r = std::io::BufReader::with_capacity(1024 * 1024, src);
+                    if std::io::copy(&mut r, &mut f).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                Err(_) => { ok = false; }
+            }
+        }
+        let _ = f.flush();
+        drop(f);
+        if ok {
+            cleanup_parts(task.clone());
+            let sz = fs::metadata(&task.save_path).map(|m| m.len()).unwrap_or(0);
+            task.total.store(sz.max(task.total.load(Ordering::Relaxed)), Ordering::Relaxed);
+            task.done.store(sz, Ordering::Relaxed);
+            task.set_status(DlStatus::Completed);
+        } else {
+            task.set_error("Failed to merge parts");
+            task.set_status(DlStatus::Error);
+        }
+    }
 }
 
 fn segment_done(task: &Task, seg: &Segment, idx: usize) -> bool {
@@ -644,13 +768,16 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
     }
 
     let limit = task.limit.load(Ordering::Relaxed);
-    let per_conn = if limit > 0 { limit / task.num_segments.max(1) as u64 } else { 0 };
+    let per_conn = if limit > 0 { limit / task.max_conns.max(1) as u64 } else { 0 };
 
-    let mut file = match OpenOptions::new().create(true).append(true).open(&seg.part) {
+    let std_file = match OpenOptions::new().create(true).append(true).open(&seg.part) {
         Ok(f) => f,
         Err(_) => return false,
     };
-    let offset = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let offset = std_file.metadata().map(|m| m.len()).unwrap_or(0);
+    // Buffered async writes: flush in ~1 MB batches instead of one disk syscall
+    // per network chunk (this is a major throughput win on both HDD and SSD).
+    let mut file = tokio::io::BufWriter::with_capacity(1024 * 1024, tokio::fs::File::from_std(std_file));
     let mut cursor = if seg.end == u64::MAX {
         seg.start.checked_add(offset).unwrap_or(seg.start)
     } else {
@@ -674,13 +801,20 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
         };
         let resp = match client.get(&task.url).header(RANGE, range).send().await {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                log_net_err(&e, &format!("segment {idx} send"));
                 tokio::time::sleep(Duration::from_millis(900)).await;
                 continue;
             }
         };
-        if !resp.status().is_success() && resp.status() != StatusCode::PARTIAL_CONTENT {
-            task.set_error(&format!("HTTP {}", resp.status().as_u16()));
+        let status = resp.status();
+        if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+            task.set_error(&format!("HTTP {}", status.as_u16()));
+            return false;
+        }
+        if seg.end != u64::MAX && status != StatusCode::PARTIAL_CONTENT {
+            // Server claims range support but answered with the whole file.
+            task.set_error("Server ignored range request");
             return false;
         }
 
@@ -692,7 +826,8 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
                     if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
                         break;
                     }
-                    if std::io::Write::write_all(&mut file, &c).is_err() {
+                    if file.write_all(&c).await.is_err() {
+                        let _ = file.flush().await;
                         return false;
                     }
                     task.done.fetch_add(c.len() as u64, Ordering::Relaxed);
@@ -713,13 +848,14 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
                         }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    log_net_err(&e, &format!("segment {idx} stream"));
                     dropped = true;
                     break;
                 }
             }
         }
-        let _ = file.flush();
+        let _ = file.flush().await;
 
         if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
             break;
@@ -776,9 +912,17 @@ async fn monitor_task(task: Arc<Task>) {
     }
 }
 
-fn split_range(total: u64, n: usize, save_path: &Path) -> Vec<Segment> {
-    let mut chunk = total.div_ceil(n as u64);
-    chunk = chunk.min(64 * 1024 * 1024).max(1024 * 1024); // 1MB min, 64MB max per segment
+fn split_range(total: u64, connections: usize, save_path: &Path) -> Vec<Segment> {
+    // Work-stealing needs more chunks than connections so free workers can take
+    // over whatever a slow connection hasn't finished. Aim for ~4 chunks per
+    // connection, keep each chunk between 1 MB and 32 MB (small tail), and cap
+    // the total number of parts so resume state stays reasonable.
+    let conns = connections.max(1) as u64;
+    let max_chunks = 1024u64;
+    let mut chunk = total.div_ceil(conns * 4).clamp(1024 * 1024, 32 * 1024 * 1024);
+    if total.div_ceil(chunk) > max_chunks {
+        chunk = total.div_ceil(max_chunks);
+    }
     let mut out = Vec::new();
     let mut start = 0u64;
     let mut i = 0usize;

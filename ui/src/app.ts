@@ -4,7 +4,7 @@ import { toast } from "./lib/ui";
 import { formatBytes, formatSpeed, formatEta } from "./lib/format";
 import { SpeedChart } from "./lib/chart";
 import type { CategoryId, Download } from "./types";
-import { openAddUrl, openSettings, openConfirmRemove, openGrabber } from "./components/modals";
+import { openAddUrl, openSettings, openConfirmRemove, openConfirmBulkRemove, openGrabber } from "./components/modals";
 import { openYoutube } from "./components/youtube";
 
 const CATS: { id: CategoryId; label: string; icon: "video" | "audio" | "doc" | "program" | "zip" | "other" }[] = [
@@ -41,6 +41,8 @@ export class VortexApp {
   private chart!: SpeedChart;
   private cat: CategoryId = "all";
   private search = "";
+  private selected = new Set<string>();
+  private lastSel = -1;
   private r1 = () => {};
   private r2 = () => {};
 
@@ -128,7 +130,18 @@ export class VortexApp {
     return `
     <div class="main">
       <div class="list-head">
-        <span>File</span><span>Size</span><span>Progress</span><span>Speed</span><span>Time Left</span><span>Status</span><span></span>
+        <label class="dl-check"><input type="checkbox" id="check-all" title="Select all" /></label>
+        <span>File</span><span>Size</span><span>Progress</span><span class="dl-head-speed">Speed</span><span class="dl-head-eta">Time Left</span><span>Status</span><span></span>
+      </div>
+      <div class="bulkbar" id="bulkbar">
+        <span class="bulk-count" id="bulk-count">0 selected</span>
+        <div class="bulk-actions">
+          <button class="tbtn" data-bulk="resume">${icon("play", 14)} Resume</button>
+          <button class="tbtn" data-bulk="pause">${icon("pause", 14)} Pause</button>
+          <button class="tbtn" data-bulk="retry">${icon("sync", 14)} Retry</button>
+          <button class="tbtn danger" data-bulk="remove">${icon("trash", 14)} Delete</button>
+          <button class="tbtn" data-bulk="clear">${icon("close", 13)} Clear</button>
+        </div>
       </div>
       <div class="list-scroll" id="list"></div>
       <div class="chartbar">
@@ -170,7 +183,9 @@ export class VortexApp {
     const dim = d.status === "completed" || d.status === "cancelled";
     const pct = d.progress.toFixed(1);
     const barCls = d.status === "error" ? "err" : d.status === "completed" ? "done" : "";
+    const checked = this.selected.has(d.id);
     const cols = {
+      check: `<label class="dl-check" title="Select"><input type="checkbox" data-check="${d.id}" ${checked ? "checked" : ""} /></label>`,
       name: `
         <div class="dl-name-cell">
           <span class="dl-ico">${catIcon(d.category, 18)}</span>
@@ -197,12 +212,15 @@ export class VortexApp {
           <button data-act="cancel" data-id="${d.id}" title="Remove">${icon("trash", 15)}</button>
         </div>`,
     };
-    return `<div class="dl-row ${dim ? "dim" : ""}">${Object.values(cols).join("")}</div>`;
+    return `<div class="dl-row ${dim ? "dim" : ""} ${checked ? "sel" : ""}" data-row="${d.id}">${Object.values(cols).join("")}</div>`;
   }
 
   private render() {
     const list = this.root.querySelector<HTMLElement>("#list");
     if (!list) return;
+    // Drop selections for downloads that no longer exist.
+    const alive = new Set(store.downloads.map((d) => d.id));
+    for (const id of [...this.selected]) if (!alive.has(id)) this.selected.delete(id);
     const items = this.visible();
     list.innerHTML = items.length
       ? items.map((d) => this.row(d)).join("")
@@ -214,7 +232,62 @@ export class VortexApp {
         </div>`;
 
     // update sidebar counts + statusbar + toolbar active states
+    this.updateBulk();
     this.refreshChrome();
+  }
+
+  private updateBulk() {
+    const bar = this.root.querySelector<HTMLElement>("#bulkbar");
+    if (!bar) return;
+    const n = this.selected.size;
+    bar.classList.toggle("show", n > 0);
+    const c = this.root.querySelector<HTMLElement>("#bulk-count");
+    if (c) c.textContent = `${n} selected`;
+    const all = this.root.querySelector<HTMLInputElement>("#check-all");
+    if (all) {
+      const vis = this.visible();
+      const selVis = vis.filter((d) => this.selected.has(d.id)).length;
+      all.checked = vis.length > 0 && selVis === vis.length;
+      all.indeterminate = selVis > 0 && selVis < vis.length;
+    }
+  }
+
+  private toggleSel(id: string, shift = false) {
+    const vis = this.visible();
+    const idx = vis.findIndex((d) => d.id === id);
+    if (idx < 0) return;
+    if (shift && this.lastSel >= 0 && this.lastSel !== idx) {
+      const [a, b] = this.lastSel < idx ? [this.lastSel, idx] : [idx, this.lastSel];
+      const on = !this.selected.has(id);
+      for (let i = a; i <= b; i++) {
+        if (on) this.selected.add(vis[i].id);
+        else this.selected.delete(vis[i].id);
+      }
+    } else if (this.selected.has(id)) {
+      this.selected.delete(id);
+    } else {
+      this.selected.add(id);
+    }
+    this.lastSel = idx;
+    this.render();
+  }
+
+  private async runBulk(action: "pause" | "resume" | "retry" | "remove") {
+    const ids = [...this.selected];
+    if (!ids.length) return;
+    if (action === "remove") {
+      openConfirmBulkRemove(ids.length, (del) => {
+        void api.downloadsAction("remove", ids, del).then(() => {
+          this.selected.clear();
+          toast(`${ids.length} removed`, "ok");
+        });
+      });
+      return;
+    }
+    const n = await api.downloadsAction(action, ids);
+    this.selected.clear();
+    toast(n ? `${n} download(s) ${action === "retry" ? "retried" : action + "d"}` : "Nothing to do", n ? "ok" : "info");
+    await store.refresh();
   }
 
   private refreshChrome() {
@@ -317,9 +390,36 @@ export class VortexApp {
           this.search = search.value;
           this.render();
         });
+      const checkAll = this.root.querySelector<HTMLInputElement>("#check-all");
+      if (checkAll)
+        checkAll.addEventListener("change", () => {
+          const vis = this.visible();
+          if (checkAll.checked) vis.forEach((d) => this.selected.add(d.id));
+          else vis.forEach((d) => this.selected.delete(d.id));
+          this.render();
+        });
+      const bulkbar = this.root.querySelector<HTMLElement>("#bulkbar");
+      if (bulkbar)
+        bulkbar.addEventListener("click", (e) => {
+          const b = (e.target as HTMLElement).closest("[data-bulk]") as HTMLElement | null;
+          if (!b) return;
+          const a = b.dataset.bulk!;
+          if (a === "clear") {
+            this.selected.clear();
+            this.render();
+            return;
+          }
+          void this.runBulk(a as "pause" | "resume" | "retry" | "remove");
+        });
       this.root.querySelector<HTMLElement>("#list")!.addEventListener("click", (e) => {
-        const t = (e.target as HTMLElement).closest("[data-act]") as HTMLElement | null;
-        if (!t) return;
+        const target = e.target as HTMLElement;
+        const actEl = target.closest("[data-act]") as HTMLElement | null;
+        if (!actEl) {
+          const rowEl = target.closest("[data-row]") as HTMLElement | null;
+          if (rowEl?.dataset.row) this.toggleSel(rowEl.dataset.row, (e as MouseEvent).shiftKey);
+          return;
+        }
+        const t = actEl;
         const id = t.dataset.id!;
         const act = t.dataset.act!;
         const d = store.downloads.find((x) => x.id === id);

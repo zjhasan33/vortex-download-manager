@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
-use crate::download::{DlStatus, DlView};
+use crate::download::{self, DlStatus, DlView};
 
 pub struct DlManager {
     pub http: Mutex<HashMap<String, Arc<crate::download::Task>>>,
@@ -246,6 +246,50 @@ impl DlManager {
         }
         n
     }
+
+    /// Pause the given tasks (HTTP pause, yt-dlp process cancel).
+    pub fn bulk_pause(self: &Arc<DlManager>, ids: &[String]) -> usize {
+        let mut n = 0;
+        for id in ids {
+            let http = self.http.lock().unwrap().get(id).cloned();
+            if let Some(t) = http {
+                t.paused.store(true, Ordering::Relaxed);
+                n += 1;
+                continue;
+            }
+            if let Some(t) = self.yt.lock().unwrap().get(id) {
+                t.cancel.store(true, Ordering::Relaxed);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Restart the given HTTP tasks. `only_failed` limits it to error/cancelled;
+    /// otherwise paused tasks are resumed too.
+    pub fn bulk_restart(self: &Arc<DlManager>, ids: &[String], only_failed: bool) -> usize {
+        let mut n = 0;
+        for id in ids {
+            let t = self.http.lock().unwrap().get(id).cloned();
+            if let Some(t) = t {
+                let st = *t.status.read().unwrap();
+                let wanted = if only_failed {
+                    matches!(st, DlStatus::Error | DlStatus::Cancelled)
+                } else {
+                    matches!(st, DlStatus::Paused | DlStatus::Error | DlStatus::Cancelled)
+                };
+                if wanted {
+                    t.cancel.store(false, Ordering::Relaxed);
+                    t.paused.store(false, Ordering::Relaxed);
+                    *t.error.lock().unwrap() = None;
+                    *t.status.write().unwrap() = DlStatus::Queued;
+                    self.run_http(t);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
 }
 
 // ---------------- Settings ----------------
@@ -271,6 +315,12 @@ pub struct Settings {
     pub stop_at: Option<u64>,
     /// Show the floating always-on-top drop box.
     pub show_dropbox: bool,
+    /// Watch the clipboard for URLs and auto-start download (like IDM).
+    pub clipboard_monitor: bool,
+    /// Auto-embed one subtitle track into downloaded videos.
+    pub embed_subs: bool,
+    /// Preferred subtitle language(s) for embedding, e.g. "en" or "en,bn".
+    pub sub_langs: String,
 }
 
 impl Default for Settings {
@@ -291,6 +341,9 @@ impl Default for Settings {
             on_complete: "none".into(),
             stop_at: None,
             show_dropbox: false,
+            clipboard_monitor: false,
+            embed_subs: true,
+            sub_langs: "en".into(),
         }
     }
 }
@@ -376,6 +429,7 @@ pub fn category_folder(cat: &str) -> &'static str {
         "document" => "Documents",
         "program" => "Programs",
         "zip" => "Archives",
+        "subtitle" => "Subtitles",
         _ => "Other",
     }
 }
@@ -497,6 +551,152 @@ pub fn persist_loop(app: AppHandle, mgr: Arc<DlManager>) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             persist_history(&app, &mgr);
+        }
+    });
+}
+
+// ---------------- Clipboard monitoring (IDM-style) ----------------
+
+#[cfg(windows)]
+mod win_clip {
+    #![allow(non_camel_case_types)]
+    use std::ffi::c_void;
+    use std::ptr;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hwnd: *mut c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(u_format: u32) -> *mut c_void;
+        fn IsClipboardFormatAvailable(u_format: u32) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalLock(h_mem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(h_mem: *mut c_void) -> i32;
+        fn GlobalSize(h_mem: *mut c_void) -> usize;
+    }
+
+    const CF_UNICODETEXT: u32 = 13;
+    const MAX_LEN: usize = 4096;
+
+    /// Read the current clipboard text (UTF-8), or None if unavailable.
+    pub fn get_clipboard_text() -> Option<String> {
+        unsafe {
+            if OpenClipboard(ptr::null_mut()) == 0 {
+                return None;
+            }
+            let result = (|| {
+                if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+                    return None;
+                }
+                let h = GetClipboardData(CF_UNICODETEXT);
+                if h.is_null() {
+                    return None;
+                }
+                let lock = GlobalLock(h);
+                if lock.is_null() {
+                    return None;
+                }
+                let size = GlobalSize(h);
+                let byte_len = size.min(MAX_LEN * 2);
+                if byte_len < 2 {
+                    GlobalUnlock(h);
+                    return None;
+                }
+                let slice = std::slice::from_raw_parts(lock as *const u16, byte_len / 2);
+                let s = String::from_utf16_lossy(slice);
+                GlobalUnlock(h);
+                Some(s.trim_end_matches('\0').to_string())
+            })();
+            CloseClipboard();
+            result
+        }
+    }
+}
+
+/// Extract http(s) URLs from a clipboard text blob.
+fn urls_in_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in text.split_whitespace() {
+        let mut t = token.trim();
+        while (t.starts_with('(') || t.starts_with('[') || t.starts_with('{')) && t.len() > 1 {
+            t = &t[1..];
+        }
+        let mut end = t.len();
+        while end > 0
+            && matches!(t.as_bytes()[end - 1], b')' | b']' | b'}' | b'.' | b',' | b';' | b'"' | b'\'' | b'!' | b'?')
+        {
+            end -= 1;
+        }
+        let t = &t[..end];
+        if t.starts_with("http://") || t.starts_with("https://") {
+            if !out.contains(&t.to_string()) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Spawn the clipboard watcher. While `clipboard_monitor` is enabled it polls the
+/// clipboard and auto-queues any new http(s) URL it finds (like IDM).
+pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        {
+            let mut last: Option<String> = None;
+            let mut last_seen_ms: u64 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                let settings = load_settings(&app);
+                if !settings.clipboard_monitor {
+                    continue;
+                }
+                let Some(text) = win_clip::get_clipboard_text() else { continue };
+                let now = crate::download::now_ms();
+                let urls = urls_in_text(&text);
+                if urls.is_empty() {
+                    // remember recent non-URL text so a repeat copy of the same text still works
+                    last_seen_ms = now;
+                    continue;
+                }
+                let url = urls[0].clone();
+                // Debounce: same URL copied again within 4s is treated as a re-copy trigger.
+                if last.as_deref() == Some(url.as_str()) && now.saturating_sub(last_seen_ms) < 4000 {
+                    last_seen_ms = now;
+                    continue;
+                }
+                last = Some(url.clone());
+                last_seen_ms = now;
+
+                let app = app.clone();
+                let mgr = mgr.clone();
+                let settings = settings.clone();
+                tauri::async_runtime::spawn(async move {
+                    if crate::download::url_is_downloadable(&url) {
+                        let opts = download::StartOpts {
+                            segments: settings.segments,
+                            filename: None,
+                            categorize: settings.categorize_folders,
+                            start_at: None,
+                            auto_retries: settings.auto_retries,
+                            proxy: settings.proxy.clone(),
+                        };
+                        if let Ok(task) = crate::download::start(app.clone(), url.clone(), settings.path.clone(), opts, mgr.limit.clone()).await {
+                            let id = task.id.clone();
+                            let view = task.view();
+                            mgr.add_http(task.clone());
+                            mgr.run_http(task);
+                            let _ = app.emit("downloads-changed", ());
+                            let _ = app.emit(
+                                "clips", 
+                                serde_json::json!({ "url": url, "id": id, "filename": view.title }),
+                            );
+                        }
+                    }
+                });
+            }
         }
     });
 }

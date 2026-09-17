@@ -189,9 +189,22 @@ async fn launch_yt_from_capture(
                 .map(|f| f.id.clone())
         }
     }?;
-    let task = ytdlp::start(app.clone(), cap.url, fmt, save_path, categorize, proxy, false, String::new(), None)
-        .await
-        .ok()?;
+    let settings = crate::state::load_settings(&app);
+    let task = ytdlp::start(
+        app.clone(),
+        cap.url,
+        fmt,
+        save_path,
+        categorize,
+        proxy,
+        false,
+        String::new(),
+        None,
+        settings.embed_subs,
+        settings.sub_langs,
+    )
+    .await
+    .ok()?;
     let id = task.id.clone();
     let view = task.view();
     mgr.add_yt(task.clone());
@@ -297,33 +310,84 @@ async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
 
 #[tauri::command]
 async fn remove_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String, delete_file: Option<bool>) -> Result<(), String> {
-    remove_internal(app, state, id, delete_file.unwrap_or(false));
+    remove_one(&app, &state, &id, delete_file.unwrap_or(false));
+    let _ = app.emit("downloads-changed", ());
     Ok(())
 }
 
-fn remove_internal(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String, delete_file: bool) {
-    // Remove: cancel + delete from lists + cleanup .part files if enabled
-    let settings = state::load_settings(&app);
-    state.remove_with_file(&id, delete_file);
-    if settings.delete_part {
-        // Best-effort cleanup of .vtx.part files
-        for t in state.http.lock().unwrap().values() {
-            if t.id == id {
-                let dir = t.save_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for e in entries.flatten() {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        if name.contains(&id) || name.ends_with(".vtx.part") {
-                            let _ = std::fs::remove_file(e.path());
-                        }
-                    }
-                }
-                break;
+/// Apply a bulk action to a set of task ids. `action` is one of
+/// "pause" | "resume" | "retry" | "remove". Returns how many were affected.
+#[tauri::command]
+async fn downloads_action(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<DlManager>>,
+    action: String,
+    ids: Vec<String>,
+    delete_file: Option<bool>,
+) -> Result<usize, String> {
+    let n = match action.as_str() {
+        "remove" => {
+            let del = delete_file.unwrap_or(false);
+            for id in &ids {
+                remove_one(&app, &state, id, del);
+            }
+            ids.len()
+        }
+        "pause" => state.bulk_pause(&ids),
+        "resume" => state.bulk_restart(&ids, false),
+        "retry" => state.bulk_restart(&ids, true),
+        other => return Err(format!("unknown action: {other}")),
+    };
+    let _ = app.emit("downloads-changed", ());
+    Ok(n)
+}
+
+/// Delete every `*.vtx.part` file that belongs to the given final file.
+fn cleanup_parts_for(save_path: &std::path::Path) {
+    let dir = match save_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => return,
+    };
+    let base = match save_path.file_name() {
+        Some(b) => b.to_string_lossy().into_owned(),
+        None => return,
+    };
+    let prefix = format!("{base}.");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && name.ends_with(".vtx.part") {
+                let _ = std::fs::remove_file(e.path());
             }
         }
     }
-    state.remove(&id);
-    let _ = app.emit("downloads-changed", ());
+}
+
+fn remove_one(app: &tauri::AppHandle, state: &Arc<DlManager>, id: &str, delete_file: bool) {
+    let settings = state::load_settings(app);
+    // Grab the target path before the task is dropped from the lists.
+    let save_path = state
+        .http
+        .lock()
+        .unwrap()
+        .get(id)
+        .map(|t| t.save_path.clone())
+        .or_else(|| state.yt.lock().unwrap().get(id).map(|t| t.save_path.lock().unwrap().clone()))
+        .or_else(|| {
+            state
+                .history
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|h| h.id == id)
+                .map(|h| std::path::PathBuf::from(&h.save_path))
+        });
+    state.remove_with_file(id, delete_file);
+    if settings.delete_part {
+        if let Some(p) = save_path {
+            cleanup_parts_for(&p);
+        }
+    }
 }
 
 #[tauri::command]
@@ -356,6 +420,8 @@ async fn start_ytdl(
     include_playlist: Option<bool>,
     playlist_items: Option<String>,
     start_at: Option<u64>,
+    embed_subs: Option<bool>,
+    sub_langs: Option<String>,
 ) -> Result<download::DlView, String> {
     let settings = state::load_settings(&app);
     let task = ytdlp::start(
@@ -368,6 +434,8 @@ async fn start_ytdl(
         include_playlist.unwrap_or(false),
         playlist_items.unwrap_or_default(),
         start_at,
+        embed_subs.unwrap_or(settings.embed_subs),
+        sub_langs.unwrap_or_else(|| settings.sub_langs.clone()),
     )
     .await?;
     let id = task.id.clone();
@@ -464,6 +532,11 @@ async fn read_urls(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
+fn get_ws_token(app: tauri::AppHandle) -> String {
+    ws_server::ws_token(&app)
+}
+
+#[tauri::command]
 fn window_action(app: tauri::AppHandle, action: String) {
     if let Some(win) = app.get_webview_window("main") {
         match action.as_str() {
@@ -516,6 +589,7 @@ pub fn run() {
             state::persist_loop(handle.clone(), mgr.inner().clone());
             state::sleep_block_loop(mgr.inner().clone());
             state::completion_watch_loop(handle.clone(), mgr.inner().clone());
+            state::clipboard_monitor_loop(handle.clone(), mgr.inner().clone());
 
             // Minimize-to-tray + tray menu.
             if let Some(icon) = app.default_window_icon() {
@@ -597,6 +671,7 @@ pub fn run() {
             resume_all_downloads,
             cancel_download,
             remove_download,
+            downloads_action,
             list_downloads,
             get_stats,
             fetch_ytdl_info,
@@ -611,6 +686,7 @@ pub fn run() {
             open_folder,
             open_saved_file,
             read_urls,
+            get_ws_token,
             window_action,
         ])
         .run(tauri::generate_context!())

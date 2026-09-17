@@ -164,6 +164,7 @@ pub async fn grab_site(start_url: &str, max_pages: usize, want: Vec<String>) -> 
     }
     let max_pages = max_pages.clamp(1, 50);
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| format!("Client error: {e}"))?;

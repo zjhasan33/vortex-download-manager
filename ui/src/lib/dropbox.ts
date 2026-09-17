@@ -3,7 +3,7 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 /** Create the floating drop box if enabled (and missing), or close it if disabled. */
 export async function syncDropbox(enabled: boolean): Promise<void> {
   try {
-    const existing = WebviewWindow.getByLabel("dropbox");
+    const existing = await WebviewWindow.getByLabel("dropbox");
     if (enabled) {
       if (existing) {
         try {

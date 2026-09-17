@@ -172,6 +172,16 @@ export function openSettings() {
           Toggle OFF = cookies always skipped (default). Toggle ON = yt-dlp uses your cookies.txt for YouTube, age-restricted & member-only videos.
         </div>
       </div>
+      <div class="field">
+        <label>Browser extension key (pairing)</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input class="input ext" id="st-key" readonly placeholder="loading…" />
+          <button class="tbtn" id="st-keycopy" title="Copy to clipboard">${icon("copy", 15)} Copy</button>
+        </div>
+        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
+          Copy this key into the Vortex browser extension → <b>Connection key</b> once, so only the extension can control the app.
+        </div>
+      </div>
       <div class="row2">
         <div class="field">
           <label>When all downloads complete</label>
@@ -203,6 +213,22 @@ export function openSettings() {
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
             <input type="checkbox" id="st-dropbox" ${s.show_dropbox ? "checked" : ""} /> Show floating drop box
           </label>
+          <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="st-clip" ${s.clipboard_monitor ? "checked" : ""} /> Watch clipboard for URLs (auto-add like IDM)
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Subtitles</label>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="st-embed" ${s.embed_subs ? "checked" : ""} /> Auto-embed subtitles in videos
+          </label>
+          <span style="font-size:12.5px;color:var(--text-2)">Language(s)</span>
+          <input class="input" id="st-sublangs" value="${escapeAttr(s.sub_langs)}" placeholder="en" style="width:130px" spellcheck="false" />
+        </div>
+        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
+          Videos download with one subtitle track embedded (e.g. <b>en</b> or <b>en,bn</b>). Separate .srt/.vtt/.ass downloads are available in the Download Video window.
         </div>
       </div>
     </div>
@@ -229,6 +255,20 @@ export function openSettings() {
       };
       root.querySelector<HTMLButtonElement>("#st-cookieclear")!.onclick = () => (ckPath.value = "");
 
+      // Browser extension pairing key
+      const keyInp = root.querySelector<HTMLInputElement>("#st-key")!;
+      void api.getWsToken().then((t) => {
+        keyInp.value = t;
+      });
+      root.querySelector<HTMLButtonElement>("#st-keycopy")!.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(keyInp.value);
+          toast("Key copied — paste it in the extension popup", "ok");
+        } catch {
+          toast("Copy failed — select the key and press Ctrl+C", "err");
+        }
+      };
+
       root.querySelector<HTMLButtonElement>("#st-save")!.onclick = async () => {
         const next: Settings = {
           path: pathInp.value.trim() || s.path,
@@ -245,6 +285,9 @@ export function openSettings() {
           cookies: ckPath.value.trim(),
           on_complete: root.querySelector<HTMLSelectElement>("#st-oncomplete")!.value,
           show_dropbox: root.querySelector<HTMLInputElement>("#st-dropbox")!.checked,
+          clipboard_monitor: root.querySelector<HTMLInputElement>("#st-clip")!.checked,
+          embed_subs: root.querySelector<HTMLInputElement>("#st-embed")!.checked,
+          sub_langs: root.querySelector<HTMLInputElement>("#st-sublangs")!.value.trim() || "en",
           stop_at: (() => {
             const v = root.querySelector<HTMLInputElement>("#st-stopat")!.value;
             return v ? new Date(v).getTime() || null : null;
@@ -413,6 +456,38 @@ export function openConfirmRemove(name: string, onYes: (deleteFile: boolean) => 
       <div style="font-size:13px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeAttr(name)}</div>
       <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
         <input type="checkbox" id="cf-delfile" /> Also delete the file from disk
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" data-close>Cancel</button>
+      <button class="tbtn primary" id="cf-yes">Remove</button>
+    </div>
+  </div>`,
+    (root, close) => {
+      root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = close));
+      root.querySelector<HTMLButtonElement>("#cf-yes")!.onclick = () => {
+        const del = root.querySelector<HTMLInputElement>("#cf-delfile")!.checked;
+        onYes(del);
+        close();
+      };
+    },
+  );
+  return close;
+}
+
+export function openConfirmBulkRemove(count: number, onYes: (deleteFile: boolean) => void) {
+  const close = openModal(
+    () => `
+  <div class="modal" style="width:440px">
+    <div class="modal-head">
+      <h3>Remove ${count} download(s)?</h3>
+      <div class="spacer"></div>
+      <button class="x" data-close>✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:13px;color:var(--text-2)">This removes ${count} item(s) from the list.</div>
+      <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+        <input type="checkbox" id="cf-delfile" /> Also delete the file(s) from disk
       </label>
     </div>
     <div class="modal-foot">

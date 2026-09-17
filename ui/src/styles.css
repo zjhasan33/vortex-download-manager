@@ -243,7 +243,7 @@ button {
 
 .list-head {
   display: grid;
-  grid-template-columns: minmax(220px, 1.6fr) 90px 130px 190px 130px 90px 140px;
+  grid-template-columns: 30px minmax(220px, 1.6fr) 90px 130px 190px 130px 90px minmax(132px, auto);
   gap: 12px;
   padding: 10px 18px;
   font-size: 11px;
@@ -257,7 +257,7 @@ button {
 
 .dl-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.6fr) 90px 130px 190px 130px 90px 140px;
+  grid-template-columns: 30px minmax(220px, 1.6fr) 90px 130px 190px 130px 90px minmax(132px, auto);
   gap: 12px;
   align-items: center;
   padding: 12px 6px 12px 12px;
@@ -336,18 +336,62 @@ button {
 .chip.merging::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--acc-3); animation: pulse 0.8s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
-.dl-actions { display: flex; gap: 4px; justify-content: flex-end; opacity: 0; transition: opacity 0.15s; }
+.dl-actions {
+  display: flex;
+  gap: 3px;
+  justify-content: flex-end;
+  opacity: 0;
+  transition: opacity 0.15s;
+  min-width: 0;
+}
 .dl-row:hover .dl-actions { opacity: 1; }
 .dl-actions button {
-  width: 30px; height: 30px;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
   border-radius: 8px;
-  display: grid; place-items: center;
+  display: grid;
+  place-items: center;
   color: var(--text-3);
   transition: all 0.14s;
 }
-.dl-actions button svg { width: 15px; height: 15px; }
+.dl-actions button svg { width: 14px; height: 14px; }
 .dl-actions button:hover { background: var(--surface-2); color: #fff; }
 .dl-actions button.red:hover { background: rgba(239,68,68,0.2); color: #fca5a5; }
+
+/* ---- selection + bulk actions ---- */
+.dl-check { display: flex; align-items: center; justify-content: center; pointer-events: none; }
+.list-head .dl-check { pointer-events: auto; }
+.dl-check input {
+  appearance: none; -webkit-appearance: none;
+  width: 16px; height: 16px; border-radius: 5px;
+  border: 1.5px solid var(--border-strong);
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer; position: relative; transition: all 0.14s;
+}
+.dl-check input:checked { background: var(--grad); border-color: transparent; }
+.dl-check input:indeterminate { background: var(--surface-2); border-color: var(--acc-1); }
+.dl-check input:checked::after {
+  content: ""; position: absolute; left: 4.5px; top: 1px;
+  width: 4px; height: 8px;
+  border: solid #04121f; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.dl-row.sel { background: rgba(129, 140, 248, 0.1); border-color: var(--border-strong); }
+
+.bulkbar {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(90deg, rgba(129, 140, 248, 0.16), rgba(34, 211, 238, 0.07));
+}
+.bulkbar.show { display: flex; }
+.bulk-count { font-size: 12px; font-weight: 600; color: var(--text-1); }
+.bulk-actions { display: flex; gap: 6px; margin-left: auto; }
+.bulk-actions .tbtn.danger { color: #fca5a5; border-color: rgba(239, 68, 68, 0.35); }
+.bulk-actions .tbtn.danger:hover { background: rgba(239, 68, 68, 0.18); color: #fff; }
 
 .empty {
   height: 100%;
@@ -494,6 +538,8 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .yt-meta .tags { display: flex; gap: 8px; flex-wrap: wrap; }
 .yt-meta .tag { font-size: 11px; color: var(--text-2); background: var(--surface-2); padding: 2px 9px; border-radius: 20px; }
 .yt-formats { max-height: 240px; overflow-y: auto; display: grid; gap: 6px; }
+.sub-select { display: flex; gap: 8px; align-items: center; }
+.sub-select select { flex: 1; min-width: 0; }
 .fmt {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 13px;
@@ -548,7 +594,7 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .btn-ghost:hover { color: #fff; border-color: var(--border-strong); }
 
 @media (max-width: 1000px) {
-  .list-head, .dl-row { grid-template-columns: minmax(200px, 1.4fr) 80px 110px 170px 140px; }
+  .list-head, .dl-row { grid-template-columns: 30px minmax(200px, 1.4fr) 80px 110px 170px minmax(132px, auto); }
   .dl-head-speed, .dl-head-eta, .dl-speed, .dl-eta { display: none; }
 }
 

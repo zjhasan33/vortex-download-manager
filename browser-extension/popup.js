@@ -4,12 +4,30 @@ function $(id) {
   return document.getElementById(id);
 }
 
-function send(msg) {
+// Send a message to the background service worker. Always resolves (never hangs):
+// a timeout + chrome.runtime.lastError guard guarantees a result.
+function send(msg, timeoutMs = 8000) {
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (res) => {
+      if (settled) return;
+      settled = true;
+      resolve(res || {});
+    };
+    const timer = setTimeout(
+      () => done({ error: "No response from Vortex bridge (timed out)" }),
+      timeoutMs
+    );
     try {
-      chrome.runtime.sendMessage(msg, (res) => resolve(res || {}));
+      chrome.runtime.sendMessage(msg, (res) => {
+        clearTimeout(timer);
+        const err = chrome.runtime.lastError;
+        if (err) return done({ error: err.message || "bridge error" });
+        done(res);
+      });
     } catch (e) {
-      resolve({ error: String(e) });
+      clearTimeout(timer);
+      done({ error: String(e) });
     }
   });
 }
@@ -73,14 +91,20 @@ async function loadCaptures(on) {
     dl.textContent = "Download";
     dl.disabled = !on;
     dl.addEventListener("click", async () => {
-      if (on) {
-        const res = await send({ type: "download_direct", url: c.url, filename: c.filename });
-        if (res && res.launched) dl.textContent = "Launched ✓";
-        else dl.textContent = "Started ✓";
-      } else {
-        await send({ type: "download_direct", url: c.url, filename: c.filename });
-        dl.textContent = "Launched ✓";
+      dl.disabled = true;
+      dl.textContent = "Sending…";
+      const res = await send(
+        { type: "download_direct", url: c.url, filename: c.filename },
+        5000
+      );
+      if (res && res.error && !res.launched) {
+        dl.disabled = false;
+        dl.textContent = "Failed";
+        alert("Could not send to Vortex:\n" + res.error);
+        setTimeout(() => (dl.textContent = "Download"), 1500);
+        return;
       }
+      dl.textContent = res && res.launched ? "Launched ✓" : "Started ✓";
       setTimeout(() => dl.remove(), 1400);
     });
     row.appendChild(name);
@@ -96,14 +120,21 @@ $("addbtn").addEventListener("click", async () => {
   const btn = $("addbtn");
   btn.disabled = true;
   btn.textContent = "Sending…";
-  const r = await send({ type: "download_direct", url, filename: "" });
-  if (r && r.error && r.launched) btn.textContent = "Launched ✓";
-  else btn.textContent = r && r.error ? "Failed: check Vortex" : "Started ✓";
-  $("url").value = "";
-  setTimeout(() => {
+  const reset = () => {
     btn.disabled = false;
     btn.textContent = "Add URL";
-  }, 1400);
+  };
+  // 5-second cap: never stay stuck on "Sending…".
+  const r = await send({ type: "download_direct", url, filename: "" }, 5000);
+  if (r && r.error && !r.launched) {
+    btn.textContent = "Failed — check Vortex";
+    alert("Could not send to Vortex:\n" + r.error);
+    setTimeout(reset, 1800);
+    return;
+  }
+  btn.textContent = r && r.launched ? "Launched ✓" : "Started ✓";
+  $("url").value = "";
+  setTimeout(reset, 1400);
 });
 $("url").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("addbtn").click();
@@ -114,6 +145,43 @@ $("refresh").addEventListener("click", () => void refreshStatus());
 $("clear").addEventListener("click", () => {
   void send({ type: "clear_captures" });
   $("cap-list").innerHTML = '<div class="empty">Watching for downloads on any tab…</div>';
+});
+
+// ---- Pairing key ----
+(async () => {
+  const stored = (await chrome.storage.local.get({ vx_token: "" })).vx_token;
+  const pairInput = $("pair-key");
+  if (stored) {
+    pairInput.value = stored;
+    pairInput.placeholder = "Key saved ✓";
+  }
+})();
+
+$("pair-save").addEventListener("click", async () => {
+  const key = $("pair-key").value.trim();
+  if (!key) return;
+  await chrome.storage.local.set({ vx_token: key });
+  $("pair-key").placeholder = "Key saved ✓";
+  // Force reconnection with the new key
+  $("pair-save").textContent = "Saved ✓";
+  setTimeout(() => { $("pair-save").textContent = "Save"; }, 1200);
+  void refreshStatus();
+});
+
+$("pair-clear").addEventListener("click", async () => {
+  await chrome.storage.local.remove("vx_token");
+  $("pair-key").value = "";
+  $("pair-key").placeholder = "Paste key from Vortex → Settings";
+});
+
+// ---- Notification toggle ----
+(async () => {
+  const { vx_notify } = await chrome.storage.local.get({ vx_notify: true });
+  $("notify-toggle").checked = vx_notify !== false;
+})();
+
+$("notify-toggle").addEventListener("change", async (e) => {
+  await chrome.storage.local.set({ vx_notify: !!e.target.checked });
 });
 
 refreshStatus();

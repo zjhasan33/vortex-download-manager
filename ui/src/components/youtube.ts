@@ -8,6 +8,8 @@ export function openYoutube() {
   let info: YtdlInfo | null = null;
   let selected: string | null = null;
   let loading = false;
+  let subSel = "";
+  let subFmt = "srt";
 
   const close = openModal(
     () => `
@@ -39,11 +41,14 @@ export function openYoutube() {
       <div class="row2" id="yt-optrow" style="display:none">
         <div class="field">
           <label>Options</label>
-          <div style="display:flex;gap:16px;padding-top:2px">
+          <div style="display:flex;gap:16px;padding-top:2px;flex-wrap:wrap">
             <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
               <input type="checkbox" id="yt-playlist" /> Download whole playlist
             </label>
             <input class="input" id="yt-items" placeholder="Items (e.g. 1-10)" style="width:130px;display:none" />
+            <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+              <input type="checkbox" id="yt-embed" ${store.settings?.embed_subs !== false ? "checked" : ""} /> Embed subtitles in video
+            </label>
           </div>
         </div>
         <div class="field">
@@ -74,6 +79,7 @@ export function openYoutube() {
         const best = info.formats.find((f) => f.note?.includes("Best"));
         const start = selected ?? best?.id ?? info.formats[0]?.id;
         if (start) selected = start;
+        if (!subSel && info.subtitles.length) subSel = info.subtitles[0].lang;
 
         body.innerHTML = `
           <div class="yt-info">
@@ -90,7 +96,21 @@ export function openYoutube() {
           <div class="field">
             <label>Choose format</label>
             <div class="yt-formats">${listFormats(info, selected!)}</div>
-          </div>`;
+          </div>
+          ${info.subtitles.length ? `
+          <div class="field">
+            <label>Subtitles / Captions</label>
+            <div class="sub-select">
+              <select class="input" id="yt-sublang">
+                <option value="all" ${subSel === "all" ? "selected" : ""}>All languages</option>
+                ${info.subtitles.map((s) => `<option value="${s.lang}" ${s.lang === subSel ? "selected" : ""}>${esc(s.label)}</option>`).join("")}
+              </select>
+              <select class="input" id="yt-subfmt" style="flex:0 0 96px;width:96px">
+                ${["srt", "vtt", "ass"].map((f) => `<option value="${f}" ${f === subFmt ? "selected" : ""}>${f.toUpperCase()}</option>`).join("")}
+              </select>
+              <button class="tbtn primary" id="yt-subs-go">Download subs</button>
+            </div>
+          </div>` : ""}`;
 
         body.querySelectorAll<HTMLElement>(".fmt").forEach((el) => {
           el.onclick = () => {
@@ -100,6 +120,16 @@ export function openYoutube() {
             refreshGo();
           };
         });
+        const subSelect = root.querySelector<HTMLSelectElement>("#yt-sublang");
+        if (subSelect) subSelect.onchange = () => (subSel = subSelect.value);
+        const subFmtSel = root.querySelector<HTMLSelectElement>("#yt-subfmt");
+        if (subFmtSel) subFmtSel.onchange = () => (subFmt = subFmtSel.value);
+        const subGo = root.querySelector<HTMLButtonElement>("#yt-subs-go");
+        if (subGo)
+          subGo.onclick = async () => {
+            const lang = subSel || "all";
+            await goDownload(`subs:${subFmt}:${lang}`);
+          };
 
         pathInp.value = store.settings?.path ?? "";
         pathwrap.style.display = "";
@@ -142,15 +172,35 @@ export function openYoutube() {
         e.key === "Enter" && root.querySelector<HTMLButtonElement>("#yt-fetch")!.click(),
       );
 
-      root.querySelector<HTMLButtonElement>("#yt-go")!.onclick = async () => {
-        if (!selected) return;
+      const goDownload = async (formatId: string) => {
         const playlist = root.querySelector<HTMLInputElement>("#yt-playlist")!.checked;
         const items = root.querySelector<HTMLInputElement>("#yt-items")!.value.trim();
         const startInp = root.querySelector<HTMLInputElement>("#yt-start")!;
         const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
-        await api.startYtdl(urlInp.value.trim(), selected, pathInp.value.trim(), playlist, items, when);
-        toast("Video download started", "ok");
+        const embed = root.querySelector<HTMLInputElement>("#yt-embed")?.checked ?? true;
+        const subLangs = subSel && subSel !== "all" ? subSel : store.settings?.sub_langs || "en";
+        await api.startYtdl(
+          urlInp.value.trim(),
+          formatId,
+          pathInp.value.trim(),
+          playlist,
+          items,
+          when,
+          embed,
+          subLangs,
+        );
+        const msg = formatId.startsWith("subs:")
+          ? "Subtitle download started"
+          : formatId.startsWith("ba-") || formatId.startsWith("bestaudio")
+            ? "Audio download started"
+            : "Video download started";
+        toast(msg, "ok");
         close();
+      };
+
+      root.querySelector<HTMLButtonElement>("#yt-go")!.onclick = async () => {
+        if (!selected) return;
+        await goDownload(selected);
       };
 
       setTimeout(() => urlInp.focus(), 50);

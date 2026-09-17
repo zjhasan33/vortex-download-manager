@@ -2,9 +2,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use futures_util::StreamExt;
-use reqwest::Client;
 use tauri::{AppHandle, Manager};
 
 /// Prevent console windows from flashing for spawned console apps (yt-dlp, ffmpeg, reg, ...).
@@ -20,7 +20,11 @@ pub(crate) fn silent(mut cmd: Command) -> Command {
 }
 
 pub const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+/// Gyan's "essentials" build is a small (~80 MB) static release with bin/ffmpeg.exe.
 pub const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+/// Some CDNs reject requests with a missing/empty User-Agent.
+pub const BROWSER_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
 
 pub fn tools_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("tools");
@@ -84,53 +88,121 @@ pub async fn ensure_ytdlp(app: &AppHandle) -> Result<PathBuf, String> {
 /// Ensure ffmpeg is present; download + extract the portable exe if needed.
 pub async fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
     if let Some(p) = ffmpeg_path(app) {
-        return Ok(p);
+        // Trust it only if it actually runs; a truncated/partial file must be replaced.
+        if ffmpeg_version(app).is_some() {
+            return Ok(p);
+        }
+        eprintln!("[vortex-tools] existing ffmpeg.exe is invalid — re-downloading");
+        let _ = fs::remove_file(&p);
     }
     let dir = tools_dir(app).map_err(|e| e.to_string())?;
     let zip_path = dir.join("ffmpeg.zip");
+    let _ = fs::remove_file(&zip_path); // drop any stale partial archive
+
+    eprintln!("[vortex-tools] downloading ffmpeg from {FFMPEG_URL} -> {zip_path:?}");
     download_to(&FFMPEG_URL, &zip_path)
         .await
-        .map_err(|e| format!("Failed to download ffmpeg: {e}"))?;
+        .map_err(|e| {
+            eprintln!("[vortex-tools] ffmpeg download FAILED: {e}");
+            let _ = fs::remove_file(&zip_path);
+            format!("Failed to download ffmpeg: {e}")
+        })?;
 
-    let file = File::open(&zip_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    let mut found = false;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = entry.name().to_string();
-        if name.ends_with("/ffmpeg.exe") {
-            let mut out = File::create(dir.join("ffmpeg.exe")).map_err(|e| e.to_string())?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-            found = true;
-            break;
+    let zip_len = fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!("[vortex-tools] ffmpeg zip downloaded ({zip_len} bytes), extracting…");
+
+    let extract = extract_ffmpeg(&zip_path, &dir);
+    // Always remove the large temp archive, even if extraction failed.
+    let _ = fs::remove_file(&zip_path);
+
+    match extract {
+        Ok(()) => {
+            let exe = dir.join("ffmpeg.exe");
+            eprintln!("[vortex-tools] ffmpeg ready at {exe:?}");
+            Ok(exe)
+        }
+        Err(e) => {
+            eprintln!("[vortex-tools] ffmpeg extraction FAILED: {e}");
+            Err(e)
         }
     }
-    let _ = fs::remove_file(&zip_path);
-    if !found {
-        return Err("ffmpeg.exe not found inside archive".into());
+}
+
+/// Find `ffmpeg.exe` anywhere inside the archive (e.g. `.../bin/ffmpeg.exe`)
+/// and copy it to `dir/ffmpeg.exe`.
+fn extract_ffmpeg(zip_path: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+    let file = File::open(zip_path).map_err(|e| format!("Cannot open zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Bad zip archive: {e}"))?;
+
+    let target = dir.join("ffmpeg.exe");
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Zip entry {i} error: {e}"))?;
+        let name = entry.name().replace('\\', "/");
+        let is_exe = name
+            .rsplit('/')
+            .next()
+            .map(|f| f.eq_ignore_ascii_case("ffmpeg.exe"))
+            .unwrap_or(false);
+        if !is_exe {
+            continue;
+        }
+        eprintln!("[vortex-tools] found '{name}' in archive, extracting");
+        let mut out = File::create(&target).map_err(|e| format!("Cannot create ffmpeg.exe: {e}"))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| format!("Copy failed: {e}"))?;
+        std::io::Write::flush(&mut out).ok();
+        return Ok(());
     }
-    Ok(dir.join("ffmpeg.exe"))
+    Err("ffmpeg.exe not found inside archive".into())
 }
 
 async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> {
-    let client = Client::builder()
-        .user_agent("Vortex/0.1 (download manager)")
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .user_agent(BROWSER_UA)
+        // GitHub / CDN release URLs redirect several times to the asset.
+        .redirect(reqwest::redirect::Policy::limited(10))
+        // ffmpeg zip is ~80–120 MB; allow up to 10 minutes for the stream.
+        .timeout(Duration::from_secs(600))
+        .connect_timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+
+    let resp = client.get(url).send().await.map_err(|e| {
+        crate::download::log_net_err(&e, "tools download");
+        format!("Network error: {e}")
+    })?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        return Err(format!("HTTP {code} for {url}"));
+    }
+
     let total = resp.content_length().unwrap_or(0);
-    let mut out = File::create(target).map_err(|e| e.to_string())?;
+    eprintln!(
+        "[vortex-tools] download started: {url} ({} bytes)",
+        if total > 0 { total.to_string() } else { "unknown".into() }
+    );
+
+    let mut out = File::create(target).map_err(|e| format!("Cannot create file: {e}"))?;
     let mut stream = resp.bytes_stream();
     let mut written = 0u64;
+    let mut next_log = 0u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
+        let chunk = chunk.map_err(|e| {
+            crate::download::log_net_err(&e, "tools stream");
+            format!("Stream error after {written} bytes: {e}")
+        })?;
         out.write_all(&chunk).map_err(|e| e.to_string())?;
         written += chunk.len() as u64;
-        if written % (1024 * 512) < chunk.len() as u64 {
+        if written >= next_log {
+            let pct = if total > 0 { (written * 100 / total) as u32 } else { 0 };
+            eprintln!("[vortex-tools]   {written} / {total} ({pct}%)");
+            next_log = written + 2 * 1024 * 1024;
             std::io::Write::flush(&mut out).ok();
         }
     }
     std::io::Write::flush(&mut out).ok();
-    let _ = total;
+    eprintln!("[vortex-tools] download finished: {written} bytes");
     Ok(())
 }

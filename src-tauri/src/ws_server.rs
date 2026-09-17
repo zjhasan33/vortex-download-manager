@@ -13,7 +13,7 @@ use crate::{download, grabber, tools, ytdlp};
 pub const PORT: u16 = 17190;
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-fn ws_token(app: &AppHandle) -> String {
+pub fn ws_token(app: &AppHandle) -> String {
     // Persistent random token stored in app data dir, used to authenticate extension
     let dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let _ = std::fs::create_dir_all(&dir);
@@ -44,14 +44,31 @@ pub async fn run(app: AppHandle) {
 }
 
 async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> std::io::Result<()> {
-    let key = match handshake(&mut stream).await {
-        Ok(k) => k,
+    let (key, origin) = match handshake(&mut stream).await {
+        Ok(v) => v,
         Err(_) => {
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
             return Ok(());
         }
     };
-    let _ = token;
+
+    // ---- Auth: require matching token via Sec-WebSocket-Protocol header ----
+    // The extension must echo back the token it received at first connection.
+    // For the initial handshake, the extension has no token yet; it uses "vortex-register".
+    // After first connect, the desktop sends the token back and the extension must use it.
+
+    // ---- Origin enforcement: only allow chrome-extension:// and moz-extension:// ----
+    let origin_ok = origin.as_ref().map_or(false, |o| {
+        o.starts_with("chrome-extension://")
+            || o.starts_with("moz-extension://")
+            || o.starts_with("http://localhost")
+            || o.starts_with("http://127.0.0.1")
+    });
+    if !origin_ok {
+        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+        return Ok(());
+    }
+
     let accept = accept_key(&key);
     let resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
@@ -60,6 +77,7 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
     stream.write_all(resp.as_bytes()).await?;
 
     let mut frag: Vec<u8> = Vec::new();
+    let mut authenticated = false;
     loop {
         let (fin, opcode, payload) = match read_frame(&mut stream).await {
             Ok(f) => f,
@@ -80,6 +98,23 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
                 }
                 let text = String::from_utf8_lossy(&frag).into_owned();
                 frag.clear();
+
+                // Auth gate: first message must be {"type":"auth","token":"<token>"}
+                if !authenticated {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        if v.get("type").and_then(|t| t.as_str()) == Some("auth") {
+                            let msg_token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
+                            if msg_token == token {
+                                authenticated = true;
+                                let _ = write_frame(&mut stream, 0x1, br#"{"type":"auth","ok":true}"#).await;
+                                continue;
+                            }
+                        }
+                    }
+                    let _ = write_frame(&mut stream, 0x8, b"unauthorized").await;
+                    break;
+                }
+
                 let reply = dispatch(&app, &text).await;
                 let _ = write_frame(&mut stream, 0x1, reply.as_bytes()).await;
             }
@@ -90,7 +125,7 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
     Ok(())
 }
 
-async fn handshake(stream: &mut TcpStream) -> Result<String, ()> {
+async fn handshake(stream: &mut TcpStream) -> Result<(String, Option<String>), ()> {
     let mut buf = [0u8; 8192];
     let mut read = 0usize;
     loop {
@@ -114,6 +149,7 @@ async fn handshake(stream: &mut TcpStream) -> Result<String, ()> {
     }
     let mut key = String::new();
     let mut upgrade = false;
+    let mut origin: Option<String> = None;
     for l in lines {
         let (name, value) = match l.split_once(':') {
             Some((n, v)) => (n.trim(), v.trim()),
@@ -122,13 +158,14 @@ async fn handshake(stream: &mut TcpStream) -> Result<String, ()> {
         match name.to_ascii_lowercase().as_str() {
             "sec-websocket-key" => key = value.to_string(),
             "upgrade" if value.eq_ignore_ascii_case("websocket") => upgrade = true,
+            "origin" => origin = Some(value.to_string()),
             _ => {}
         }
     }
     if !upgrade || key.is_empty() {
         return Err(());
     }
-    Ok(key)
+    Ok((key, origin))
 }
 
 fn accept_key(key: &str) -> String {
@@ -202,7 +239,15 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     if url.is_empty() {
                         err("url required")
                     } else {
-                        download_op(app, &mgr, &p).await
+                        // Acknowledge immediately; the probe/yt-dlp work runs in the
+                        // background so the extension popup never times out.
+                        let app2 = app.clone();
+                        let mgr2 = mgr.clone();
+                        let payload = p.clone();
+                        tokio::spawn(async move {
+                            let _ = download_op(&app2, &mgr2, &payload).await;
+                        });
+                        json!({"type":"ack","ok":true,"success":true,"action":"download_started"}).to_string()
                     }
                 }
                 "analyze" => {
@@ -227,7 +272,13 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let playlist = p["playlist"].as_bool().unwrap_or(false);
                         let playlist_items = p["playlist_items"].as_str().unwrap_or("").to_string();
                         let start_at = p["start_at"].as_u64();
-                        start_ytdl(app, &mgr, url, fid, settings_path(app), playlist, playlist_items, start_at).await
+                        let sp = settings_path(app);
+                        let app2 = app.clone();
+                        let mgr2 = mgr.clone();
+                        tokio::spawn(async move {
+                            let _ = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at).await;
+                        });
+                        json!({"type":"ack","ok":true,"success":true,"action":"ytdl_started"}).to_string()
                     }
                 }
                 "resume" => {
@@ -352,7 +403,21 @@ async fn start_ytdl(
     start_at: Option<u64>,
 ) -> String {
     let settings = crate::state::load_settings(app);
-    match ytdlp::start(app.clone(), url, format_id, save_path, settings.categorize_folders, settings.proxy.clone(), playlist, playlist_items, start_at).await {
+    match ytdlp::start(
+        app.clone(),
+        url,
+        format_id,
+        save_path,
+        settings.categorize_folders,
+        settings.proxy.clone(),
+        playlist,
+        playlist_items,
+        start_at,
+        settings.embed_subs,
+        settings.sub_langs.clone(),
+    )
+    .await
+    {
         Ok(task) => {
             let id = task.id.clone();
             let view = task.view();

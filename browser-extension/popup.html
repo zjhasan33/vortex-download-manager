@@ -19,10 +19,29 @@
       <button id="addbtn" class="btn primary">Add URL</button>
     </section>
 
+    <section class="notify">
+      <label class="toggle">
+        <input type="checkbox" id="notify-toggle" checked />
+        <span>Show notification when download link detected</span>
+      </label>
+    </section>
+
     <section id="stats" class="stats hidden">
       <div><b id="st-active">0</b><span>active</span></div>
       <div><b id="st-speed">0 B/s</b><span>speed</span></div>
       <div><b id="st-done">0</b><span>finished</span></div>
+    </section>
+
+    <section class="pair">
+      <div class="pair-head">
+        <span>Connection key</span>
+        <button id="pair-clear" class="linkbtn" title="Forget key">clear</button>
+      </div>
+      <div class="pair-row">
+        <input id="pair-key" type="text" placeholder="Paste key from Vortex → Settings" spellcheck="false" />
+        <button id="pair-save" class="btn primary">Save</button>
+      </div>
+      <div class="pair-hint">Get the key from Vortex app → Settings → Browser extension key → Copy, then paste it here once.</div>
     </section>
 
     <section class="captures">
