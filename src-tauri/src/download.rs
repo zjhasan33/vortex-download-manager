@@ -3,7 +3,7 @@ use std::error::Error as StdError;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,7 +52,12 @@ fn build_client_with_ua(proxy: &str, ua: &str) -> Result<Client, String> {
         // hosts and schemes (https<->http) — same behaviour as IDM.
         .redirect(reqwest::redirect::Policy::limited(20))
         // Keep a pooled connection per segment alive for retries/resume.
-        .pool_max_idle_per_host(64);
+        .pool_max_idle_per_host(64)
+        // Let HTTP/2 dynamically grow the receive window so large files don't
+        // stall waiting for WINDOW_UPDATE round-trips.
+        .http2_adaptive_window(true)
+        .http2_initial_stream_window_size(8 * 1024 * 1024)
+        .http2_initial_connection_window_size(16 * 1024 * 1024);
     if !proxy.trim().is_empty() {
         let p = Proxy::all(proxy.trim()).map_err(|e| format!("Bad proxy: {e}"))?;
         cb = cb.proxy(p);
@@ -170,6 +175,9 @@ pub struct DlView {
     pub eta: u64,
     pub segments: usize,
     pub connections: usize,
+    /// Live worker connections at this moment (0 when idle).
+    #[serde(default)]
+    pub live: usize,
     pub status: DlStatus,
     pub error: Option<String>,
     pub thumbnail: Option<String>,
@@ -239,6 +247,8 @@ pub struct Task {
     pub num_segments: usize,
     /// Max simultaneous connections (segments are split into smaller chunks than this).
     pub max_conns: usize,
+    /// Number of worker connections currently running (real-time, for stats).
+    pub live: AtomicUsize,
     pub status: RwLock<DlStatus>,
     pub error: Mutex<Option<String>>,
     pub cancel: AtomicBool,
@@ -428,6 +438,7 @@ impl Task {
             eta,
             segments: self.num_segments,
             connections: self.connections(),
+            live: self.live.load(Ordering::Relaxed),
             status,
             error: self.error.lock().unwrap().clone(),
             thumbnail: self.thumbnail.clone(),
@@ -626,6 +637,7 @@ pub async fn start(
         claimed: Mutex::new(vec![false; num_segments]),
         num_segments,
         max_conns,
+        live: AtomicUsize::new(0),
         status: RwLock::new(DlStatus::Queued),
         error: Mutex::new(None),
         cancel: AtomicBool::new(false),
@@ -680,6 +692,7 @@ pub fn restore(
         done: AtomicU64::new(view.downloaded),
         num_segments,
         max_conns: view.connections.clamp(1, 32),
+        live: AtomicUsize::new(0),
         status: RwLock::new(status),
         error: Mutex::new(view.error.clone()),
         cancel: AtomicBool::new(false),
@@ -758,7 +771,14 @@ pub async fn run(task: Arc<Task>) {
                 break;
             }
             let t = task.clone();
-            workers.push(tokio::spawn(async move { worker_loop(t).await }));
+            let t2 = task.clone();
+            t.live.fetch_add(1, Ordering::Relaxed);
+            let spawned = tokio::spawn(async move {
+                let r = worker_loop(t).await;
+                t2.live.fetch_sub(1, Ordering::Relaxed);
+                r
+            });
+            workers.push(spawned);
         }
 
         let mut all_ok = true;
@@ -1068,6 +1088,8 @@ async fn monitor_task(task: Arc<Task>) {
                 "speed": speed,
                 "progress": progress.min(100.0),
                 "eta": eta,
+                "segments": task.num_segments,
+                "connections": task.live.load(Ordering::Relaxed),
             }),
         );
 

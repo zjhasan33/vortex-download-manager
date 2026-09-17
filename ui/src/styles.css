@@ -351,6 +351,7 @@ button {
   min-width: 0;
 }
 .dl-row:hover .dl-actions { opacity: 1; }
+.dl-row.active .dl-actions { opacity: 1; }
 .dl-actions button {
   width: 28px;
   height: 28px;

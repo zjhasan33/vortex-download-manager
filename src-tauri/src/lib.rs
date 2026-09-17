@@ -326,6 +326,33 @@ async fn resume_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlMana
     Ok(n)
 }
 
+/// Pause every active (downloading/merging/queued) HTTP + youtube task.
+async fn pause_all_inner(app: &tauri::AppHandle, mgr: Arc<DlManager>) -> usize {
+    let ids: Vec<String> = mgr
+        .views()
+        .iter()
+        .filter(|v| {
+            matches!(
+                v.status,
+                download::DlStatus::Downloading
+                    | download::DlStatus::Merging
+                    | download::DlStatus::Queued
+            )
+        })
+        .map(|v| v.id.clone())
+        .collect();
+    let n = mgr.bulk_pause(&ids);
+    if n > 0 {
+        let _ = app.emit("downloads-changed", ());
+    }
+    n
+}
+
+#[tauri::command]
+async fn pause_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>) -> Result<usize, String> {
+    Ok(pause_all_inner(&app, state.inner().clone()).await)
+}
+
 #[tauri::command]
 async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
     // Cancel: stop download but keep entry in history as cancelled
@@ -711,50 +738,64 @@ pub fn run() {
 
             // Minimize-to-tray + tray menu.
             if let Some(icon) = app.default_window_icon() {
-                if let (Ok(open), Ok(quit)) = (
-                    MenuItem::with_id(app, "open", "Open Vortex", true, None::<&str>),
-                    MenuItem::with_id(app, "quit", "Quit", true, None::<&str>),
-                ) {
-                    if let Ok(menu) = Menu::with_items(app, &[&open, &quit]) {
-                        if let Ok(tray) = TrayIconBuilder::with_id("vortex-tray")
-                            .icon(icon.clone())
-                            .menu(&menu)
-                            .show_menu_on_left_click(false)
-                            .tooltip("Vortex — Download Manager")
-                            .on_menu_event(|app, event| match event.id().as_ref() {
-                                "open" => {
-                                    if let Some(w) = app.get_webview_window("main") {
-                                        let _ = w.show();
-                                        let _ = w.unminimize();
-                                        let _ = w.set_focus();
-                                    }
-                                }
-                                "quit" => {
-                                    app.exit(0);
-                                }
-                                _ => {}
-                            })
-                            .on_tray_icon_event(|tray, event| {
-                                if let TrayIconEvent::Click {
-                                    button: MouseButton::Left,
-                                    button_state: MouseButtonState::Up,
-                                    ..
-                                } = event
-                                {
-                                    let app = tray.app_handle();
-                                    if let Some(w) = app.get_webview_window("main") {
-                                        let _ = w.show();
-                                        let _ = w.unminimize();
-                                        let _ = w.set_focus();
-                                    }
-                                }
-                            })
-                            .build(app)
-                        {
-                            let _ = app.manage(tray);
+                let show = MenuItem::with_id(app, "show", "Show Vortex", true, None::<&str>)?;
+                let pause_all = MenuItem::with_id(app, "pause_all", "Pause All Downloads", true, None::<&str>)?;
+                let resume_all = MenuItem::with_id(app, "resume_all", "Resume All Downloads", true, None::<&str>)?;
+                let sep = MenuItem::with_id(app, "sep", "—", false, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show, &pause_all, &resume_all, &sep, &quit])?;
+                let tray = TrayIconBuilder::with_id("vortex-tray")
+                    .icon(icon.clone())
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .tooltip("Vortex — Download Manager")
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
                         }
-                    }
-                }
+                        "pause_all" => {
+                            let mgr = app.state::<Arc<DlManager>>().inner().clone();
+                            let app2 = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                pause_all_inner(&app2, mgr).await;
+                            });
+                        }
+                        "resume_all" => {
+                            let mgr = app.state::<Arc<DlManager>>().inner().clone();
+                            let app2 = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let n = mgr.resume_all();
+                                if n > 0 {
+                                    let _ = app2.emit("downloads-changed", ());
+                                }
+                            });
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    })
+                    .build(app)?;
+                let _ = app.manage(tray);
             }
 
             // Close = hide to tray (quit via tray menu).
@@ -789,6 +830,7 @@ pub fn run() {
             remove_credential,
             retry_all_downloads,
             resume_all_downloads,
+            pause_all_downloads,
             cancel_download,
             remove_download,
             downloads_action,

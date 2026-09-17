@@ -18,6 +18,8 @@ export interface ProgressPayload {
   speed: number;
   progress: number;
   eta: number;
+  segments?: number;
+  connections?: number;
 }
 
 const events: UnlistenFn[] = [];
@@ -56,6 +58,7 @@ export const api = {
   resumeDownload: (id: string) => cmd<void>("resume_download", { id }),
   retryAllDownloads: () => cmd<number>("retry_all_downloads"),
   resumeAllDownloads: () => cmd<number>("resume_all_downloads"),
+  pauseAllDownloads: () => cmd<number>("pause_all_downloads"),
   cancelDownload: (id: string) => cmd<void>("cancel_download", { id }),
   removeDownload: (id: string, deleteFile?: boolean) => cmd<void>("remove_download", { id, deleteFile }),
   downloadsAction: (action: "pause" | "resume" | "retry" | "remove", ids: string[], deleteFile?: boolean) =>
@@ -111,7 +114,7 @@ type Listener = () => void;
 
 class Store {
   downloads: Download[] = [];
-  stats: AppStats = { total_speed: 0, active: 0, completed: 0, total_downloaded: 0, segments: 0 };
+  stats: AppStats = { total_speed: 0, active: 0, completed: 0, total_downloaded: 0, segments: 0, connections: 0 };
   tools: ToolsStatus | null = null;
   settings: Settings | null = null;
   private listeners = new Set<Listener>();
@@ -140,7 +143,25 @@ class Store {
       d.speed = p.speed;
       d.progress = p.progress;
       d.eta = p.eta;
+      if (p.segments != null) d.segments = p.segments;
+      if (p.connections != null) d.live = p.connections;
     }
+    // Live stats from in-flight payloads so the statusbar moves in real time
+    // instead of waiting for the next get_stats poll (which still refreshes
+    // completed counts, totals, etc).
+    let speed = 0,
+      active = 0,
+      segs = 0,
+      conns = 0;
+    for (const x of this.downloads) {
+      if (x.status === "downloading" || x.status === "merging") {
+        active += 1;
+        speed += x.speed;
+        segs += x.segments;
+        conns += x.live || 0;
+      }
+    }
+    this.stats = { ...this.stats, total_speed: speed, active, segments: segs, connections: conns };
     this.emit();
   }
 

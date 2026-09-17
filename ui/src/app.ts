@@ -60,6 +60,7 @@ export class VortexApp {
   private search = "";
   private selected = new Set<string>();
   private lastSel = -1;
+  private lastRowKey = "";
   private r1 = () => {};
   private r2 = () => {};
 
@@ -68,7 +69,16 @@ export class VortexApp {
   }
 
   mount() {
-    this.r1 = store.subscribe(() => this.render());
+    // Render only when the list structure changes (status, add/remove, filter…).
+    // Progress ticks keep the same key, so they take the cheap patchRows path.
+    this.r1 = store.subscribe(() => {
+      const k = this.rowKey();
+      if (k === this.lastRowKey) this.patchRows();
+      else {
+        this.lastRowKey = k;
+        this.render();
+      }
+    });
     this.renderShell();
     this.afterShell();
     this.render();
@@ -199,6 +209,7 @@ export class VortexApp {
 
   private row(d: Download): string {
     const dim = d.status === "completed" || d.status === "cancelled";
+    const active = d.status === "downloading" || d.status === "merging" || d.status === "queued";
     const pct = d.progress.toFixed(1);
     const barCls = d.status === "error" ? "err" : d.status === "completed" ? "done" : "";
     const checked = this.selected.has(d.id);
@@ -217,7 +228,7 @@ export class VortexApp {
       prog: `
         <div class="dl-prog">
           <div class="bar ${barCls}"><div class="fill" style="width:${pct}%"></div></div>
-          <span class="dl-pct">${pct}% <span style="color:var(--text-3)">${d.segments} seg</span></span>
+          <span class="dl-pct"><span class="dl-pct-val">${pct}%</span> <span style="color:var(--text-3)">${d.segments} seg</span></span>
         </div>`,
       speed: `<span class="dl-speed">${d.status === "downloading" || d.status === "merging" ? formatSpeed(d.speed) : "–"}</span>`,
       eta: `<span class="dl-eta">${d.status === "downloading" ? formatEta(d.eta) : "–"}</span>`,
@@ -231,12 +242,50 @@ export class VortexApp {
           <button data-act="cancel" data-id="${d.id}" title="Remove">${icon("trash", 15)}</button>
         </div>`,
     };
-    return `<div class="dl-row ${dim ? "dim" : ""} ${checked ? "sel" : ""}" data-row="${d.id}">${Object.values(cols).join("")}</div>`;
+    return `<div class="dl-row ${dim ? "dim" : ""} ${checked ? "sel" : ""} ${active ? "active" : ""}" data-row="${d.id}">${Object.values(cols).join("")}</div>`;
+  }
+
+  /** Structural signature of the visible list; progress/speed changes are excluded. */
+  private rowKey(): string {
+    const sel = [...this.selected].sort().join(",");
+    const rows = store.downloads
+      .map(
+        (d) =>
+          [d.id, d.status, d.source, d.category, d.filename, d.total_size, d.segments, d.error ?? "", d.completed_at ?? 0, d.created_at].join("~"),
+      )
+      .join("|");
+    return `${this.cat}|${this.search}|${sel}|${rows}`;
+  }
+
+  /** Update only live metrics on already-rendered rows (no innerHTML rebuild → no flicker). */
+  private patchRows() {
+    const list = this.root.querySelector<HTMLElement>("#list");
+    if (!list) return;
+    const items = this.visible();
+    const kids = Array.from(list.children).filter((c): c is HTMLElement => c instanceof HTMLElement && !!c.dataset.row);
+    for (let i = 0; i < items.length && i < kids.length; i++) {
+      const d = items[i];
+      const el = kids[i];
+      const fill = el.querySelector<HTMLElement>(".bar .fill");
+      if (fill) fill.style.width = `${d.progress.toFixed(1)}%`;
+      const pv = el.querySelector<HTMLElement>(".dl-pct-val");
+      if (pv) pv.textContent = `${d.progress.toFixed(1)}%`;
+      const sz = el.querySelector<HTMLElement>(".dl-size");
+      if (sz) sz.textContent = formatBytes(d.total_size || d.downloaded);
+      const sp = el.querySelector<HTMLElement>(".dl-speed");
+      if (sp)
+        sp.textContent =
+          d.status === "downloading" || d.status === "merging" ? formatSpeed(d.speed) : "–";
+      const eta = el.querySelector<HTMLElement>(".dl-eta");
+      if (eta) eta.textContent = d.status === "downloading" ? formatEta(d.eta) : "–";
+    }
+    this.refreshChrome();
   }
 
   private render() {
     const list = this.root.querySelector<HTMLElement>("#list");
     if (!list) return;
+    this.lastRowKey = this.rowKey();
     // Drop selections for downloads that no longer exist.
     const alive = new Set(store.downloads.map((d) => d.id));
     for (const id of [...this.selected]) if (!alive.has(id)) this.selected.delete(id);
@@ -329,7 +378,7 @@ export class VortexApp {
     const bar = this.root.querySelector<HTMLElement>("#chart-speed");
     if (bar) bar.textContent = formatSpeed(s.total_speed);
     const segs = this.root.querySelector<HTMLElement>("#chart-segs");
-    if (segs) segs.textContent = `${s.active} active • ${s.segments} connections`;
+    if (segs) segs.textContent = `${s.active} active • ${s.connections} connections`;
     this.root.querySelectorAll<HTMLElement>(".statusbar").forEach((el) => {
       const b = el.querySelectorAll("b");
       if (b.length >= 2) {
@@ -414,7 +463,10 @@ export class VortexApp {
       this.root.querySelector<HTMLButtonElement>("#tb-settings")!.onclick = openSettings;
       const pa = this.root.querySelector<HTMLButtonElement>("#tb-pause");
       const re = this.root.querySelector<HTMLButtonElement>("#tb-resume");
-      if (pa) pa.onclick = () => store.downloads.filter((d) => d.status === "downloading" || d.status === "queued").forEach((d) => api.pauseDownload(d.id));
+      if (pa) pa.onclick = async () => {
+        const n = await api.pauseAllDownloads();
+        toast(n ? `${n} download(s) paused` : "Nothing to pause", n ? "ok" : "info");
+      };
       if (re) re.onclick = async () => {
         const n = await api.resumeAllDownloads();
         toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");

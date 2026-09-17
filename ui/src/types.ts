@@ -23,6 +23,7 @@ export interface Download {
   eta: number;
   segments: number;
   connections: number;
+  live?: number;
   status: DownloadStatus;
   error?: string;
   thumbnail?: string;
@@ -81,6 +82,7 @@ export interface AppStats {
   completed: number;
   total_downloaded: number;
   segments: number;
+  connections: number;
 }
 
 export interface GrabItem {

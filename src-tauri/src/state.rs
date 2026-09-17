@@ -110,11 +110,13 @@ impl DlManager {
         let mut completed = 0u64;
         let mut downloaded = 0u64;
         let mut segments = 0u64;
+        let mut connections = 0u64;
         for v in self.views() {
             if v.status == DlStatus::Downloading || v.status == DlStatus::Merging {
                 total_speed += v.speed;
                 active += 1;
-                segments += v.connections as u64;
+                segments += v.segments as u64;
+                connections += v.live as u64;
             }
             if v.status == DlStatus::Completed {
                 completed += 1;
@@ -127,6 +129,7 @@ impl DlManager {
             "completed": completed,
             "total_downloaded": downloaded,
             "segments": segments,
+            "connections": connections,
         })
     }
 

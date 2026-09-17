@@ -386,6 +386,7 @@ impl YtTask {
             eta,
             segments: 1,
             connections: 1,
+            live: 1,
             status,
             error: self.error.lock().unwrap().clone(),
             thumbnail: self.thumb.clone(),
