@@ -57,6 +57,16 @@ Write-Host "Installer : $($setup.FullName)" -ForegroundColor Green
 Write-Host "Size      : $([math]::Round($setup.Length / 1MB, 2)) MB"
 Write-Host "SHA-256   : $hash" -ForegroundColor Green
 
+# Browser extension packages (attach these to the GitHub Release too)
+Write-Host "[$now] Building browser extensions..." -ForegroundColor Cyan
+Push-Location (Join-Path $Repo "browser-extension")
+node build.mjs
+Pop-Location
+foreach ($z in "vortex-chrome.zip", "vortex-firefox.zip") {
+    $p = Join-Path $Repo "browser-extension\dist\$z"
+    if (Test-Path $p) { Write-Host "Extension : $p  ($([math]::Round((Get-Item $p).Length / 1KB, 0)) KB)" -ForegroundColor Green }
+}
+
 if ($Tag) {
     git tag "v$Version"
     Write-Host "Tagged    : v$Version  (push with: git push origin v$Version)" -ForegroundColor Yellow
