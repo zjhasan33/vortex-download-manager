@@ -495,6 +495,84 @@ async fn get_tools_status(app: tauri::AppHandle) -> serde_json::Value {
     })
 }
 
+/// Check for yt-dlp updates (fast; self-updater with a 15s cap). ffmpeg is a
+/// ~111MB download that rarely changes, so it is only re-fetched when it is
+/// entirely missing or `force_ffmpeg` is explicitly set.
+#[tauri::command]
+async fn update_tools(app: tauri::AppHandle, force_ffmpeg: bool) -> serde_json::Value {
+    let y_old = tools::ytdlp_version(&app);
+    let f_old = tools::ffmpeg_version(&app);
+    let mut changed = false;
+    let mut timed_out = false;
+    let mut msgs: Vec<String> = Vec::new();
+
+    // 1) yt-dlp self-update (the only thing that changes frequently).
+    match tools::update_ytdlp(&app).await {
+        Ok(()) => {
+            let v = tools::ytdlp_version(&app);
+            if y_old == v {
+                if let Some(n) = &v {
+                    msgs.push(format!("Tools are already up to date! (yt-dlp v{n})"));
+                }
+            } else {
+                changed = true;
+                msgs.push(match v {
+                    Some(n) if y_old.is_none() => format!("yt-dlp installed (v{n})"),
+                    Some(n) => format!("yt-dlp successfully updated to v{n}"),
+                    None => "yt-dlp updated (version not reported)".into(),
+                });
+            }
+        }
+        Err(e) => {
+            if e.to_lowercase().contains("timed out") {
+                timed_out = true;
+            }
+            msgs.push(format!("yt-dlp update FAILED: {e}"));
+        }
+    }
+
+    // 2) ffmpeg: skip unless missing or explicitly forced.
+    if force_ffmpeg || f_old.is_none() {
+        match tools::update_ffmpeg(&app).await {
+            Ok(()) => {
+                let v = tools::ffmpeg_version(&app);
+                if f_old == v {
+                    if let Some(n) = &v {
+                        msgs.push(format!("ffmpeg is up to date (v{n})"));
+                    }
+                } else {
+                    changed = true;
+                    msgs.push(match v {
+                        Some(n) => format!("ffmpeg updated to v{n}"),
+                        None => "ffmpeg updated (version not reported)".into(),
+                    });
+                }
+            }
+            Err(e) => msgs.push(format!("ffmpeg update FAILED: {e}")),
+        }
+    }
+
+    let (y, f, yv, fv) = tools::status(&app);
+    let message = if timed_out {
+        "Update check timed out. Please try again.".to_string()
+    } else if changed {
+        msgs.join(" • ")
+    } else {
+        match &yv {
+            Some(n) => format!("Tools are already up to date! (yt-dlp v{n})"),
+            None => "Tools are already up to date!".to_string(),
+        }
+    };
+    serde_json::json!({
+        "ytdlp": y,
+        "ffmpeg": f,
+        "ytdlp_version": yv,
+        "ffmpeg_version": fv,
+        "updated": changed,
+        "message": message,
+    })
+}
+
 #[tauri::command]
 async fn get_settings(app: tauri::AppHandle) -> Settings {
     state::load_settings(&app)
@@ -720,6 +798,7 @@ pub fn run() {
             start_ytdl,
             grab_site,
             get_tools_status,
+            update_tools,
             get_settings,
             save_settings,
             choose_folder,

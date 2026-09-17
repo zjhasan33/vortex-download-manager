@@ -237,6 +237,8 @@ button {
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); }
 .dot.ok { background: var(--good); box-shadow: 0 0 8px var(--good); }
 .dot.missing { background: var(--bad); box-shadow: 0 0 8px var(--bad); }
+.spin { width: 12px; height: 12px; border: 2px solid var(--text-3); border-top-color: var(--acc-1); border-radius: 50%; display: inline-block; vertical-align: -2px; margin-right: 6px; animation: vxspin .8s linear infinite; }
+@keyframes vxspin { to { transform: rotate(360deg); } }
 
 /* ============ Main list ============ */
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }

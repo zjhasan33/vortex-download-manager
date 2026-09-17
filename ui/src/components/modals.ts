@@ -251,6 +251,13 @@ export function openSettings() {
           Logins for a site are reused automatically on every download from that host. Supports Basic and Digest auth.
         </div>
       </div>
+      <div class="field">
+        <label>Tools &amp; Dependencies</label>
+        <div id="st-tools" style="display:flex;flex-direction:column;gap:6px;align-items:stretch;max-width:340px"></div>
+        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
+          yt-dlp needs frequent updates — YouTube keeps changing, so keeping it current prevents broken downloads. ffmpeg is used for merging and audio conversion.
+        </div>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn-ghost" data-close>Cancel</button>
@@ -285,6 +292,47 @@ export function openSettings() {
           toast("Login forgotten for " + host, "ok");
         });
       });
+
+      // Tools & Dependencies: status + update
+      const toolsEl = root.querySelector<HTMLElement>("#st-tools")!;
+      const renderTools = () => {
+        const t = store.tools;
+        const dot = (ok: boolean) => `<span class="dot ${ok ? "ok" : "missing"}"></span>`;
+        const vs = (needle: string) =>
+          t && (needle === "ytdlp" ? t.ytdlp_version : t.ffmpeg_version)
+            ? "v" + (needle === "ytdlp" ? t.ytdlp_version : t.ffmpeg_version)
+            : t && (needle === "ytdlp" ? t.ytdlp : t.ffmpeg)
+              ? ""
+              : "(not found)";
+        toolsEl.innerHTML = `
+          <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2)">${dot(!!t?.ytdlp)} yt-dlp ${vs("ytdlp")}</div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2)">${dot(!!t?.ffmpeg)} ffmpeg ${vs("ffmpeg")}</div>
+          <button class="tbtn" id="st-update">↻ Update Tools</button>`;
+        const btn = toolsEl.querySelector<HTMLButtonElement>("#st-update")!;
+        btn.onclick = async () => {
+          btn.disabled = true;
+          btn.innerHTML = `<span class="spin"></span> Checking for updates…`;
+          try {
+            const res = await api.updateTools();
+            store.tools = {
+              ytdlp: res.ytdlp,
+              ffmpeg: res.ffmpeg,
+              ytdlp_version: res.ytdlp_version,
+              ffmpeg_version: res.ffmpeg_version,
+            };
+            const msg =
+              res.message ||
+              (res.updated ? "yt-dlp successfully updated" : "Tools are already up to date!");
+            toast(msg, res.message?.toLowerCase().includes("timed out") ? "err" : res.updated ? "ok" : "info");
+          } catch (e) {
+            toast("Update check failed: " + String(e), "err");
+          } finally {
+            // Always re-render the tools block so the spinner can never get stuck.
+            renderTools();
+          }
+        };
+      };
+      renderTools();
 
       // Browser extension pairing key
       const keyInp = root.querySelector<HTMLInputElement>("#st-key")!;

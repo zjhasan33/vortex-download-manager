@@ -3,6 +3,7 @@ import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Download,
   ToolsStatus,
+  UpdateToolsResult,
   YtdlFormat,
   YtdlInfo,
   GrabItem,
@@ -89,6 +90,7 @@ export const api = {
   openFile: (path: string) => cmd<void>("open_saved_file", { path }),
   readUrls: () => cmd<string[]>("read_urls"),
   getTools: () => cmd<ToolsStatus>("get_tools_status"),
+  updateTools: (forceFfmpeg = false) => cmd<UpdateToolsResult>("update_tools", { forceFfmpeg }),
   getSettings: () => cmd<Settings>("get_settings"),
   saveSettings: (s: Settings) => cmd<void>("save_settings", { settings: s }),
   chooseFolder: () => cmd<string | null>("choose_folder"),

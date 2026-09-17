@@ -59,7 +59,11 @@ pub fn ytdlp_version(app: &AppHandle) -> Option<String> {
 
 pub fn ffmpeg_version(app: &AppHandle) -> Option<String> {
     let bin = ffmpeg_path(app)?;
-    let out = run_out(&bin, &["-version"])?;
+    ffmpeg_version_of(&bin)
+}
+
+fn ffmpeg_version_of(bin: &std::path::Path) -> Option<String> {
+    let out = run_out(bin, &["-version"])?;
     out.lines().next().map(|l| {
         l.trim()
             .split_whitespace()
@@ -129,12 +133,16 @@ pub async fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Find `ffmpeg.exe` anywhere inside the archive (e.g. `.../bin/ffmpeg.exe`)
-/// and copy it to `dir/ffmpeg.exe`.
-fn extract_ffmpeg(zip_path: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+/// and copy it to `dir/filename`.
+fn extract_ffmpeg_as(
+    zip_path: &std::path::Path,
+    dir: &std::path::Path,
+    filename: &str,
+) -> Result<(), String> {
     let file = File::open(zip_path).map_err(|e| format!("Cannot open zip: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Bad zip archive: {e}"))?;
 
-    let target = dir.join("ffmpeg.exe");
+    let target = dir.join(filename);
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -149,12 +157,17 @@ fn extract_ffmpeg(zip_path: &std::path::Path, dir: &std::path::Path) -> Result<(
             continue;
         }
         eprintln!("[vortex-tools] found '{name}' in archive, extracting");
-        let mut out = File::create(&target).map_err(|e| format!("Cannot create ffmpeg.exe: {e}"))?;
+        let mut out = File::create(&target).map_err(|e| format!("Cannot create {filename}: {e}"))?;
         std::io::copy(&mut entry, &mut out).map_err(|e| format!("Copy failed: {e}"))?;
         std::io::Write::flush(&mut out).ok();
         return Ok(());
     }
     Err("ffmpeg.exe not found inside archive".into())
+}
+
+/// Legacy entry point used by `ensure_ffmpeg`; extracts straight to `ffmpeg.exe`.
+fn extract_ffmpeg(zip_path: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+    extract_ffmpeg_as(zip_path, dir, "ffmpeg.exe")
 }
 
 async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> {
@@ -204,5 +217,103 @@ async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> 
     }
     std::io::Write::flush(&mut out).ok();
     eprintln!("[vortex-tools] download finished: {written} bytes");
+    Ok(())
+}
+
+/// Read a child process pipe fully into a string. Must run concurrently with
+/// `Child::wait()` so the process can never deadlock on full pipe buffers.
+async fn drain_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> String {
+    let mut buf = String::new();
+    if let Some(mut io) = pipe {
+        use tokio::io::AsyncReadExt;
+        let _ = io.read_to_string(&mut buf).await;
+    }
+    buf
+}
+
+/// Bring yt-dlp up to date via its built-in self updater. Runs with a hard
+/// 15s timeout and drains stdout+stderr concurrently, so the subprocess can
+/// never block on a full pipe buffer. If the updater fails or stays silent,
+/// falls back to re-downloading the portable exe from GitHub.
+pub async fn update_ytdlp(app: &AppHandle) -> Result<(), String> {
+    use std::process::Stdio;
+
+    let dir = tools_dir(app).map_err(|e| e.to_string())?;
+    let target = dir.join("yt-dlp.exe");
+    if !target.exists() {
+        return ensure_ytdlp(app).await.map(|_| ());
+    }
+
+    let mut child = tokio::process::Command::new(&target)
+        .arg("--update")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to start yt-dlp updater: {e}"))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let wait = child.wait();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        async {
+            let so = drain_pipe(stdout);
+            let se = drain_pipe(stderr);
+            let (status, out, err) = tokio::join!(wait, so, se);
+            (status, out, err)
+        },
+    )
+    .await;
+
+    match result {
+        // Dropping `child` here kills + reaps the process via kill_on_drop.
+        Err(_) => Err("Update check timed out".into()),
+        Ok((status, out, err)) => {
+            let combined = format!("{out}{err}");
+            eprintln!("[vortex-tools] yt-dlp --update => {combined}");
+            if !status.map(|s| s.success()).unwrap_or(false) {
+                eprintln!("[vortex-tools] yt-dlp updater failed — re-downloading");
+                return download_to(&YTDLP_URL, &target)
+                    .await
+                    .map_err(|e| format!("yt-dlp update failed: {e}"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Force-refresh ffmpeg from the latest Gyan essentials build. The existing copy
+/// is only replaced after the new binary has been verified to run.
+pub async fn update_ffmpeg(app: &AppHandle) -> Result<(), String> {
+    let dir = tools_dir(app).map_err(|e| e.to_string())?;
+    let zip_path = dir.join("ffmpeg.zip");
+    let _ = fs::remove_file(&zip_path); // drop any stale partial archive
+
+    eprintln!("[vortex-tools] force-refreshing ffmpeg from {FFMPEG_URL}");
+    download_to(&FFMPEG_URL, &zip_path)
+        .await
+        .map_err(|e| {
+            let _ = fs::remove_file(&zip_path);
+            format!("ffmpeg update download failed: {e}")
+        })?;
+
+    let extract = extract_ffmpeg_as(&zip_path, &dir, "ffmpeg.exe.new");
+    let _ = fs::remove_file(&zip_path); // always drop the large temp archive
+    extract.map_err(|e| format!("ffmpeg update failed: {e}"))?;
+
+    let new = dir.join("ffmpeg.exe.new");
+    // Only swap if the freshly downloaded exe actually runs (truncated/bad file guard).
+    if ffmpeg_version_of(&new).is_none() {
+        let _ = fs::remove_file(&new);
+        return Err("Downloaded ffmpeg failed to run — kept the existing copy".into());
+    }
+    let target = dir.join("ffmpeg.exe");
+    if target.exists() {
+        fs::remove_file(&target).map_err(|e| format!("Cannot replace ffmpeg.exe: {e}"))?;
+    }
+    fs::rename(&new, &target).map_err(|e| format!("Cannot finalize ffmpeg.exe: {e}"))?;
+    eprintln!("[vortex-tools] ffmpeg force-refresh complete");
     Ok(())
 }

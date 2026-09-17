@@ -125,7 +125,8 @@ export class VortexApp {
       <div class="tools-status">
         <div class="side-head" style="padding:0">Tools</div>
         <div class="row"><span class="dot ${tools?.ytdlp ? "ok" : "missing"}"></span> yt-dlp ${tools?.ytdlp_version ? "v" + tools.ytdlp_version : tools?.ytdlp ? "" : "(not found)"}</div>
-        <div class="row"><span class="dot ${tools?.ffmpeg ? "ok" : "missing"}"></span> ffmpeg ${tools?.ffmpeg ? "" : "(auto-download)"}</div>
+        <div class="row"><span class="dot ${tools?.ffmpeg ? "ok" : "missing"}"></span> ffmpeg ${tools?.ffmpeg_version ? "v" + tools.ffmpeg_version : tools?.ffmpeg ? "" : "(auto-download)"}</div>
+        <button class="tbtn tools-update" id="tools-update">↻ Update Tools</button>
       </div>
     </div>`;
   }
@@ -347,7 +348,37 @@ export class VortexApp {
     if (!el) return;
     el.innerHTML = `<div class="side-head" style="padding:0">Tools</div>
       <div class="row"><span class="dot ${tools.ytdlp ? "ok" : "missing"}"></span> yt-dlp ${tools.ytdlp_version ? "v" + tools.ytdlp_version : tools.ytdlp ? "" : "(not found)"}</div>
-      <div class="row"><span class="dot ${tools.ffmpeg ? "ok" : "missing"}"></span> ffmpeg ${tools.ffmpeg ? "" : "(auto-download)"}</div>`;
+      <div class="row"><span class="dot ${tools.ffmpeg ? "ok" : "missing"}"></span> ffmpeg ${tools.ffmpeg_version ? "v" + tools.ffmpeg_version : tools.ffmpeg ? "" : "(auto-download)"}</div>
+      <button class="tbtn tools-update" id="tools-update">↻ Update Tools</button>`;
+    this.root.querySelector<HTMLButtonElement>(".tools-update")!.onclick = () => {
+      void this.runToolsUpdate(el);
+    };
+  }
+
+  private async runToolsUpdate(panel: HTMLElement) {
+    const btn = panel.querySelector<HTMLButtonElement>(".tools-update");
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spin"></span> Checking for updates…`;
+    }
+    try {
+      const res = await api.updateTools();
+      store.tools = {
+        ytdlp: res.ytdlp,
+        ffmpeg: res.ffmpeg,
+        ytdlp_version: res.ytdlp_version,
+        ffmpeg_version: res.ffmpeg_version,
+      };
+      const msg =
+        res.message ||
+        (res.updated ? "yt-dlp successfully updated" : "Tools are already up to date!");
+      toast(msg, res.message?.toLowerCase().includes("timed out") ? "err" : res.updated ? "ok" : "info");
+    } catch (e) {
+      toast("Update check failed: " + String(e), "err");
+    } finally {
+      // Always re-render the panel so the spinner can never get stuck.
+      this.refreshTools();
+    }
   }
 
   private afterShell() {

@@ -69,6 +69,11 @@ export interface ToolsStatus {
   ffmpeg_version: string;
 }
 
+export interface UpdateToolsResult extends ToolsStatus {
+  updated: boolean;
+  message: string;
+}
+
 export interface AppStats {
   total_speed: number;
   active: number;
