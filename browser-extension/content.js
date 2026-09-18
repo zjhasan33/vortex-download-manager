@@ -516,6 +516,10 @@
     if (res && res.ok) {
       btn.classList.add("vx-hb-added");
       btn.textContent = "Added ✓";
+    } else if (res && res.error) {
+      // Real server failure (e.g. tools still fetching) — show it instead of
+      // a generic message so the user knows what to fix.
+      btn.textContent = String(res.error).slice(0, 28);
     } else {
       btn.textContent = "Vortex off?";
     }

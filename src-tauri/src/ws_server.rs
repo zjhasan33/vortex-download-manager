@@ -120,13 +120,16 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
                 // popup (which races against a short timeout) always gets a reply
                 // within microseconds. dispatch() below keeps working in the
                 // background and emits events when the job really starts.
+                // NOTE: `start_ytdl` is deliberately NOT acked here. Its reply
+                // must be the real result: rpc() resolves on the FIRST frame
+                // carrying its req, so an early ack would report success while
+                // the background job fails ("Added ✓" with nothing in the app).
+                // ytdlp::start() is pure construction (no network), so the real
+                // reply below is fast anyway.
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
                     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     let req = v.get("req").and_then(|r| r.as_str()).unwrap_or("");
-                    if matches!(
-                        typ,
-                        "download" | "start_download" | "start_ytdl" | "open_grabber"
-                    ) {
+                    if matches!(typ, "download" | "start_download" | "open_grabber") {
                         let mut ack = json!({"type":"ack","ok":true,"success":true,"action":"accepted"});
                         if !req.is_empty() {
                             ack["req"] = json!(req);
@@ -299,6 +302,10 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     if url.is_empty() || fid.is_empty() {
                         err("url and format_id required")
                     } else {
+                        // Synchronous: ytdlp::start() does no network (tool
+                        // fetching happens in launch()), so this returns the
+                        // REAL result in the reply frame the extension waits
+                        // for — never a premature "accepted".
                         let playlist = p["playlist"].as_bool().unwrap_or(false);
                         let playlist_items = p["playlist_items"].as_str().unwrap_or("").to_string();
                         let start_at = p["start_at"].as_u64();
@@ -306,20 +313,7 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let sub_langs = p["sub_langs"].as_str().map(|s| s.to_string());
                         let embed_thumbnail = p["embed_thumbnail"].as_bool();
                         let sp = settings_path(app);
-                        let app2 = app.clone();
-                        let mgr2 = mgr.clone();
-                        let url2 = url.clone();
-                        tokio::spawn(async move {
-                            let res = start_ytdl(&app2, &mgr2, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail).await;
-                            let j: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
-                            if j.get("type").and_then(|t| t.as_str()) != Some("started") {
-                                let _ = app2.emit(
-                                    "dl-error",
-                                    json!({ "via": "extension", "url": url2, "error": j.get("error").cloned().unwrap_or(json!(res)) }),
-                                );
-                            }
-                        });
-                        json!({"type":"ack","ok":true,"success":true,"action":"ytdl_started"}).to_string()
+                        start_ytdl(app, &mgr, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail).await
                     }
                 }
                 "resume" => {

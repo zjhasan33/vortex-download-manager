@@ -4,7 +4,7 @@ import { toast } from "./lib/ui";
 import { formatBytes, formatSpeed, formatEta } from "./lib/format";
 import { SpeedChart } from "./lib/chart";
 import type { CategoryId, Download } from "./types";
-import { openAddUrl, openSettings, openConfirmRemove, openConfirmBulkRemove, openGrabber, openAuthDialog } from "./components/modals";
+import { openAddUrl, openSettings, openConfirmRemove, openConfirmBulkRemove, openGrabber, openAuthDialog, openWelcome } from "./components/modals";
 import { openYoutube } from "./components/youtube";
 
 // When a download hits HTTP 401, pop the login dialog.
@@ -490,6 +490,32 @@ export class VortexApp {
     void api.getTools().then((t) => {
       store.tools = t;
       this.refreshTools();
+      // First-run onboarding: explain the red dots BEFORE the user panics,
+      // and fetch missing tools automatically in the background.
+      const missing = !t.ytdlp || !t.ffmpeg;
+      try {
+        if (!localStorage.getItem("vx_welcomed")) {
+          localStorage.setItem("vx_welcomed", "1");
+          openWelcome(missing, () => openSettings());
+        } else if (missing) {
+          toast("Helper tools missing — downloading in background…", "info");
+        }
+      } catch { /* private mode: skip onboarding */ }
+      if (missing) {
+        void api
+          .updateTools()
+          .then((res) => {
+            store.tools = {
+              ytdlp: res.ytdlp,
+              ffmpeg: res.ffmpeg,
+              ytdlp_version: res.ytdlp_version,
+              ffmpeg_version: res.ffmpeg_version,
+            };
+            this.refreshTools();
+            if (res.ytdlp && res.ffmpeg) toast("Helper tools ready", "ok");
+          })
+          .catch(() => toast("Tools download failed — press Update Tools to retry", "err"));
+      }
     });
     const id = setInterval(() => {
       this.chart.push(store.stats.total_speed);

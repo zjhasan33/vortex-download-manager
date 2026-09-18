@@ -599,6 +599,10 @@ pub struct YtTask {
     pub created_at: u64,
     /// Epoch ms when the job reached Completed (None until then).
     pub completed_at: Mutex<Option<u64>>,
+    /// True when this job merges/remuxes (needs ffmpeg). Decided here so
+    /// `launch()` can fetch it in the background; `start()` itself stays fast
+    /// (pure task construction, no network) so WS callers get a real result.
+    pub needs_ffmpeg: bool,
 }
 
 impl YtTask {
@@ -673,8 +677,9 @@ pub async fn start(
     sub_langs: String,
     embed_thumbnail: bool,
 ) -> Result<Arc<YtTask>, String> {
-    let bin = tools::ensure_ytdlp(&app).await?;
-    let _ = &bin;
+    // NOTE: no tool downloads here — `start()` must stay fast and synchronous
+    // (extension WS calls time out on slow fetches). Tools are ensured in
+    // `launch()`, which runs in the background after the task is registered.
     let is_subs = format_id.starts_with("subs:");
     let audio_fmt = parse_audio_fmt(&format_id);
     let use_merge = !is_subs
@@ -684,9 +689,8 @@ pub async fn start(
     let is_video = !is_subs && !is_audio;
     let wants_embed = is_video && embed_subs && !sub_langs.trim().is_empty();
     // Embedding a thumbnail also remuxes with ffmpeg (mp4/mkv/mp3 cover art).
-    if use_merge || audio_fmt.is_some() || wants_embed || (embed_thumbnail && !is_subs) {
-        let _ = tools::ensure_ffmpeg(&app).await?;
-    }
+    let needs_ffmpeg =
+        use_merge || audio_fmt.is_some() || wants_embed || (embed_thumbnail && !is_subs);
     // mp3 conversion also needs a final container rename to .mp3; ensure we handle it.
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -754,6 +758,7 @@ pub async fn start(
         app,
         created_at,
         completed_at: Mutex::new(None),
+        needs_ffmpeg,
     });
 
     Ok(task)
@@ -783,6 +788,15 @@ pub async fn launch(task: Arc<YtTask>) {
             return;
         }
     };
+    // ffmpeg is fetched here (background) so a slow/missing binary shows as a
+    // row Error instead of failing task creation (and lying "Added" to WS).
+    if task.needs_ffmpeg {
+        if let Err(e) = tools::ensure_ffmpeg(&task.app).await {
+            *task.error.lock().unwrap() = Some(e);
+            task.set_status(DlStatus::Error);
+            return;
+        }
+    }
     let _ = ytdlp_run(task.clone(), &bin).await;
 }
 

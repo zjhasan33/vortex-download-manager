@@ -672,6 +672,86 @@ function escapeAttr(s: string): string {
   return s.replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
+/** First-run welcome: tells a new user what happens automatically (tools),
+ *  how to connect the browser, and how to start. Shown once (localStorage). */
+export function openWelcome(toolsMissing: boolean, onSettings: () => void) {
+  let busy = false;
+  const close = openModal(
+    () => `
+  <div class="modal" style="width:520px">
+    <div class="modal-head">
+      <span style="color:var(--acc-1)">${icon("logo", 20)}</span>
+      <h3>Welcome to Vortex</h3>
+      <div class="spacer"></div>
+      <button class="x" data-close>${icon("close", 16)}</button>
+    </div>
+    <div class="modal-body">
+      <div style="display:grid;gap:12px;font-size:13px;color:var(--text-2)">
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          <span style="font-size:16px">${toolsMissing ? "⬇️" : "✅"}</span>
+          <span><b style="color:var(--text-1)">1. Helper tools</b><br/>${
+            toolsMissing
+              ? "yt-dlp + ffmpeg are downloading automatically — wait till both dots turn green."
+              : "yt-dlp + ffmpeg are ready (green dots)."
+          }</span>
+        </div>
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          <span style="font-size:16px">🔗</span>
+          <span><b style="color:var(--text-1)">2. Browser extension</b><br/>Load the extension, then paste the pairing key from Settings so videos send here in one click.</span>
+        </div>
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          <span style="font-size:16px">⬇️</span>
+          <span><b style="color:var(--text-1)">3. Download</b><br/>Add URL, YouTube, Grabber — or right-click a link in the browser.</span>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" data-close>Close</button>
+      <button class="tbtn" id="wc-key">${icon("key", 14)} Copy pairing key</button>
+      <button class="tbtn primary" id="wc-tools" ${toolsMissing ? "" : "disabled"}>${icon("download", 15)} Download tools now</button>
+    </div>
+  </div>`,
+    (root, doClose) => {
+      root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = doClose));
+      root.querySelector<HTMLButtonElement>("#wc-key")!.onclick = async () => {
+        try {
+          const key = await api.getWsToken();
+          await navigator.clipboard.writeText(key);
+          toast("Key copied — paste it in the extension popup, then open Settings", "ok");
+          doClose();
+          onSettings();
+        } catch {
+          toast("Copy failed — find the key in Settings", "err");
+        }
+      };
+      const dl = root.querySelector<HTMLButtonElement>("#wc-tools")!;
+      dl.onclick = async () => {
+        if (busy) return;
+        busy = true;
+        dl.disabled = true;
+        dl.innerHTML = `<span class="spin"></span> Downloading… (may take ~2 min)`;
+        try {
+          const res = await api.updateTools();
+          store.tools = {
+            ytdlp: res.ytdlp,
+            ffmpeg: res.ffmpeg,
+            ytdlp_version: res.ytdlp_version,
+            ffmpeg_version: res.ffmpeg_version,
+          };
+          toast(res.ytdlp && res.ffmpeg ? "Tools ready — both dots green" : "Still missing something — try Update Tools again", res.ytdlp && res.ffmpeg ? "ok" : "err");
+          doClose();
+        } catch (e) {
+          toast("Download failed: " + String(e), "err");
+          dl.disabled = false;
+          dl.textContent = "Retry download";
+          busy = false;
+        }
+      };
+    },
+  );
+  return close;
+}
+
 export function openConfirmRemove(name: string, onYes: (deleteFile: boolean) => void) {
   const close = openModal(
     () => `

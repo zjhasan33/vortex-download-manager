@@ -20,8 +20,12 @@ pub(crate) fn silent(mut cmd: Command) -> Command {
 }
 
 pub const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
-/// Gyan's "essentials" build is a small (~80 MB) static release with bin/ffmpeg.exe.
-pub const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+/// BtbN full static GPL build (single ffmpeg.exe under bin/, ~180 MB).
+/// Previously Gyan essentials, but gyan.dev throttles to ~80 KB/s from some
+/// regions (23+ min per fetch) while GitHub CDN saturates the line — and the
+/// extractor only needs *some* ffmpeg.exe inside the archive either way.
+pub const FFMPEG_URL: &str =
+    "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-n9.0-latest-win64-gpl-9.0.zip";
 /// Some CDNs reject requests with a missing/empty User-Agent.
 pub const BROWSER_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
@@ -174,7 +178,30 @@ fn extract_ffmpeg(zip_path: &std::path::Path, dir: &std::path::Path) -> Result<(
     extract_ffmpeg_as(zip_path, dir, "ffmpeg.exe")
 }
 
+/// Download with resume + retries: a truncated tool fetch (killed app, cut
+/// connection — the classic 7 MB ffmpeg.zip) continues from its partial bytes
+/// instead of restarting from zero and failing the same way again.
 async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> {
+    const MAX_ATTEMPTS: u64 = 5;
+    let mut attempt = 0u64;
+    loop {
+        attempt += 1;
+        match download_once(url, target).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("[vortex-tools] attempt {attempt} failed: {e}");
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(format!("Gave up after {attempt} tries: {e}"));
+                }
+                let wait = 2u64.saturating_pow(attempt.min(5) as u32);
+                eprintln!("[vortex-tools] retry {attempt}/{MAX_ATTEMPTS} in {wait}s: {e}");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            }
+        }
+    }
+}
+
+async fn download_once(url: &str, target: &std::path::Path) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .user_agent(BROWSER_UA)
@@ -186,25 +213,53 @@ async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> 
         .build()
         .map_err(|e| e.to_string())?;
 
-    let resp = client.get(url).send().await.map_err(|e| {
+    // Resume a partial file left by a killed/interrupted attempt.
+    let have = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+    let mut req = client.get(url);
+    if have > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+    }
+    let resp = req.send().await.map_err(|e| {
         crate::download::log_net_err(&e, "tools download");
         format!("Network error: {e}")
     })?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        return Err(format!("HTTP {code} for {url}"));
+    let status = resp.status();
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        // Already fully fetched (or server disagrees) — accept if non-empty.
+        if have > 0 {
+            eprintln!("[vortex-tools] already complete: {have} bytes");
+            return Ok(());
+        }
+        return Err("HTTP 416 for {url}".to_string());
     }
-
-    let total = resp.content_length().unwrap_or(0);
+    if !status.is_success() {
+        return Err(format!("HTTP {} for {url}", status.as_u16()));
+    }
+    // 206 = resume accepted (append); anything else = fresh body (truncate).
+    // A server that drops Range on redirect answers 200 — restarting is the
+    // only correct fallback then.
+    let resumed = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if !resumed && have > 0 {
+        eprintln!("[vortex-tools] server ignored Range — restarting from zero");
+    }
+    let remaining = resp.content_length().unwrap_or(0);
+    let total = if resumed { have + remaining } else { remaining };
     eprintln!(
-        "[vortex-tools] download started: {url} ({} bytes)",
-        if total > 0 { total.to_string() } else { "unknown".into() }
+        "[vortex-tools] download started: {url} ({} bytes{})",
+        if total > 0 { total.to_string() } else { "unknown".into() },
+        if resumed { format!(", resuming at {have}") } else { String::new() },
     );
 
-    let mut out = File::create(target).map_err(|e| format!("Cannot create file: {e}"))?;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resumed)
+        .truncate(!resumed)
+        .open(target)
+        .map_err(|e| format!("Cannot create file: {e}"))?;
     let mut stream = resp.bytes_stream();
-    let mut written = 0u64;
-    let mut next_log = 0u64;
+    let mut written = if resumed { have } else { 0 };
+    let mut next_log = written;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
             crate::download::log_net_err(&e, "tools stream");
@@ -220,6 +275,14 @@ async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> 
         }
     }
     std::io::Write::flush(&mut out).ok();
+    drop(out);
+    // A short stream with no error is still a failure (truncated zip).
+    if total > 0 {
+        let final_len = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+        if final_len != total {
+            return Err(format!("Incomplete download ({final_len}/{total} bytes)"));
+        }
+    }
     eprintln!("[vortex-tools] download finished: {written} bytes");
     Ok(())
 }
