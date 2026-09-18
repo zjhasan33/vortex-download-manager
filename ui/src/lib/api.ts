@@ -9,8 +9,10 @@ import type {
   GrabItem,
   Settings,
   AppStats,
+  TorrentMetadata,
 } from "../types";
 import { toast } from "./ui";
+import { playSuccess, playError, playBatch } from "./sound";
 
 export interface ProgressPayload {
   id: string;
@@ -21,6 +23,19 @@ export interface ProgressPayload {
   eta: number;
   segments?: number;
   connections?: number;
+}
+
+export interface TorrentProgress {
+  id: string;
+  downloaded: number;
+  total_size: number;
+  down_speed: number;
+  up_speed: number;
+  peers: number;
+  seeders: number;
+  progress: number;
+  eta: number;
+  ratio: number;
 }
 
 const events: UnlistenFn[] = [];
@@ -37,11 +52,16 @@ export async function initApi() {
     await listen<ProgressPayload>("download-progress", (e) => {
       store.updateProgress(e.payload);
     }),
+    await listen<TorrentProgress>("torrent-progress", (e) => {
+      store.updateTorrent(e.payload);
+    }),
     await listen<{ id: string; status: Download["status"]; error?: string }>(
       "download-status",
       (e) => store.updateStatus(e.payload),
     ),
-    await listen("downloads-changed", () => store.refresh()),
+    await listen("downloads-changed", () =>
+      store.refresh().catch((e) => console.error("[refresh failed]", e)),
+    ),
     await listen<{ via?: string; url?: string; error?: string }>("dl-error", (e) => {
       const p = e.payload;
       const err = typeof p?.error === "string" && p.error ? p.error : "unknown error";
@@ -86,6 +106,15 @@ export const api = {
   fetchYtdlInfo: (url: string) => cmd<YtdlInfo>("fetch_ytdl_info", { url }),
   grabSite: (url: string, maxPages?: number, kinds?: string[]) =>
     cmd<GrabItem[]>("grab_site", { url, maxPages, kinds }),
+  parseTorrentFile: (path: string) => cmd<TorrentMetadata>("parse_torrent_file", { path }),
+  parseMagnetLink: (url: string) => cmd<TorrentMetadata>("parse_magnet_link", { url }),
+  resolveMagnet: (source: string, outputDir?: string, timeoutSecs?: number) =>
+    cmd<TorrentMetadata>("resolve_magnet_metadata", { source, outputDir, timeoutSecs }),
+  addTorrent: (source: string, outputDir?: string, files?: number[]) =>
+    cmd<string>("add_torrent", { source, outputDir, files }),
+  pauseTorrent: (infoHash: string) => cmd<void>("pause_torrent", { infoHash }),
+  resumeTorrent: (infoHash: string) => cmd<void>("resume_torrent", { infoHash }),
+  cancelTorrent: (infoHash: string, deleteFiles?: boolean) => cmd<void>("cancel_torrent", { infoHash, deleteFiles }),
   grabStop: () => cmd<void>("grab_stop"),  startYtdl: (
     url: string,
     formatId: string,
@@ -96,6 +125,7 @@ export const api = {
     embedSubs?: boolean,
     subLangs?: string,
     embedThumbnail?: boolean,
+    autoSubs?: boolean,
   ) =>
     cmd<Download>("start_ytdl", {
       url,
@@ -107,6 +137,7 @@ export const api = {
       embedSubs,
       subLangs,
       embed_thumbnail: embedThumbnail,
+      autoSubs,
     }),
 
   openFolder: (path: string) => cmd<void>("open_folder", { path }),
@@ -141,6 +172,9 @@ class Store {
   stats: AppStats = { total_speed: 0, active: 0, completed: 0, total_downloaded: 0, segments: 0, connections: 0 };
   tools: ToolsStatus | null = null;
   settings: Settings | null = null;
+  /** Live per-torrent extras (up speed / peers / ratio) keyed by info-hash.
+   *  Survives list refreshes; rows read it when `source === "torrent"`. */
+  tstats: Record<string, { up: number; peers: number; ratio: number }> = {};
   private listeners = new Set<Listener>();
   private ticking = false;
 
@@ -156,6 +190,10 @@ class Store {
     const [dl, st] = await Promise.all([api.listDownloads(), api.getStats()]);
     this.downloads = dl;
     this.stats = st;
+    const alive = new Set(dl.map((d) => d.id));
+    for (const id of Object.keys(this.tstats)) {
+      if (!alive.has(id)) delete this.tstats[id];
+    }
     this.emit();
   }
 
@@ -178,7 +216,7 @@ class Store {
       segs = 0,
       conns = 0;
     for (const x of this.downloads) {
-      if (x.status === "downloading" || x.status === "merging") {
+      if (x.status === "downloading" || x.status === "merging" || x.status === "resolving") {
         active += 1;
         speed += x.speed;
         segs += x.segments;
@@ -189,22 +227,75 @@ class Store {
     this.emit();
   }
 
+  updateTorrent(p: TorrentProgress) {
+    const d = this.downloads.find((x) => x.id === p.id);
+    if (d) {
+      d.downloaded = p.downloaded;
+      d.total_size = p.total_size;
+      d.speed = p.down_speed;
+      d.progress = p.progress;
+      d.eta = p.eta;
+      d.live = p.peers;
+    }
+    this.tstats[p.id] = { up: p.up_speed, peers: p.peers, ratio: p.ratio };
+    // Fold torrent speed into the live statusbar like HTTP downloads.
+    let speed = 0,
+      active = 0;
+    for (const x of this.downloads) {
+      if (x.status === "downloading" || x.status === "merging") {
+        active += 1;
+        speed += x.speed;
+      }
+    }
+    this.stats = { ...this.stats, total_speed: speed, active };
+    this.emit();
+  }
+
+  torrentExtra(id: string): { up: number; peers: number; ratio: number } {
+    return this.tstats[id] ?? { up: 0, peers: 0, ratio: 0 };
+  }
+
   updateStatus(p: { id: string; status: Download["status"]; error?: string }) {
     const d = this.downloads.find((x) => x.id === p.id);
+    const prev = d?.status;
     if (d) {
       d.status = p.status;
       if (p.error) d.error = p.error;
     }
+    // Notification sounds (Settings → Notification Sounds, default on).
+    // Only on real transitions to avoid double-chimes from re-renders.
+    if (prev !== p.status && (this.settings?.sounds ?? true)) {
+      if (p.status === "completed") {
+        const busy = this.downloads.some(
+          (x) =>
+            x.id !== p.id &&
+            (x.status === "downloading" ||
+              x.status === "merging" ||
+              x.status === "queued" ||
+              x.status === "resolving"),
+        );
+        if (busy) playSuccess();
+        else playBatch();
+      } else if (p.status === "error") {
+        playError();
+      }
+    }
     this.emit();
-    this.refresh();
+    // Background refresh: failures stay in the console (a toast here would
+    // spam on every event while the backend is down).
+    this.refresh().catch((e) => console.error("[refresh failed]", e));
   }
 }
 
 export const store = new Store();
 export function startTicker(fps = 4) {
   setInterval((): void => {
-    if (store.downloads.some((d) => d.status === "downloading" || d.status === "merging")) {
-      store.refresh();
+    if (
+      store.downloads.some(
+        (d) => d.status === "downloading" || d.status === "merging" || d.status === "resolving",
+      )
+    ) {
+      store.refresh().catch((e) => console.error("[ticker refresh failed]", e));
     }
   }, 1000 / fps);
 }

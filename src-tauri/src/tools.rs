@@ -1,5 +1,4 @@
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -250,13 +249,15 @@ async fn download_once(url: &str, target: &std::path::Path) -> Result<(), String
         if resumed { format!(", resuming at {have}") } else { String::new() },
     );
 
-    let mut out = std::fs::OpenOptions::new()
+    let mut out = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .append(resumed)
         .truncate(!resumed)
         .open(target)
+        .await
         .map_err(|e| format!("Cannot create file: {e}"))?;
+    use tokio::io::AsyncWriteExt;
     let mut stream = resp.bytes_stream();
     let mut written = if resumed { have } else { 0 };
     let mut next_log = written;
@@ -265,20 +266,20 @@ async fn download_once(url: &str, target: &std::path::Path) -> Result<(), String
             crate::download::log_net_err(&e, "tools stream");
             format!("Stream error after {written} bytes: {e}")
         })?;
-        out.write_all(&chunk).map_err(|e| e.to_string())?;
+        out.write_all(&chunk).await.map_err(|e| e.to_string())?;
         written += chunk.len() as u64;
         if written >= next_log {
             let pct = if total > 0 { (written * 100 / total) as u32 } else { 0 };
             eprintln!("[vortex-tools]   {written} / {total} ({pct}%)");
             next_log = written + 2 * 1024 * 1024;
-            std::io::Write::flush(&mut out).ok();
+            out.flush().await.ok();
         }
     }
-    std::io::Write::flush(&mut out).ok();
+    out.flush().await.ok();
     drop(out);
     // A short stream with no error is still a failure (truncated zip).
     if total > 0 {
-        let final_len = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+        let final_len = tokio::fs::metadata(target).await.map(|m| m.len()).unwrap_or(0);
         if final_len != total {
             return Err(format!("Incomplete download ({final_len}/{total} bytes)"));
         }

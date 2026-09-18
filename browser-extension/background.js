@@ -62,6 +62,19 @@ let wsSerial = 0;
 let autoAuthed = false;
 const pending = new Map(); // req -> {resolve, reject, timer}
 
+// MV3 suspend survival: reconnect immediately on worker (re)start instead
+// of waiting for the 15 s poll, so takeovers aren't skipped while offline.
+connect().catch(() => {});
+// Alarms (not setInterval) wake a suspended worker: re-probe the bridge.
+try {
+  if (browser.alarms) {
+    browser.alarms.create("vx-keep", { periodInMinutes: 1 });
+    browser.alarms.onAlarm.addListener((a) => {
+      if (a && a.name === "vx-keep" && !online) connect().catch(() => {});
+    });
+  }
+} catch (e) { /* alarms unavailable: the 15 s poll below still applies */ }
+
 const tabTitles = new Map();
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.title) tabTitles.set(tabId, changeInfo.title);
@@ -399,14 +412,14 @@ if (browser.downloads) {
     browser.downloads.onDeterminingFilename.addListener((item) => {
       if (!interceptEnabled || !online) return; // let the browser download normally
       if (!isTakeoverUrl(item)) return;
-      takeOverDownload(item);
+      takeOverDownload(item).catch((e) => console.error("[vortex] takeover failed:", e));
     });
   } else {
     // Firefox: no onDeterminingFilename — intercept just after creation.
     browser.downloads.onCreated.addListener((item) => {
       if (!interceptEnabled || !online) return;
       if (!isTakeoverUrl(item)) return;
-      takeOverDownload(item);
+      takeOverDownload(item).catch((e) => console.error("[vortex] takeover failed:", e));
     });
   }
 }
@@ -507,8 +520,12 @@ async function handleGrabAll(tab) {
   }
   let queued = 0;
   for (const l of links) {
-    const r = await handleStart({ type: "direct", url: l.url, filename: fileNameFromUrl(l.url) });
-    if (r && !r.error) queued++;
+    try {
+      const r = await handleStart({ type: "direct", url: l.url, filename: fileNameFromUrl(l.url) });
+      if (r && !r.error) queued++;
+    } catch (e) {
+      console.error("[vortex] grab item failed:", e);
+    }
   }
   browser.notifications.create({
     type: "basic",

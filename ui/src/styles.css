@@ -340,6 +340,8 @@ button {
 .chip.needs_auth { background: rgba(251, 191, 36, 0.15); color: #fcd34d; }
 .chip.queued { background: rgba(148, 163, 184, 0.14); color: #cbd5e1; }
 .chip.merging { background: rgba(192, 132, 252, 0.16); color: #d8b4fe; }
+.chip.resolving { background: rgba(34, 211, 238, 0.12); color: #67e8f9; }
+.chip.resolving::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--acc-1); animation: pulse 1.2s infinite; }
 .auth-host { font-family: var(--mono); font-size: 12.5px; color: var(--acc-3); background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 7px; padding: 7px 9px; word-break: break-all; }
 .auth-url { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); word-break: break-all; }
 .chip.merging::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--acc-3); animation: pulse 0.8s infinite; }

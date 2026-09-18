@@ -146,6 +146,41 @@ fn parse_progress_vx(line: &str) -> Option<(u64, u64, u64, u64)> {
     Some((downloaded, total, speed, eta))
 }
 
+/// Extract the video id from a per-item marker: per video yt-dlp logs
+/// `[info] <id>: Downloading N format(s)` right before fetching it. Counting
+/// UNIQUE ids gives a live "k / N videos" indicator for playlist jobs (one
+/// line per stream would otherwise double-count merged video+audio).
+fn playlist_item_id(line: &str) -> Option<&str> {
+    let s = line.strip_prefix("[info]")?.trim_start();
+    let (id, rest) = s.split_once(':')?;
+    let id = id.trim();
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        return None;
+    }
+    // Note: real lines carry a format suffix ("...format(s): 248+251"), so
+    // match containment, not end-of-line.
+    if rest.contains("Downloading ") && rest.contains("format(s)") {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// Parse `[download] Downloading video 3 of 12` → (3, 12). yt-dlp logs one
+/// per playlist item, carrying BOTH numbers — so jobs whose total was never
+/// learned upfront (no playlist_title template) still show live "k / N".
+fn playlist_progress(line: &str) -> Option<(u64, u64)> {
+    let s = line.strip_prefix("[download]")?.trim_start();
+    let s = s.strip_prefix("Downloading video")?.trim_start();
+    let (k, rest) = s.split_once("of")?;
+    let k = k.trim().parse::<u64>().ok()?;
+    let n = rest.trim().split_whitespace().next()?.parse::<u64>().ok()?;
+    if k == 0 || n == 0 || k > n {
+        return None;
+    }
+    Some((k, n))
+}
+
 /// Parse an ETA that yt-dlp may render as seconds (`42`), `MM:SS`, or
 /// `HH:MM:SS`. Returns 0 for `NA`/`None`/empty.
 fn parse_eta(s: &str) -> u64 {
@@ -282,6 +317,7 @@ pub async fn fetch_info(app: AppHandle, url: String) -> Result<YtdlInfo, String>
     let bin = tools::ensure_ytdlp(&app).await?;
     let settings = crate::state::load_settings(&app);
     let cooks = cookie_args(settings.use_cookies, &settings.cookies);
+    let eff_proxy = crate::state::proxy_for_url(&settings.per_site_proxies, &settings.proxy, &url);
     let playlist = is_playlist_url(&url);
     let out = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let mut cmd = crate::tools::silent(Command::new(&bin));
@@ -296,6 +332,9 @@ pub async fn fetch_info(app: AppHandle, url: String) -> Result<YtdlInfo, String>
             cmd.arg("--no-playlist");
         }
         cmd.args(&cooks);
+        if !eff_proxy.trim().is_empty() {
+            cmd.arg("--proxy").arg(eff_proxy.trim());
+        }
         cmd.arg(&url);
         let o = cmd.output().map_err(|e| e.to_string())?;
         if !o.status.success() {
@@ -388,12 +427,16 @@ async fn dynamic_info(app: &AppHandle, bin: &std::path::Path, url: &str) -> Ytdl
     let settings = crate::state::load_settings(app);
     let cooks = cookie_args(settings.use_cookies, &settings.cookies);
     let url = url.to_string();
+    let eff_proxy = crate::state::proxy_for_url(&settings.per_site_proxies, &settings.proxy, &url);
     let bin = bin.to_path_buf();
     let out = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let mut cmd = crate::tools::silent(Command::new(&bin));
         cmd.arg("--newline").arg("--dump-single-json").arg("--no-warnings");
         cmd.args(["--playlist-items", "1"]);
         cmd.args(&cooks);
+        if !eff_proxy.trim().is_empty() {
+            cmd.arg("--proxy").arg(eff_proxy.trim());
+        }
         cmd.arg(&url);
         let o = cmd.output().map_err(|e| e.to_string())?;
         if !o.status.success() {
@@ -603,19 +646,27 @@ pub struct YtTask {
     /// `launch()` can fetch it in the background; `start()` itself stays fast
     /// (pure task construction, no network) so WS callers get a real result.
     pub needs_ffmpeg: bool,
+    /// Playlist size (videos) for whole-playlist jobs; 0 = unknown/single.
+    /// The run loop counts finished items so the row shows "3 / 10 videos".
+    pub playlist_total: AtomicU64,
+    /// Final on-disk output files (playlist videos, subtitles). Recorded at
+    /// completion so remove-with-delete wipes exactly what the job produced.
+    pub produced: Mutex<Vec<std::path::PathBuf>>,
+    /// Fetch auto-generated captions when no official track matches.
+    pub auto_subs: bool,
 }
 
 impl YtTask {
     pub fn view(&self) -> download::DlView {
-        let status = *self.status.read().unwrap();
+        let status = *self.status.read().unwrap_or_else(|e| e.into_inner());
         let total = self.total.load(Ordering::Relaxed);
         let done = self.done.load(Ordering::Relaxed);
         let speed = self.speed.load(Ordering::Relaxed);
         let progress = if total > 0 { (done as f64 / total as f64) * 100.0 } else { 0.0 };
         let eta = if speed > 0 && total > done { (total - done) / speed } else { 0 };
-        let title = self.title.lock().unwrap().clone();
-        let filename = self.filename.lock().unwrap().clone();
-        let path = self.save_path.lock().unwrap();
+        let title = self.title.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let filename = self.filename.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let path = self.save_path.lock().unwrap_or_else(|e| e.into_inner());
         download::DlView {
             id: self.id.clone(),
             url: self.url.clone(),
@@ -631,13 +682,20 @@ impl YtTask {
             connections: 1,
             live: 1,
             status,
-            error: self.error.lock().unwrap().clone(),
+            error: self.error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             thumbnail: self.thumb.clone(),
             source: "youtube".into(),
             save_path: path.display().to_string(),
             created_at: self.created_at,
-            completed_at: *self.completed_at.lock().unwrap(),
+            completed_at: *self.completed_at.lock().unwrap_or_else(|e| e.into_inner()),
             format_id: Some(self.format_id.clone()),
+            produced: self
+                .produced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         }
     }
 
@@ -676,6 +734,9 @@ pub async fn start(
     embed_subs: bool,
     sub_langs: String,
     embed_thumbnail: bool,
+    // Also fetch auto-generated captions (for videos with no official
+    // subtitle track). Off by default: auto captions are machine quality.
+    auto_subs: bool,
 ) -> Result<Arc<YtTask>, String> {
     // NOTE: no tool downloads here — `start()` must stay fast and synchronous
     // (extension WS calls time out on slow fetches). Tools are ensured in
@@ -759,6 +820,9 @@ pub async fn start(
         created_at,
         completed_at: Mutex::new(None),
         needs_ffmpeg,
+        playlist_total: AtomicU64::new(0),
+        produced: Mutex::new(Vec::new()),
+        auto_subs,
     });
 
     Ok(task)
@@ -847,8 +911,12 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         };
         args.push("--skip-download".into());
         args.push("--write-subs".into());
-        // Only manual/official subtitles — never auto-generated captions.
-        args.push("--no-write-auto-subs".into());
+        // Auto-generated captions only when the chosen track is an (auto) one.
+        if task.auto_subs {
+            args.push("--write-auto-subs".into());
+        } else {
+            args.push("--no-write-auto-subs".into());
+        }
         args.push("--sub-langs".into());
         args.push(if langs.is_empty() || langs == "all" { "all".into() } else { langs });
         args.push("--sub-format".into());
@@ -893,7 +961,13 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                 args.push("--sub-format".into());
                 args.push("srt/vtt/best".into());
                 args.push("--embed-subs".into());
-                args.push("--no-write-auto-subs".into());
+                // Auto-generated captions only when explicitly asked (the
+                // modal passes auto when the chosen track is an (auto) one).
+                if task.auto_subs {
+                    args.push("--write-auto-subs".into());
+                } else {
+                    args.push("--no-write-auto-subs".into());
+                }
                 args.push("--sub-langs".into());
                 args.push(task.sub_langs.trim().to_string());
                 args.push("--convert-subs".into());
@@ -909,9 +983,15 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         args.push("--convert-thumbnails".into());
         args.push("jpg".into());
     }
-    if !task.proxy.trim().is_empty() {
+    // Per-site proxy override wins over the task's global proxy here too
+    // ("DIRECT" drops the flag entirely).
+    let eff_proxy = {
+        let settings = crate::state::load_settings(&task.app);
+        crate::state::proxy_for_url(&settings.per_site_proxies, &task.proxy, &task.url)
+    };
+    if !eff_proxy.trim().is_empty() {
         args.push("--proxy".into());
-        args.push(task.proxy.trim().to_string());
+        args.push(eff_proxy.trim().to_string());
     }
     let settings = crate::state::load_settings(&task.app);
     args.extend(cookie_args(settings.use_cookies, &settings.cookies));
@@ -935,6 +1015,7 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             let base = task.save_base.lock().unwrap().join(&ptitle);
             *task.save_base.lock().unwrap() = base;
             if let Some(n) = info.playlist_count {
+                task.playlist_total.store(n, Ordering::Relaxed);
                 *task.filename.lock().unwrap() = format!("0 / {} videos", n);
             }
             raw.replace("%(playlist_title)s", &ptitle)
@@ -987,14 +1068,23 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
     }
     drop(tx);
 
+    // The drain + join + wait below blocks for the whole job (minutes): run
+    // it on the blocking pool so Tokio workers stay free for IPC/commands.
+    // Everything inside is thread-safe (Arc task, atomics, channel, emits).
+    let task_b = task.clone();
+    let (stderr_tail, saw_progress, status) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+    let task = task_b;
     let mut stderr_tail: Vec<String> = Vec::new();
     let mut saw_progress = false;
     let mut last_prog_emit = Instant::now() - Duration::from_millis(1000);
+    let mut last_prog_done = u64::MAX;
     // Cumulative-progress bookkeeping across the multiple files of one job
     // (e.g. separate video + audio streams that get merged).
     let mut prog_base: u64 = 0;
     let mut last_file_dl: u64 = 0;
     let mut last_file_total: u64 = 0;
+    // Seen playlist video ids (see playlist_item_id).
+    let mut pl_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for msg in rx {
         if task.cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -1020,6 +1110,27 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         if line.contains("[Merger]") || line.contains("[ExtractAudio]") {
             if *task.status.read().unwrap() == DlStatus::Downloading {
                 task.set_status(DlStatus::Merging);
+            }
+        }
+
+        // Playlist item counter: each new "[info] <id>: Downloading N
+        // format(s)" line means yt-dlp moved to the next video — show
+        // "k / N videos" so a 50-video job isn't a mystery bar.
+        if task.include_playlist {
+            // Authoritative "video k of n" line: also teaches us N when the
+            // upfront probe never ran (no playlist_title template).
+            if let Some((k, n)) = playlist_progress(&line) {
+                task.playlist_total.store(n, Ordering::Relaxed);
+                *task.filename.lock().unwrap() = format!("{k} / {n} videos");
+                let _ = task.app.emit("downloads-changed", ());
+            }
+            if let Some(id) = playlist_item_id(&line) {
+                let total = task.playlist_total.load(Ordering::Relaxed);
+                if total > 0 && pl_seen.insert(id.to_string()) {
+                    let k = (pl_seen.len() as u64).min(total);
+                    *task.filename.lock().unwrap() = format!("{} / {} videos", k, total);
+                    let _ = task.app.emit("downloads-changed", ());
+                }
             }
         }
 
@@ -1064,22 +1175,28 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             if spd > 0 {
                 task.speed.store(spd, Ordering::Relaxed);
             }
-            // Emit live progress right away (throttled) so the bar moves smoothly.
-            if Instant::now().duration_since(last_prog_emit) >= Duration::from_millis(200) {
-                last_prog_emit = Instant::now();
-                let d = task.done.load(Ordering::Relaxed);
-                let t = task.total.load(Ordering::Relaxed);
-                let _ = task.app.emit(
-                    "download-progress",
-                    serde_json::json!({
-                        "id": task.id,
-                        "downloaded": d,
-                        "total_size": t,
-                        "speed": task.speed.load(Ordering::Relaxed),
-                        "progress": if t > 0 { (d as f64 / t as f64 * 100.0).min(100.0) } else { 0.0 },
-                        "eta": eta,
-                    }),
-                );
+            // Emit live progress (max 4/s, only on movement + 1 s heartbeat)
+            // so IPC never starves network/disk I/O on fast links.
+            let d = task.done.load(Ordering::Relaxed);
+            if d != last_prog_done
+                || Instant::now().duration_since(last_prog_emit) >= Duration::from_secs(1)
+            {
+                if Instant::now().duration_since(last_prog_emit) >= Duration::from_millis(250) {
+                    last_prog_emit = Instant::now();
+                    last_prog_done = d;
+                    let t = task.total.load(Ordering::Relaxed);
+                    let _ = task.app.emit(
+                        "download-progress",
+                        serde_json::json!({
+                            "id": task.id,
+                            "downloaded": d,
+                            "total_size": t,
+                            "speed": task.speed.load(Ordering::Relaxed),
+                            "progress": if t > 0 { (d as f64 / t as f64 * 100.0).min(100.0) } else { 0.0 },
+                            "eta": eta,
+                        }),
+                    );
+                }
             }
         } else if let Some((pct, total, speed)) = parse_progress(&line) {
             saw_progress = true;
@@ -1098,6 +1215,10 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
         let _ = h.join();
     }
     let status = child.wait().map_err(|e| e.to_string())?;
+    Ok((stderr_tail, saw_progress, status))
+    })
+    .await
+    .map_err(|e| format!("yt-dlp monitor task failed: {e}"))??;
     watch.abort();
 
     if !saw_progress {
@@ -1137,13 +1258,15 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             let base = task.save_base.lock().unwrap().clone();
             let outputs = find_playlist_outputs(&base, started);
             if !outputs.is_empty() {
+                // Remember every produced video for remove-with-delete.
+                *task.produced.lock().unwrap() = outputs.clone();
                 let folder = outputs[0].parent().map(|p| p.to_path_buf()).unwrap_or(base);
                 let count = outputs.len();
                 let sum: u64 = outputs.iter().filter_map(|p| p.metadata().ok()).map(|m| m.len()).sum();
                 let folder_name = folder.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                *task.filename.lock().unwrap() = format!("{} videos", count);
+                *task.filename.lock().unwrap() = format!("{count} / {count} videos");
                 *task.title.lock().unwrap() = folder_name;
-                *task.save_path.lock().unwrap() = folder;
+                *task.save_path.lock().unwrap() = folder.clone();
                 if sum > 0 {
                     task.total.store(sum, Ordering::Relaxed);
                     task.done.store(sum, Ordering::Relaxed);
@@ -1151,6 +1274,12 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                     task.done.store(task.total.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
                 let _ = task.app.emit("downloads-changed", ());
+                // Auto-sub embed drops .srt sidecars next to the videos:
+                // the subs live inside the files now, so sweep the strays.
+                // (Subs-only jobs keep their product — never sweep those.)
+                if task.auto_subs && !task.format_id.starts_with("subs:") {
+                    cleanup_stray_subs(&folder, started);
+                }
             } else {
                 *task.error.lock().unwrap() = Some("Output file not found".into());
             }
@@ -1162,16 +1291,18 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             if !outputs.is_empty() {
                 // Strip the temporary prefix from final filename(s).
                 let mut real_names: Vec<String> = Vec::new();
+                let mut produced: Vec<std::path::PathBuf> = Vec::new();
                 for real in &outputs {
                     let raw = real.file_name().map(|s| s.to_string_lossy()[prefix.len()..].to_string()).unwrap_or_default();
                     if !raw.is_empty() {
                         if let Some(fp) = finalize_file(real, &dir, &clean_output_name(&raw)) {
+                            produced.push(fp.clone());
                             real_names.push(fp.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
                         }
                     }
                 }
-                let first = dir.join(real_names.first().cloned().unwrap_or_default());
-                if real_names.len() == 1 {
+                *task.produced.lock().unwrap() = produced;
+                let first = dir.join(real_names.first().cloned().unwrap_or_default());                if real_names.len() == 1 {
                     let fname = real_names[0].clone();
                     *task.filename.lock().unwrap() = fname.clone();
                     *task.title.lock().unwrap() = first
@@ -1188,6 +1319,9 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                     *task.save_path.lock().unwrap() = dir.join(real_names.join(", "));
                 }
                 let _ = task.app.emit("downloads-changed", ());
+                if task.auto_subs && !task.format_id.starts_with("subs:") {
+                    cleanup_stray_subs(&dir, started);
+                }
             } else {
                 *task.error.lock().unwrap() = Some("Output file not found".into());
             }
@@ -1255,6 +1389,37 @@ fn find_playlist_outputs(dir: &std::path::Path, since: std::time::SystemTime) ->
     out
 }
 
+/// Remove stray subtitle sidecars (`*.srt|*.vtt|…`) that `--write-auto-subs`
+/// drops next to an *embed* job's outputs. Only files created after `since`
+/// qualify (mtime-scoped, so user files are never touched); unknown mtime
+/// means keep. Subs-only jobs keep their product — callers gate on that.
+fn cleanup_stray_subs(dir: &std::path::Path, since: std::time::SystemTime) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            continue;
+        }
+        let is_sub = p
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| matches!(x.to_ascii_lowercase().as_str(), "srt" | "vtt" | "ass" | "ssa" | "ttml" | "srv3" | "json3"))
+            .unwrap_or(false);
+        if !is_sub {
+            continue;
+        }
+        let fresh = p
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| t >= since)
+            .unwrap_or(false);
+        if fresh {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 /// File name matches the "NN - Title.ext" playlist convention.
 fn is_playlist_output_name(p: &std::path::Path) -> bool {
     p.file_name()
@@ -1274,10 +1439,13 @@ fn is_playlist_output_name(p: &std::path::Path) -> bool {
 pub async fn progress_watch(task: Arc<YtTask>) {
     let mut last = Instant::now();
     let mut last_done = task.done.load(Ordering::Relaxed);
+    // Same IPC throttle as the template path: max 4/s, movement + heartbeat.
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut sent_done = u64::MAX;
     loop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let now = task.done.load(Ordering::Relaxed);
-        let speed = ((now.saturating_sub(last_done)) as f64 / last.elapsed().as_secs_f64().max(0.2)) as u64;
+        let speed = ((now.saturating_sub(last_done)) as f64 / last.elapsed().as_secs_f64().max(0.05)) as u64;
         // Never overwrite a live template-reported speed with 0: when yt-dlp is
         // in a merge/extract stage `done` doesn't move, but zeroing the speed
         // is what froze the row at "0 B/s" between progress bursts.
@@ -1286,23 +1454,67 @@ pub async fn progress_watch(task: Arc<YtTask>) {
         }
         last = Instant::now();
         last_done = now;
-        let total = task.total.load(Ordering::Relaxed);
-        let progress = if total > 0 { (now as f64 / total as f64) * 100.0 } else { 0.0 };
-        let eta = if speed > 0 && total > now { (total - now) / speed } else { 0 };
-        let _ = task.app.emit(
-            "download-progress",
-            serde_json::json!({
-                "id": task.id,
-                "downloaded": now,
-                "total_size": total,
-                "speed": speed,
-                "progress": progress.min(100.0),
-                "eta": eta,
-            }),
-        );
+        if now != sent_done || last_emit.elapsed() >= Duration::from_secs(1) {
+            last_emit = Instant::now();
+            sent_done = now;
+            let total = task.total.load(Ordering::Relaxed);
+            let progress = if total > 0 { (now as f64 / total as f64) * 100.0 } else { 0.0 };
+            let eta = if speed > 0 && total > now { (total - now) / speed } else { 0 };
+            let _ = task.app.emit(
+                "download-progress",
+                serde_json::json!({
+                    "id": task.id,
+                    "downloaded": now,
+                    "total_size": total,
+                    "speed": speed,
+                    "progress": progress.min(100.0),
+                    "eta": eta,
+                }),
+            );
+        }
         let st = *task.status.read().unwrap();
         if st == DlStatus::Completed || st == DlStatus::Cancelled || st == DlStatus::Error {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod vx_tests {
+    use super::*;
+
+    #[test]
+    fn playlist_item_id_detects_markers() {
+        assert_eq!(
+            playlist_item_id("[info] dQw4w9WgXcQ: Downloading 1 format(s)"),
+            Some("dQw4w9WgXcQ")
+        );
+        assert_eq!(
+            playlist_item_id("[info] abc123XYZ_-: Downloading 2 format(s): 248+251"),
+            Some("abc123XYZ_-")
+        );
+        // not markers
+        assert_eq!(playlist_item_id("[download] 12.3% of 5MiB at 1MiB/s"), None);
+        assert_eq!(playlist_item_id("[info] Downloading video 3 of 10"), None);
+        assert_eq!(playlist_item_id("__VX_PROG__:1:2:3:4"), None);
+        assert_eq!(playlist_item_id(""), None);
+    }
+
+    #[test]
+    fn playlist_progress_parses_counter() {
+        assert_eq!(
+            playlist_progress("[download] Downloading video 3 of 12"),
+            Some((3, 12))
+        );
+        assert_eq!(
+            playlist_progress("[download] Downloading video 1 of 1"),
+            Some((1, 1))
+        );
+        // junk / edge cases never yield numbers
+        assert_eq!(playlist_progress("[download] 12.3% of 5MiB at 1MiB/s"), None);
+        assert_eq!(playlist_progress("[download] Downloading video 0 of 12"), None);
+        assert_eq!(playlist_progress("[download] Downloading video 13 of 12"), None);
+        assert_eq!(playlist_progress("[info] abc: Downloading 1 format(s)"), None);
+        assert_eq!(playlist_progress(""), None);
     }
 }

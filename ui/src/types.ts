@@ -6,7 +6,8 @@ export type DownloadStatus =
   | "merging"
   | "error"
   | "cancelled"
-  | "needs_auth";
+  | "needs_auth"
+  | "resolving";
 
 export type CategoryId = "all" | "video" | "audio" | "document" | "program" | "zip" | "other";
 
@@ -88,6 +89,16 @@ export interface AppStats {
   connections: number;
 }
 
+export interface TorrentMetadata {
+  info_hash: string;
+  name: string;
+  total_size: number;
+  files: { path: string; size: number }[];
+  trackers: string[];
+  is_magnet: boolean;
+  magnet_url?: string | null;
+}
+
 export interface GrabItem {
   url: string;
   filename: string;
@@ -99,6 +110,7 @@ export interface Settings {
   segments: number;
   speed_limit: number;
   notifications: boolean;
+  sounds: boolean;
   auto_start: boolean;
   delete_part: boolean;
   categorize_folders: boolean;
@@ -115,4 +127,5 @@ export interface Settings {
   sub_langs: string;
   embed_thumbnail: boolean;
   credentials: { host: string; username: string; password: string }[];
+  per_site_proxies: { id: string; domain_pattern: string; proxy_url: string; enabled: boolean }[];
 }

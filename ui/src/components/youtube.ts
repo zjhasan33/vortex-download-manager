@@ -10,6 +10,9 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
   let loading = false;
   let subSel = "";
   let subFmt = "srt";
+  // True when the chosen subtitle track is auto-generated: the backend must
+  // fetch auto captions (otherwise an (auto) pick silently embeds nothing).
+  let subAuto = false;
   let autoChecked = false;
 
   const close = openModal(
@@ -51,6 +54,7 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
               <input type="checkbox" id="yt-embed" ${store.settings?.embed_subs !== false ? "checked" : ""} /> Embed official subtitles
             </label>
           </div>
+          <div id="yt-plhint" style="font-size:11.5px;color:var(--text-3);padding-top:2px"></div>
         </div>
         <div class="field">
           <label>Start at (optional)</label>
@@ -73,14 +77,35 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
       const pathInp = root.querySelector<HTMLInputElement>("#yt-path")!;
       const itemsInp = root.querySelector<HTMLInputElement>("#yt-items")!;
       const plChk = root.querySelector<HTMLInputElement>("#yt-playlist")!;
-      plChk.onchange = () => (itemsInp.style.display = plChk.checked ? "" : "none");
+      // Destination hint so a flat single download from a playlist URL is
+      // never a surprise (folder forms in playlist mode only).
+      const syncPlHint = () => {
+        const hint = root.querySelector<HTMLElement>("#yt-plhint");
+        if (!hint) return;
+        if (plChk.checked && info?.playlist) {
+          const n = info.playlist_count ? `${info.playlist_count} videos` : "playlist";
+          const t = info.playlist_title ? ` → folder "${info.playlist_title}"` : " → playlist folder";
+          hint.textContent = `→ ${n}${t}`;
+        } else if (info?.playlist) {
+          hint.textContent = "→ Single video → Downloads root (no folder)";
+        } else {
+          hint.textContent = "";
+        }
+      };
+      plChk.onchange = () => {
+        itemsInp.style.display = plChk.checked ? "" : "none";
+        syncPlHint();
+      };
 
       const renderBody = () => {
         if (loading || !info) return;
         const best = info.formats.find((f) => f.note?.includes("Best"));
         const start = selected ?? best?.id ?? info.formats[0]?.id;
         if (start) selected = start;
-        if (!subSel && info.subtitles.length) subSel = info.subtitles[0].lang;
+        if (!subSel && info.subtitles.length) {
+          subSel = info.subtitles[0].lang;
+          subAuto = !!info.subtitles[0].auto;
+        }
 
         body.innerHTML = `
           <div class="yt-info">
@@ -105,7 +130,7 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
             <div class="sub-select">
               <select class="input" id="yt-sublang">
                 <option value="all" ${subSel === "all" ? "selected" : ""}>All languages</option>
-                ${info.subtitles.map((s) => `<option value="${s.lang}" ${s.lang === subSel ? "selected" : ""}>${esc(s.label)}</option>`).join("")}
+                ${info.subtitles.map((s) => `<option value="${s.lang}" data-auto="${s.auto ? "1" : ""}" ${s.lang === subSel ? "selected" : ""}>${esc(s.label)}</option>`).join("")}
               </select>
               <select class="input" id="yt-subfmt" style="flex:0 0 96px;width:96px">
                 ${["srt", "vtt"].map((f) => `<option value="${f}" ${f === subFmt ? "selected" : ""}>${f.toUpperCase()}</option>`).join("")}
@@ -123,7 +148,11 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
           };
         });
         const subSelect = root.querySelector<HTMLSelectElement>("#yt-sublang");
-        if (subSelect) subSelect.onchange = () => (subSel = subSelect.value);
+        if (subSelect)
+          subSelect.onchange = () => {
+            subSel = subSelect.value;
+            subAuto = subSelect.selectedOptions[0]?.dataset.auto === "1";
+          };
         const subFmtSel = root.querySelector<HTMLSelectElement>("#yt-subfmt");
         if (subFmtSel) subFmtSel.onchange = () => (subFmt = subFmtSel.value);
         const subGo = root.querySelector<HTMLButtonElement>("#yt-subs-go");
@@ -143,6 +172,7 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
           plChk.checked = true;
           itemsInp.style.display = "";
         }
+        syncPlHint();
         refreshGo();
       };
 
@@ -181,30 +211,35 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
       );
 
       const goDownload = async (formatId: string) => {
-        const playlist = root.querySelector<HTMLInputElement>("#yt-playlist")!.checked;
-        const items = root.querySelector<HTMLInputElement>("#yt-items")!.value.trim();
-        const startInp = root.querySelector<HTMLInputElement>("#yt-start")!;
-        const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
-        const embed = root.querySelector<HTMLInputElement>("#yt-embed")?.checked ?? true;
-        const subLangs = subSel && subSel !== "all" ? subSel : store.settings?.sub_langs || "en";
-        await api.startYtdl(
-          urlInp.value.trim(),
-          formatId,
-          pathInp.value.trim(),
-          playlist,
-          items,
-          when,
-          embed,
-          subLangs,
-          store.settings?.embed_thumbnail !== false,
-        );
-        const msg = formatId.startsWith("subs:")
-          ? "Subtitle download started"
-          : formatId.startsWith("ba-") || formatId.startsWith("bestaudio")
-            ? "Audio download started"
-            : "Video download started";
-        toast(msg, "ok");
-        close();
+        try {
+          const playlist = root.querySelector<HTMLInputElement>("#yt-playlist")!.checked;
+          const items = root.querySelector<HTMLInputElement>("#yt-items")!.value.trim();
+          const startInp = root.querySelector<HTMLInputElement>("#yt-start")!;
+          const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
+          const embed = root.querySelector<HTMLInputElement>("#yt-embed")?.checked ?? true;
+          const subLangs = subSel && subSel !== "all" ? subSel : store.settings?.sub_langs || "all";
+          await api.startYtdl(
+            urlInp.value.trim(),
+            formatId,
+            pathInp.value.trim(),
+            playlist,
+            items,
+            when,
+            embed,
+            subLangs,
+            store.settings?.embed_thumbnail !== false,
+            subAuto,
+          );
+          const msg = formatId.startsWith("subs:")
+            ? "Subtitle download started"
+            : formatId.startsWith("ba-") || formatId.startsWith("bestaudio")
+              ? "Audio download started"
+              : "Video download started";
+          toast(msg, "ok");
+          close();
+        } catch (e: unknown) {
+          toast("Download failed: " + String(e), "err");
+        }
       };
 
       root.querySelector<HTMLButtonElement>("#yt-go")!.onclick = async () => {

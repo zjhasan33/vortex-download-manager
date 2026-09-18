@@ -36,6 +36,7 @@ const STATUS_LABEL: Record<Download["status"], string> = {
   error: "Error",
   cancelled: "Cancelled",
   needs_auth: "Login required",
+  resolving: "Resolving metadata…",
 };
 
 /** Row-sort keys tied to the clickable list headers + the quick date toggle. */
@@ -46,11 +47,12 @@ const STATUS_RANK: Record<Download["status"], number> = {
   downloading: 0,
   merging: 1,
   queued: 2,
-  needs_auth: 3,
-  paused: 4,
-  error: 5,
-  completed: 6,
-  cancelled: 7,
+  resolving: 3,
+  needs_auth: 4,
+  paused: 5,
+  error: 6,
+  completed: 7,
+  cancelled: 8,
 };
 
 /** First-click default order per column (name A–Z, size largest, status by rank, date newest). */
@@ -61,8 +63,25 @@ const SORT_DEFAULT: Record<SortColumn, "asc" | "desc"> = {
   status: "asc",
 };
 
-function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function esc(s: unknown): string {
+  const t = typeof s === "string" ? s : s == null ? "" : String(s);
+  return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** Backend marks playlist jobs via filename `"k / N videos"`. Parse it for
+ *  prominent display; null for single videos / history. Never throws. */
+function playlistPos(filename: unknown): { k: number; n: number } | null {
+  try {
+    if (typeof filename !== "string") return null;
+    const m = filename.match(/(\d+)\s*\/\s*(\d+)\s*videos/i);
+    if (!m) return null;
+    const k = Number(m[1]);
+    const n = Number(m[2]);
+    if (!Number.isFinite(k) || !Number.isFinite(n) || k <= 0 || n <= 0 || k > n) return null;
+    return { k, n };
+  } catch {
+    return null;
+  }
 }
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -241,7 +260,7 @@ export class VortexApp {
   }
 
   private activeCount(): number {
-    return store.downloads.filter((d) => d.status === "downloading" || d.status === "queued" || d.status === "merging").length;
+    return store.downloads.filter((d) => d.status === "downloading" || d.status === "queued" || d.status === "merging" || d.status === "resolving").length;
   }
 
   private visible(): Download[] {
@@ -293,17 +312,25 @@ export class VortexApp {
 
   private row(d: Download): string {
     const dim = d.status === "completed" || d.status === "cancelled";
-    const active = d.status === "downloading" || d.status === "merging" || d.status === "queued";
-    const pct = d.progress.toFixed(1);
+    const active = d.status === "downloading" || d.status === "merging" || d.status === "queued" || d.status === "resolving";
+    const pct = Number.isFinite(d.progress) ? d.progress.toFixed(1) : "0.0";
     const barCls = d.status === "error" ? "err" : d.status === "completed" ? "done" : "";
     const checked = this.selected.has(d.id);
+    const isTorrent = d.source === "torrent";
+    const tx = isTorrent ? store.torrentExtra(d.id) : { up: 0, peers: d.live || 0, ratio: 0 };
+    // Playlist prominence (A+): "▶ k/n • title" so the current video is
+    // obvious; single videos / history fall through unchanged.
+    const pl = d.source === "youtube" ? playlistPos(d.filename) : null;
+    const nameHtml = pl ? `▶ ${pl.k}/${pl.n} • ${esc(d.title)}` : esc(d.title);
+    const statusLabel =
+      d.status === "merging" && pl ? `Merging ${pl.k}/${pl.n}…` : (STATUS_LABEL[d.status] ?? d.status);
     const cols = {
       check: `<label class="dl-check" title="Select"><input type="checkbox" data-check="${d.id}" ${checked ? "checked" : ""} /></label>`,
       name: `
         <div class="dl-name-cell">
           <span class="dl-ico">${catIcon(d.category, 18)}</span>
           <span style="min-width:0">
-            <div class="dl-name" title="${esc(d.title)}">${esc(d.title)}</div>
+            <div class="dl-name" title="${nameHtml}">${nameHtml}</div>
             <div class="dl-sub">${esc(d.url)} ${d.source === "youtube" ? "• " + esc(d.filename) : ""}</div>
             <div class="dl-date">${fmtStamp(d)}</div>
           </span>
@@ -312,14 +339,14 @@ export class VortexApp {
       prog: `
         <div class="dl-prog">
           <div class="bar ${barCls}"><div class="fill" style="width:${pct}%"></div></div>
-          <span class="dl-pct"><span class="dl-pct-val">${pct}%</span> <span style="color:var(--text-3)">${d.segments} seg</span></span>
+          <span class="dl-pct"><span class="dl-pct-val">${pct}%</span> <span class="dl-seg" style="color:var(--text-3)">${isTorrent ? `Peers ${tx.peers}` : `${d.segments} seg`}</span></span>
         </div>`,
-      speed: `<span class="dl-speed">${d.status === "downloading" || d.status === "merging" ? formatSpeed(d.speed) : "–"}</span>`,
-      eta: `<span class="dl-eta">${d.status === "downloading" ? formatEta(d.eta) : "–"}</span>`,
-      status: `<div class="dl-status"><span class="chip ${d.status}">${STATUS_LABEL[d.status]}${d.status === "error" && d.error ? ` • ${esc(d.error.slice(0, 28))}` : ""}</span></div>`,
+      speed: `<span class="dl-speed">${d.status === "downloading" || d.status === "merging" ? (isTorrent ? `↓ ${formatSpeed(d.speed)} ↑ ${formatSpeed(tx.up)}` : formatSpeed(d.speed)) : "–"}</span>`,
+      eta: `<span class="dl-eta">${d.status === "downloading" ? (isTorrent ? `Ratio ${tx.ratio.toFixed(2)}` : formatEta(d.eta)) : "–"}</span>`,
+      status: `<div class="dl-status"><span class="chip ${d.status}">${statusLabel}${d.status === "error" && d.error ? ` • ${esc(d.error.slice(0, 28))}` : ""}</span></div>`,
       actions: `
         <div class="dl-actions">
-          ${d.status === "downloading" || d.status === "queued" ? `<button data-act="pause" data-id="${d.id}" title="Pause">${icon("pause", 15)}</button>` : d.status === "paused" ? `<button data-act="resume" data-id="${d.id}" title="Resume">${icon("play", 15)}</button>` : ""}${d.status === "downloading" || d.status === "queued" || d.status === "paused" || d.status === "merging" ? `<button data-act="stop" data-id="${d.id}" title="Stop (keeps partial progress)">${icon("stop", 15)}</button>` : ""}
+          ${d.status === "downloading" || d.status === "queued" || d.status === "resolving" ? `<button data-act="pause" data-id="${d.id}" title="Pause">${icon("pause", 15)}</button>` : d.status === "paused" ? `<button data-act="resume" data-id="${d.id}" title="Resume">${icon("play", 15)}</button>` : ""}${d.status === "downloading" || d.status === "queued" || d.status === "paused" || d.status === "merging" || d.status === "resolving" ? `<button data-act="stop" data-id="${d.id}" title="Stop (keeps partial progress)">${icon("stop", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="folder" data-id="${d.id}" title="Show in folder">${icon("folder", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="open" data-id="${d.id}" title="Open file">${icon("play", 15)}</button>` : ""}
           ${d.source !== "youtube" && (d.status === "error" || d.status === "cancelled") ? `<button data-act="resume" data-id="${d.id}" title="Resume from partial progress">${icon("play", 15)}</button>` : ""}${d.status === "completed" || d.status === "needs_auth" || (d.source === "youtube" && (d.status === "error" || d.status === "cancelled")) ? `<button data-act="reload" data-id="${d.id}" title="Download again">${icon("redo", 15)}</button>` : ""}
@@ -335,7 +362,7 @@ export class VortexApp {
     const rows = store.downloads
       .map(
         (d) =>
-          [d.id, d.status, d.source, d.category, d.filename, d.total_size, d.segments, d.error ?? "", d.completed_at ?? 0, d.created_at].join("~"),
+          [d.id, d.status, d.source, d.category, d.filename, d.title ?? "", d.total_size, d.segments, d.error ?? "", d.completed_at ?? 0, d.created_at].join("~"),
       )
       .join("|");
     return `${this.cat}|${this.search}|${this.sort.column}:${this.sort.order}|${sel}|${rows}`;
@@ -351,17 +378,28 @@ export class VortexApp {
       const d = items[i];
       const el = kids[i];
       const fill = el.querySelector<HTMLElement>(".bar .fill");
-      if (fill) fill.style.width = `${d.progress.toFixed(1)}%`;
+      const pct = Number.isFinite(d.progress) ? d.progress.toFixed(1) : "0.0";
+      if (fill) fill.style.width = `${pct}%`;
       const pv = el.querySelector<HTMLElement>(".dl-pct-val");
-      if (pv) pv.textContent = `${d.progress.toFixed(1)}%`;
+      if (pv) pv.textContent = `${pct}%`;
       const sz = el.querySelector<HTMLElement>(".dl-size");
       if (sz) sz.textContent = formatBytes(d.total_size || d.downloaded);
+      const isT = d.source === "torrent";
+      const txt = isT ? store.torrentExtra(d.id) : null;
+      const segNote = el.querySelector<HTMLElement>(".dl-seg");
+      if (segNote) segNote.textContent = isT ? `Peers ${txt!.peers}` : `${d.segments} seg`;
       const sp = el.querySelector<HTMLElement>(".dl-speed");
       if (sp)
         sp.textContent =
-          d.status === "downloading" || d.status === "merging" ? formatSpeed(d.speed) : "–";
+          d.status === "downloading" || d.status === "merging"
+            ? isT
+              ? `↓ ${formatSpeed(d.speed)} ↑ ${formatSpeed(txt!.up)}`
+              : formatSpeed(d.speed)
+            : "–";
       const eta = el.querySelector<HTMLElement>(".dl-eta");
-      if (eta) eta.textContent = d.status === "downloading" ? formatEta(d.eta) : "–";
+      if (eta)
+        eta.textContent =
+          d.status === "downloading" ? (isT ? `Ratio ${txt!.ratio.toFixed(2)}` : formatEta(d.eta)) : "–";
     }
     this.refreshChrome();
   }
@@ -432,13 +470,17 @@ export class VortexApp {
         void api.downloadsAction("remove", ids, del).then(() => {
           this.selected.clear();
           toast(`${ids.length} removed`, "ok");
-        });
+        }).catch((e: unknown) => toast("Remove failed: " + String(e), "err"));
       });
       return;
     }
-    const n = await api.downloadsAction(action, ids);
-    this.selected.clear();
-    toast(n ? `${n} download(s) ${action === "retry" ? "retried" : action + "d"}` : "Nothing to do", n ? "ok" : "info");
+    try {
+      const n = await api.downloadsAction(action, ids);
+      this.selected.clear();
+      toast(n ? `${n} download(s) ${action === "retry" ? "retried" : action + "d"}` : "Nothing to do", n ? "ok" : "info");
+    } catch (e: unknown) {
+      toast("Bulk action failed: " + String(e), "err");
+    }
     await store.refresh();
   }
 
@@ -485,7 +527,8 @@ export class VortexApp {
   }
 
   private startChartLoop(): () => void {
-    const canvas = this.root.querySelector<HTMLCanvasElement>("#speedChart")!;
+    const canvas = this.root.querySelector<HTMLCanvasElement>("#speedChart");
+    if (!canvas) return () => {};
     this.chart = new SpeedChart(canvas);
     void api.getTools().then((t) => {
       store.tools = t;
@@ -516,7 +559,7 @@ export class VortexApp {
           })
           .catch(() => toast("Tools download failed — press Update Tools to retry", "err"));
       }
-    });
+    }).catch((e) => console.error("[tools status failed]", e));
     const id = setInterval(() => {
       this.chart.push(store.stats.total_speed);
     }, 700);
@@ -568,19 +611,32 @@ export class VortexApp {
       this.root.querySelectorAll<HTMLElement>("[data-win]").forEach((b) => {
         b.onclick = () => api.windowAction(b.dataset.win as "minimize" | "toggle" | "close");
       });
-      this.root.querySelector<HTMLButtonElement>("#tb-add")!.onclick = openAddUrl;
-      this.root.querySelector<HTMLButtonElement>("#tb-yt")!.onclick = () => openYoutube(undefined);
-      this.root.querySelector<HTMLButtonElement>("#tb-grab")!.onclick = () => openGrabber(undefined);
-      this.root.querySelector<HTMLButtonElement>("#tb-import")!.onclick = async () => {
-        const urls = await api.readUrls();
-        if (!urls.length) return toast("No URLs found", "err");
-        for (const u of urls) {
-          await api.startDownload(u, store.settings?.path || "", store.settings?.segments ?? 8);
-        }
-        toast(`${urls.length} download(s) queued`, "ok");
-      };
-      this.root.querySelector<HTMLButtonElement>("#tb-settings")!.onclick = openSettings;
-      this.root.querySelector<HTMLButtonElement>("#tb-sort")!.onclick = () => this.setSort("date");
+      // Guarded bindings: one missing toolbar id must never abort the
+      // whole bind (which would silently kill pause/resume/search/list).
+      const tbAdd = this.root.querySelector<HTMLButtonElement>("#tb-add");
+      if (tbAdd) tbAdd.onclick = openAddUrl;
+      const tbYt = this.root.querySelector<HTMLButtonElement>("#tb-yt");
+      if (tbYt) tbYt.onclick = () => openYoutube(undefined);
+      const tbGrab = this.root.querySelector<HTMLButtonElement>("#tb-grab");
+      if (tbGrab) tbGrab.onclick = () => openGrabber(undefined);
+      const tbImport = this.root.querySelector<HTMLButtonElement>("#tb-import");
+      if (tbImport)
+        tbImport.onclick = async () => {
+          try {
+            const urls = await api.readUrls();
+            if (!urls.length) return toast("No URLs found", "err");
+            for (const u of urls) {
+              await api.startDownload(u, store.settings?.path || "", store.settings?.segments ?? 8);
+            }
+            toast(`${urls.length} download(s) queued`, "ok");
+          } catch (e: unknown) {
+            toast("Import failed: " + String(e), "err");
+          }
+        };
+      const tbSettings = this.root.querySelector<HTMLButtonElement>("#tb-settings");
+      if (tbSettings) tbSettings.onclick = openSettings;
+      const tbSort = this.root.querySelector<HTMLButtonElement>("#tb-sort");
+      if (tbSort) tbSort.onclick = () => this.setSort("date");
       this.root.querySelectorAll<HTMLElement>(".list-head [data-sort]").forEach((el) => {
         el.onclick = () => this.setSort(el.dataset.sort as SortColumn);
       });
@@ -588,18 +644,30 @@ export class VortexApp {
       const pa = this.root.querySelector<HTMLButtonElement>("#tb-pause");
       const re = this.root.querySelector<HTMLButtonElement>("#tb-resume");
       if (pa) pa.onclick = async () => {
-        const n = await api.pauseAllDownloads();
-        toast(n ? `${n} download(s) paused` : "Nothing to pause", n ? "ok" : "info");
+        try {
+          const n = await api.pauseAllDownloads();
+          toast(n ? `${n} download(s) paused` : "Nothing to pause", n ? "ok" : "info");
+        } catch (e: unknown) {
+          toast("Pause failed: " + String(e), "err");
+        }
       };
       if (re) re.onclick = async () => {
-        const n = await api.resumeAllDownloads();
-        toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");
+        try {
+          const n = await api.resumeAllDownloads();
+          toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");
+        } catch (e: unknown) {
+          toast("Resume failed: " + String(e), "err");
+        }
       };
       const stop = this.root.querySelector<HTMLButtonElement>("#tb-stop");
       if (stop) stop.onclick = async () => {
-        const n = await api.cancelAllActive();
-        toast(n ? `Stopped ${n} download(s)` : "Nothing active", n ? "ok" : "info");
-        await store.refresh();
+        try {
+          const n = await api.cancelAllActive();
+          toast(n ? `Stopped ${n} download(s)` : "Nothing active", n ? "ok" : "info");
+          await store.refresh();
+        } catch (e: unknown) {
+          toast("Stop failed: " + String(e), "err");
+        }
       };
       // Emergency batch bar actions (pause/resume/cancel everything at once).
       const bpause = this.root.querySelector<HTMLButtonElement>("#btn-batch-pause");
@@ -607,24 +675,40 @@ export class VortexApp {
       const bcancel = this.root.querySelector<HTMLButtonElement>("#btn-batch-cancel");
       if (bpause)
         bpause.onclick = async () => {
-          const n = await api.pauseAllDownloads();
-          toast(n ? `${n} download(s) paused` : "Nothing to pause", n ? "ok" : "info");
+          try {
+            const n = await api.pauseAllDownloads();
+            toast(n ? `${n} download(s) paused` : "Nothing to pause", n ? "ok" : "info");
+          } catch (e: unknown) {
+            toast("Pause failed: " + String(e), "err");
+          }
         };
       if (bresume)
         bresume.onclick = async () => {
-          const n = await api.resumeAllDownloads();
-          toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");
+          try {
+            const n = await api.resumeAllDownloads();
+            toast(n ? `${n} download(s) resumed` : "Nothing to resume", n ? "ok" : "info");
+          } catch (e: unknown) {
+            toast("Resume failed: " + String(e), "err");
+          }
         };
       if (bcancel)
         bcancel.onclick = async () => {
-          const n = await api.cancelAllActive();
-          toast(n ? `Stopped & cancelled ${n} download(s)` : "Nothing active", n ? "ok" : "info");
-          await store.refresh();
+          try {
+            const n = await api.cancelAllActive();
+            toast(n ? `Stopped & cancelled ${n} download(s)` : "Nothing active", n ? "ok" : "info");
+            await store.refresh();
+          } catch (e: unknown) {
+            toast("Stop failed: " + String(e), "err");
+          }
         };
       const rt = this.root.querySelector<HTMLButtonElement>("#tb-retry");
       if (rt) rt.onclick = async () => {
-        const n = await api.retryAllDownloads();
-        toast(n ? `${n} download(s) retried` : "Nothing to retry", n ? "ok" : "info");
+        try {
+          const n = await api.retryAllDownloads();
+          toast(n ? `${n} download(s) retried` : "Nothing to retry", n ? "ok" : "info");
+        } catch (e: unknown) {
+          toast("Retry failed: " + String(e), "err");
+        }
       };
       this.root.querySelectorAll<HTMLElement>(".side-item").forEach((el) => {
         el.onclick = () => {
@@ -662,7 +746,9 @@ export class VortexApp {
           }
           void this.runBulk(a as "pause" | "resume" | "retry" | "remove");
         });
-      this.root.querySelector<HTMLElement>("#list")!.addEventListener("click", (e) => {
+      const listEl = this.root.querySelector<HTMLElement>("#list");
+      if (listEl)
+        listEl.addEventListener("click", (e) => {
         const target = e.target as HTMLElement;
         const actEl = target.closest("[data-act]") as HTMLElement | null;
         if (!actEl) {
@@ -675,40 +761,59 @@ export class VortexApp {
         const act = t.dataset.act!;
         const d = store.downloads.find((x) => x.id === id);
         if (!d) return;
-        if (act === "pause") void api.pauseDownload(id);
-        else if (act === "resume") void api.resumeDownload(id);
-        else if (act === "stop") void api.cancelDownload(id).then(() => store.refresh());
-        else if (act === "folder") void api.openFolder(d.save_path);
-        else if (act === "open") void api.openFile(d.save_path);
+        const isTorrent = d.source === "torrent";
+        // Row actions: failures toast (no silent dead clicks); chained list
+        // refreshes stay quiet (next tick/event covers them anyway).
+        const quiet = (p: Promise<unknown>) =>
+          p.catch((e: unknown) => console.error("[row refresh]", e));
+        const run = (p: Promise<unknown>, what: string) =>
+          p.catch((e: unknown) => toast(`${what} failed: ${String(e)}`, "err"));
+        if (act === "pause") {
+          if (isTorrent) run(api.pauseTorrent(id).then(() => quiet(store.refresh())), "Pause");
+          else run(api.pauseDownload(id), "Pause");
+        } else if (act === "resume") {
+          if (isTorrent) run(api.resumeTorrent(id).then(() => quiet(store.refresh())), "Resume");
+          else run(api.resumeDownload(id), "Resume");
+        } else if (act === "stop") {
+          if (isTorrent) run(api.cancelTorrent(id, false).then(() => quiet(store.refresh())), "Stop");
+          else run(api.cancelDownload(id).then(() => quiet(store.refresh())), "Stop");
+        } else if (act === "folder") run(api.openFolder(d.save_path), "Open folder");
+        else if (act === "open") run(api.openFile(d.save_path), "Open file");
         else if (act === "reload") {
-          if (d.source === "youtube" || d.status === "completed") {
+          if (isTorrent) {
+            // Re-seed / restart the same session task.
+            run(api.resumeTorrent(id).then(() => quiet(store.refresh())), "Reload");
+          } else if (d.source === "youtube" || d.status === "completed") {
             if (d.source === "youtube") {
               const path = store.settings?.path || "";
               if (d.format_id) {
-                void api.startYtdl(d.url, d.format_id, path, false, undefined);
+                run(api.startYtdl(d.url, d.format_id, path, false, undefined), "Download");
               } else {
-                void api.fetchYtdlInfo(d.url).then((info) => {
+                run(api.fetchYtdlInfo(d.url).then((info) => {
                   const best = info.formats.find((f) => f.note?.includes("Best")) ?? info.formats[0];
                   if (best) return api.startYtdl(d.url, best.id, path, false, undefined);
-                });
+                }), "Download");
               }
             } else {
-              void api.startDownload(d.url, store.settings?.path || "", store.settings?.segments ?? 8);
+              run(api.startDownload(d.url, store.settings?.path || "", store.settings?.segments ?? 8), "Download");
             }
+          } else if (isTorrent) {
+            // Torrent error/cancelled: unpause the SAME session task.
+            run(api.resumeTorrent(id).then(() => quiet(store.refresh())), "Resume");
           } else {
             // HTTP error/cancelled: resume the SAME task so kept part files
             // continue instead of downloading from zero.
-            void api.resumeDownload(id);
+            run(api.resumeDownload(id), "Resume");
           }
         } else if (act === "cancel") {
           if (d.status === "completed") {
-            openConfirmRemove(d.filename || d.title, (del) => void api.removeDownload(id, del));
+            openConfirmRemove(d.filename || d.title, (del) => run(api.removeDownload(id, del), "Remove"));
           } else {
-            void api.removeDownload(id, false);
+            run(api.removeDownload(id, false), "Remove");
           }
         }
       });
-      // Drag & drop URL import.
+      // Drag & drop URL import. Torrents are not supported in this version.
       document.addEventListener("dragover", (e) => e.preventDefault());
       document.addEventListener("drop", (e) => {
         e.preventDefault();
@@ -717,10 +822,13 @@ export class VortexApp {
           e.dataTransfer?.getData("text/uri-list") ||
           e.dataTransfer?.getData("URL") ||
           "";
-        const urls = txt
+        const parts = txt
           .split(/[\s,;]+/)
           .map((u) => u.trim())
-          .filter((u) => u.startsWith("http://") || u.startsWith("https://"));
+          .filter(Boolean);
+        const magnets = parts.filter((u) => /^magnet:/i.test(u));
+        const urls = parts.filter((u) => u.startsWith("http://") || u.startsWith("https://"));
+        if (magnets.length) toast("Torrent downloads are not supported in this version", "err");
         if (!urls.length) return;
         for (const u of urls) {
           void api.startDownload(u, store.settings?.path || "", store.settings?.segments ?? 8).catch((err) =>

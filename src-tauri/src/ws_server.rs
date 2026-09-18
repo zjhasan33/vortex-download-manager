@@ -20,11 +20,32 @@ pub fn ws_token(app: &AppHandle) -> String {
     let p = dir.join(".ws_token");
     if let Ok(t) = std::fs::read_to_string(&p) {
         let t = t.trim().to_string();
-        if !t.is_empty() { return t; }
+        if !t.is_empty() {
+            harden_token_file(&p);
+            return t;
+        }
     }
     let t = uuid::Uuid::new_v4().to_string();
-    let _ = std::fs::write(&p, &t);
+    if std::fs::write(&p, &t).is_ok() {
+        harden_token_file(&p);
+    }
     t
+}
+
+/// Best-effort owner-only permissions on the token file (defense in depth;
+/// the token is also dealt to frontend JS via get_ws_token by design).
+fn harden_token_file(p: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+    }
+    // Windows: %APPDATA% files already inherit user-private ACLs, and there
+    // is no ACL API without extra deps — nothing to do.
+    #[cfg(windows)]
+    {
+        let _ = p;
+    }
 }
 
 pub async fn run(app: AppHandle) {
@@ -44,9 +65,11 @@ pub async fn run(app: AppHandle) {
 }
 
 async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> std::io::Result<()> {
-    let (key, origin) = match handshake(&mut stream).await {
-        Ok(v) => v,
-        Err(_) => {
+    // Slowloris guard: the whole handshake must finish within 5 s, otherwise
+    // an idle connection parks a task + buffer forever.
+    let (key, origin) = match tokio::time::timeout(std::time::Duration::from_secs(5), handshake(&mut stream)).await {
+        Ok(Ok(v)) => v,
+        _ => {
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
             return Ok(());
         }
@@ -57,13 +80,10 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
     // For the initial handshake, the extension has no token yet; it uses "vortex-register".
     // After first connect, the desktop sends the token back and the extension must use it.
 
-    // ---- Origin enforcement: only allow chrome-extension:// and moz-extension:// ----
-    let origin_ok = origin.as_ref().map_or(false, |o| {
-        o.starts_with("chrome-extension://")
-            || o.starts_with("moz-extension://")
-            || o.starts_with("http://localhost")
-            || o.starts_with("http://127.0.0.1")
-    });
+    // ---- Origin enforcement: browser extensions + local pages only ----
+    // Parsed strictly (host-exact): the old prefix check accepted
+    // `http://localhost.evil.com`. The message-level token gate still applies.
+    let origin_ok = origin_allowed(origin.as_deref());
     if !origin_ok {
         let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
         return Ok(());
@@ -76,22 +96,51 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
     );
     stream.write_all(resp.as_bytes()).await?;
 
+    // Reader/writer split: one task owns the read half and dispatches each
+    // message to its own task; a single writer task owns the write half and
+    // sends replies FIFO. A slow `grab_site`/`analyze` no longer stalls
+    // ping/close/subsequent commands, and every reply still carries its `req`
+    // id so the extension routes it (out-of-order across reqs is fine).
+    let (mut rd, mut wr) = stream.into_split();
+    let (wtx, mut wrx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        while let Some((opcode, payload)) = wrx.recv().await {
+            if write_frame(&mut wr, opcode, &payload).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut frag: Vec<u8> = Vec::new();
+    // Fragmented-message bomb guard: continuation frames (fin=0) reassemble
+    // into `frag` — cap the running total (per-frame cap alone is bypassable).
+    const MAX_FRAG_TOTAL: usize = 5 * 1024 * 1024;
     let mut authenticated = false;
     loop {
-        let (fin, opcode, payload) = match read_frame(&mut stream).await {
+        let (fin, opcode, payload) = match read_frame(&mut rd).await {
             Ok(f) => f,
             Err(_) => break,
         };
+        // `send` fails only when the writer is gone (dead socket): stop.
+        macro_rules! emit {
+            ($op:expr, $bytes:expr) => {
+                if wtx.send(($op, $bytes)).is_err() {
+                    break;
+                }
+            };
+        }
         match opcode {
             0x8 => {
-                let _ = write_frame(&mut stream, 0x8, &payload).await;
+                emit!(0x8, payload);
                 break;
             }
             0x9 => {
-                let _ = write_frame(&mut stream, 0xA, &payload).await;
+                emit!(0xA, payload);
             }
             0x1 | 0x0 => {
+                if frag.len().saturating_add(payload.len()) > MAX_FRAG_TOTAL {
+                    break; // oversized fragmented message: drop the connection
+                }
                 frag.extend_from_slice(&payload);
                 if !fin {
                     continue;
@@ -106,12 +155,12 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
                             let msg_token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
                             if msg_token == token {
                                 authenticated = true;
-                                let _ = write_frame(&mut stream, 0x1, br#"{"type":"auth","ok":true}"#).await;
+                                emit!(0x1, br#"{"type":"auth","ok":true}"#.to_vec());
                                 continue;
                             }
                         }
                     }
-                    let _ = write_frame(&mut stream, 0x8, b"unauthorized").await;
+                    emit!(0x8, b"unauthorized".to_vec());
                     break;
                 }
 
@@ -134,17 +183,27 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream, token: String) -> st
                         if !req.is_empty() {
                             ack["req"] = json!(req);
                         }
-                        let _ = write_frame(&mut stream, 0x1, ack.to_string().as_bytes()).await;
+                        emit!(0x1, ack.to_string().into_bytes());
                     }
                 }
 
-                let reply = dispatch(&app, &text).await;
-                let _ = write_frame(&mut stream, 0x1, reply.as_bytes()).await;
+                // Heavy commands (grab_site/analyze) run detached: the read
+                // loop stays responsive and the reply still carries `req`.
+                let app2 = app.clone();
+                let wtx2 = wtx.clone();
+                tokio::spawn(async move {
+                    let reply = dispatch(&app2, &text).await;
+                    let _ = wtx2.send((0x1, reply.into_bytes()));
+                });
             }
             0x2 => { /* binary — ignore */ }
             _ => {}
         }
     }
+    drop(wtx);
+    // Flush queued replies (bounded wait so close stays prompt), then the
+    // split halves drop and the socket closes.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), writer).await;
     Ok(())
 }
 
@@ -191,14 +250,30 @@ async fn handshake(stream: &mut TcpStream) -> Result<(String, Option<String>), (
     Ok((key, origin))
 }
 
-fn accept_key(key: &str) -> String {
-    let mut h = Sha1::new();
+/// Strict origin check for the WS handshake: extension schemes (any id —
+/// the token gate authorizes) plus local dev pages with an EXACT host match.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(o) = origin else { return false };
+    if let Some(rest) = o
+        .strip_prefix("chrome-extension://")
+        .or_else(|| o.strip_prefix("moz-extension://"))
+    {
+        return !rest.is_empty();
+    }
+    if let Some(rest) = o.strip_prefix("http://") {
+        let host = rest.split(['/', ':']).next().unwrap_or("");
+        return host == "localhost" || host == "127.0.0.1";
+    }
+    false
+}
+
+fn accept_key(key: &str) -> String {    let mut h = Sha1::new();
     h.update(key.as_bytes());
     h.update(GUID.as_bytes());
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &h.finalize())
 }
 
-async fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
+async fn read_frame(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io::Result<(bool, u8, Vec<u8>)> {
     let a = stream.read_u8().await?;
     let b = stream.read_u8().await?;
     let fin = a & 0x80 != 0;
@@ -227,7 +302,7 @@ async fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8
     Ok((fin, opcode, payload))
 }
 
-async fn write_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+async fn write_frame(stream: &mut (impl tokio::io::AsyncWrite + Unpin), opcode: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut head = vec![0x80 | opcode];
     if payload.len() < 126 {
         head.push(payload.len() as u8);
@@ -312,8 +387,9 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let embed_subs = p["embed_subs"].as_bool();
                         let sub_langs = p["sub_langs"].as_str().map(|s| s.to_string());
                         let embed_thumbnail = p["embed_thumbnail"].as_bool();
+                        let auto_subs = p["auto_subs"].as_bool();
                         let sp = settings_path(app);
-                        start_ytdl(app, &mgr, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail).await
+                        start_ytdl(app, &mgr, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail, auto_subs).await
                     }
                 }
                 "resume" => {
@@ -432,7 +508,7 @@ async fn download_op(app: &AppHandle, mgr: &Arc<DlManager>, p: &Value) -> String
             .or_else(|| info.formats.iter().find(|f| f.has_video && f.has_audio))
             .or_else(|| info.formats.iter().find(|f| f.has_video));
         let Some(fmt) = fmt else { return err("no suitable format") };
-        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None, None, None, None).await;
+        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None, None, None, None, None).await;
     }
     let opts = download::StartOpts {
         segments,
@@ -473,6 +549,7 @@ async fn start_ytdl(
     embed_subs: Option<bool>,
     sub_langs: Option<String>,
     embed_thumbnail: Option<bool>,
+    auto_subs: Option<bool>,
 ) -> String {
     let settings = crate::state::load_settings(app);
     let embed = embed_subs.unwrap_or(settings.embed_subs);
@@ -491,6 +568,7 @@ async fn start_ytdl(
         embed,
         langs,
         embed_thumb,
+        auto_subs.unwrap_or(false),
     )
     .await
     {

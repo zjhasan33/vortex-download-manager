@@ -13,6 +13,8 @@ use crate::download::{self, DlStatus, DlView};
 pub struct DlManager {
     pub http: Mutex<HashMap<String, Arc<crate::download::Task>>>,
     pub yt: Mutex<HashMap<String, Arc<crate::ytdlp::YtTask>>>,
+    /// Native torrent tasks (Phase 2) — shown in the same list as HTTP/YouTube.
+    pub torrents: Mutex<HashMap<String, Arc<crate::torrent::TorrentTask>>>,
     pub limit: Arc<AtomicU64>,
     /// Concurrency gate state.
     pub max_active: AtomicUsize,
@@ -35,6 +37,7 @@ impl DlManager {
         DlManager {
             http: Mutex::new(HashMap::new()),
             yt: Mutex::new(HashMap::new()),
+            torrents: Mutex::new(HashMap::new()),
             limit: Arc::new(AtomicU64::new(0)),
             max_active: AtomicUsize::new(5),
             active: AtomicUsize::new(0),
@@ -68,23 +71,51 @@ impl DlManager {
     }
 
     /// Remove a task, optionally also deleting its finished file from disk.
+    /// With `delete_file`, multi-file jobs (playlists, subtitles) wipe every
+    /// produced file, and an emptied playlist sub-folder shell goes too.
+    /// Every caller funnels here, so no path can leak files anymore.
     pub fn remove_with_file(&self, id: &str, delete_file: bool) {
         if delete_file {
             let mut paths: Vec<PathBuf> = Vec::new();
+            // Playlist shell to remove afterwards (only when left empty).
+            let mut playlist_dir: Option<PathBuf> = None;
             if let Some(t) = self.http.lock().unwrap().get(id) {
                 paths.push(t.save_path.clone());
             }
             if let Some(t) = self.yt.lock().unwrap().get(id) {
-                paths.push(t.save_path.lock().unwrap().clone());
+                let tp = t.save_path.lock().unwrap().clone();
+                for p in t.produced.lock().unwrap().iter() {
+                    paths.push(p.clone());
+                }
+                if tp.is_dir() {
+                    // Never touch the user's base download dir itself — only a
+                    // real yt-dlp sub-folder left behind by a playlist job.
+                    let base = t.save_base.lock().unwrap().clone();
+                    if tp != base {
+                        playlist_dir = Some(tp);
+                    }
+                } else {
+                    paths.push(tp);
+                }
             }
             for h in self.history.lock().unwrap().iter() {
                 if h.id == id {
                     paths.push(PathBuf::from(&h.save_path));
+                    for p in &h.produced {
+                        paths.push(PathBuf::from(p));
+                    }
                 }
             }
-            for p in paths {
+            for p in &paths {
                 if p.is_file() {
-                    let _ = std::fs::remove_file(&p);
+                    let _ = std::fs::remove_file(p);
+                }
+                cleanup_parts_for(p);
+            }
+            if let Some(dir) = playlist_dir {
+                let empty = std::fs::read_dir(&dir).map(|mut e| e.next().is_none()).unwrap_or(false);
+                if empty {
+                    let _ = std::fs::remove_dir(&dir);
                 }
             }
         }
@@ -92,14 +123,19 @@ impl DlManager {
     }
 
     pub fn views(&self) -> Vec<DlView> {
+        // Poison-tolerant: one panicked holder must never cascade-crash every
+        // list/stats command afterwards; recover with the guarded data.
         let mut v: Vec<DlView> = Vec::new();
-        for t in self.http.lock().unwrap().values() {
+        for t in self.http.lock().unwrap_or_else(|e| e.into_inner()).values() {
             v.push(t.view());
         }
-        for t in self.yt.lock().unwrap().values() {
+        for t in self.yt.lock().unwrap_or_else(|e| e.into_inner()).values() {
             v.push(t.view());
         }
-        for h in self.history.lock().unwrap().iter() {
+        for t in self.torrents.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            v.push(t.view());
+        }
+        for h in self.history.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             v.push(h.clone());
         }
         v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -115,7 +151,10 @@ impl DlManager {
         let mut segments = 0u64;
         let mut connections = 0u64;
         for v in self.views() {
-            if v.status == DlStatus::Downloading || v.status == DlStatus::Merging {
+            if v.status == DlStatus::Downloading
+                || v.status == DlStatus::Merging
+                || v.status == DlStatus::Resolving
+            {
                 total_speed += v.speed;
                 active += 1;
                 segments += v.segments as u64;
@@ -196,7 +235,7 @@ impl DlManager {
         self.views().iter().any(|v| {
             matches!(
                 v.status,
-                DlStatus::Downloading | DlStatus::Merging | DlStatus::Queued
+                DlStatus::Downloading | DlStatus::Merging | DlStatus::Queued | DlStatus::Resolving
             )
         })
     }
@@ -279,7 +318,7 @@ impl DlManager {
         let active = |st: DlStatus| {
             matches!(
                 st,
-                DlStatus::Downloading | DlStatus::Queued | DlStatus::Merging
+                DlStatus::Downloading | DlStatus::Queued | DlStatus::Merging | DlStatus::Resolving
             )
         };
         let mut ids: Vec<String> = Vec::new();
@@ -376,6 +415,27 @@ impl DlManager {
     }
 }
 
+/// Delete `*.vtx.part` segment siblings of a finished file path.
+pub(crate) fn cleanup_parts_for(save_path: &std::path::Path) {
+    let dir = match save_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => return,
+    };
+    let base = match save_path.file_name() {
+        Some(b) => b.to_string_lossy().into_owned(),
+        None => return,
+    };
+    let prefix = format!("{base}.");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && name.ends_with(".vtx.part") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 // ---------------- Settings ----------------
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -385,6 +445,9 @@ pub struct Settings {
     pub segments: usize,
     pub speed_limit: u64,
     pub notifications: bool,
+    /// Play chimes on completion / error / batch-finish (Settings toggle).
+    #[serde(default = "default_true")]
+    pub sounds: bool,
     pub auto_start: bool,
     pub delete_part: bool,
     pub categorize_folders: bool,
@@ -410,18 +473,81 @@ pub struct Settings {
     /// Saved site logins used to auto-authenticate HTTP downloads (Basic/Digest).
     #[serde(default)]
     pub credentials: Vec<crate::auth::Cred>,
+    /// Per-site proxy overrides, first enabled match wins. Empty = global only.
+    #[serde(default)]
+    pub per_site_proxies: Vec<PerSiteProxyRule>,
+}
+
+/// One per-site proxy override: route a domain (or wildcard) through its own
+/// proxy, or "DIRECT" to bypass the global proxy for it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PerSiteProxyRule {
+    pub id: String,
+    pub domain_pattern: String,
+    pub proxy_url: String,
+    pub enabled: bool,
+}
+
+impl Default for PerSiteProxyRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            domain_pattern: String::new(),
+            proxy_url: String::new(),
+            enabled: true,
+        }
+    }
+}
+
+/// Resolve the effective proxy for `url`: first enabled matching rule wins;
+/// "DIRECT" (any case) bypasses the global proxy; no match → global.
+/// Returns the proxy URL to use, or "" for direct.
+pub fn proxy_for_url(rules: &[PerSiteProxyRule], global_proxy: &str, url: &str) -> String {
+    let host = crate::auth::host_of(url).to_lowercase();
+    // Strip a trailing :port for matching (patterns are bare domains).
+    // Bracketed IPv6 literals ([::1]:8080) are left intact.
+    let host_bare: &str = if host.starts_with('[') {
+        &host
+    } else {
+        host.split(':').next().unwrap_or(&host)
+    };
+    for r in rules {
+        if !r.enabled {
+            continue;
+        }
+        let pat = r.domain_pattern.trim().to_lowercase();
+        if pat.is_empty() {
+            continue;
+        }
+        let hit = if let Some(suffix) = pat.strip_prefix("*.") {
+            !suffix.is_empty()
+                && (host_bare == suffix || host_bare.ends_with(&format!(".{suffix}")))
+        } else {
+            host_bare == pat
+        };
+        if hit {
+            return if r.proxy_url.trim().eq_ignore_ascii_case("direct") {
+                String::new()
+            } else {
+                r.proxy_url.trim().to_string()
+            };
+        }
+    }
+    global_proxy.trim().to_string()
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             path: default_download_dir(),
-            // Benchmarked default (100 MB CDN: 8 conns ≈ 2.5 MB/s, 16 ≈ 3.0,
-            // 32 ≈ 3.8 on a per-connection-throttled mirror): 16 saturates
-            // throttled servers without the overhead of 32 part files.
-            segments: 16,
+            // Start at 8; the adaptive scaler in monitor_task grows toward 32
+            // while per-connection throttling leaves bandwidth on the table
+            // (benchmarked: 8 ≈ 2.5 MB/s, 32 ≈ 3.8 MB/s on a throttled mirror).
+            segments: 8,
             speed_limit: 0,
             notifications: true,
+            sounds: true,
             auto_start: false,
             delete_part: true,
             categorize_folders: true,
@@ -435,11 +561,18 @@ impl Default for Settings {
             show_dropbox: false,
             clipboard_monitor: false,
             embed_subs: true,
-            sub_langs: "en".into(),
+            sub_langs: "all".into(),
             embed_thumbnail: true,
             credentials: Vec::new(),
+            per_site_proxies: Vec::new(),
         }
     }
+}
+
+/// Serde default for opt-in-true flags: old settings.json files without the
+/// key must keep the feature ON (plain `bool` would default to false).
+fn default_true() -> bool {
+    true
 }
 
 fn default_download_dir() -> String {
@@ -496,22 +629,22 @@ pub fn open_in_folder(path: &str) {
     });
 }
 
-pub fn open_file(path: String) {
+pub fn open_file(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err("File not found on disk".into());
+    }
+    let owned = path.clone();
     thread::spawn(move || {
-        // Avoid shell injection: use ShellExecute via `start` with properly quoted path
-        // or directly use `cmd /c start "" "path"` with quoting.
-        // We validate the path exists and quote it to prevent & | > injection.
-        let p = std::path::Path::new(&path);
-        if !p.exists() {
-            return;
-        }
-        let quoted = format!("\"{}\"", path.replace('"', "\"\""));
-        let _ = crate::tools::silent(std::process::Command::new("cmd"))
-            .args(["/c", "start", "", &quoted])
+        // `cmd /c start` mangles non-ASCII paths (emoji etc.) through the
+        // console codepage and `url.dll,FileProtocolHandler` chokes on them
+        // too (verified live). explorer.exe is the shell itself: wide args,
+        // no quoting pitfalls, opens with the default app (Play for media).
+        let _ = crate::tools::silent(std::process::Command::new("explorer.exe"))
+            .arg(&owned)
             .spawn();
-        // Fallback: try direct open via explorer if cmd fails
-        // (explorer handles paths without shell interpretation)
     });
+    Ok(())
 }
 
 // ---------------- Folder categorization ----------------
@@ -848,10 +981,11 @@ const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
 /// Background loop: block system sleep while busy, release when idle.
 pub fn sleep_block_loop(mgr: Arc<DlManager>) {
     std::thread::spawn(move || loop {
-        let busy = mgr
-            .views()
-            .iter()
-            .any(|v| v.status == DlStatus::Downloading || v.status == DlStatus::Merging);
+        let busy = mgr.views().iter().any(|v| {
+            v.status == DlStatus::Downloading
+                || v.status == DlStatus::Merging
+                || v.status == DlStatus::Resolving
+        });
         #[cfg(windows)]
         unsafe {
             SetThreadExecutionState(if busy { ES_CONTINUOUS | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS });
@@ -873,6 +1007,7 @@ pub fn completion_watch_loop(app: AppHandle, mgr: Arc<DlManager>) {
                 v.status == DlStatus::Downloading
                     || v.status == DlStatus::Merging
                     || v.status == DlStatus::Queued
+                    || v.status == DlStatus::Resolving
             });
             let hl = mgr.history.lock().unwrap().len();
             if busy || hl > hist_len {
@@ -917,6 +1052,7 @@ pub fn completion_watch_loop(app: AppHandle, mgr: Arc<DlManager>) {
                     }
                     "exit" => {
                         notify_done(&app, "All downloads complete", "Closing Vortex");
+                        persist_history(&app, &mgr);
                         app.exit(0);
                     }
                     _ => {}
@@ -924,4 +1060,53 @@ pub fn completion_watch_loop(app: AppHandle, mgr: Arc<DlManager>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    fn rule(pattern: &str, proxy: &str, enabled: bool) -> PerSiteProxyRule {
+        PerSiteProxyRule {
+            id: "t".into(),
+            domain_pattern: pattern.into(),
+            proxy_url: proxy.into(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn proxy_for_url_matching() {
+        let rules = vec![
+            rule("github.com", "http://127.0.0.1:8080", true),
+            rule("*.example.com", "socks5://127.0.0.1:1080", true),
+            rule("blocked.test", "DIRECT", true),
+            rule("off.test", "http://127.0.0.1:9999", false),
+        ];
+        // exact
+        assert_eq!(
+            proxy_for_url(&rules, "", "https://github.com/a/b.zip"),
+            "http://127.0.0.1:8080"
+        );
+        // wildcard: sub + apex
+        assert_eq!(
+            proxy_for_url(&rules, "", "https://a.b.example.com/f"),
+            "socks5://127.0.0.1:1080"
+        );
+        assert_eq!(
+            proxy_for_url(&rules, "", "https://example.com/f"),
+            "socks5://127.0.0.1:1080"
+        );
+        // lookalike must NOT match wildcard
+        assert_eq!(proxy_for_url(&rules, "http://g:1", "https://notexample.com/f"), "http://g:1");
+        // DIRECT bypasses global
+        assert_eq!(proxy_for_url(&rules, "http://g:1", "https://blocked.test/f"), "");
+        assert_eq!(proxy_for_url(&rules, "http://g:1", "https://BLOCKED.test:8080/f"), "");
+        // disabled rule ignored → global
+        assert_eq!(proxy_for_url(&rules, "http://g:1", "https://off.test/f"), "http://g:1");
+        // no match → global / direct
+        assert_eq!(proxy_for_url(&rules, "http://g:1", "https://other.io/f"), "http://g:1");
+        assert_eq!(proxy_for_url(&rules, "", "https://other.io/f"), "");
+        assert_eq!(proxy_for_url(&[], "  http://g:1  ", "https://other.io/f"), "http://g:1");
+    }
 }

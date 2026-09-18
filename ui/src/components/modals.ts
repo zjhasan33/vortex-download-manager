@@ -1,5 +1,6 @@
 import { openModal, toast } from "../lib/ui";
 import { icon } from "../lib/icons";
+import { formatBytes } from "../lib/format";
 import { api, store } from "../lib/api";
 import { syncDropbox } from "../lib/dropbox";
 import type { Settings, GrabItem } from "../types";
@@ -75,23 +76,47 @@ export function openAddUrl() {
         if (p) pathInp.value = p;
       };
       root.querySelector<HTMLButtonElement>("#au-import")!.onclick = async () => {
-        const urls = await api.readUrls();
-        if (!urls.length) return toast("No URLs found", "err");
-        for (const u of urls) {
-          await api.startDownload(
-            u,
-            pathInp.value.trim() || store.settings?.path || "",
-            Number(segInp.value),
-            undefined,
-          );
+        try {
+          const urls = await api.readUrls();
+          if (!urls.length) return toast("No URLs found", "err");
+          let n = 0;
+          for (const u of urls) {
+            try {
+              await api.startDownload(
+                u,
+                pathInp.value.trim() || store.settings?.path || "",
+                Number(segInp.value),
+                undefined,
+              );
+              n++;
+            } catch (e: unknown) {
+              toast(`Skipped ${u}: ${String(e)}`, "err");
+            }
+          }
+          toast(`${n}/${urls.length} download(s) queued`, n ? "ok" : "err");
+        } catch (e: unknown) {
+          toast("Import failed: " + String(e), "err");
         }
-        toast(`${urls.length} download(s) queued`, "ok");
         close();
       };
 
       const go = async () => {
         const url = urlInp.value.trim();
         if (!url) return (urlInp.style.borderColor = "var(--bad)");
+        // Torrents are not supported in this version: magnet links and
+        // .torrent files are rejected here instead of opening the P2P flow.
+        if (/^magnet:/i.test(url)) {
+          toast("Torrent downloads are not supported in this version", "err");
+          return;
+        }
+        if (/\.torrent$/i.test(url) && !/^https?:/i.test(url)) {
+          toast("Torrent downloads are not supported in this version", "err");
+          return;
+        }
+        if (/^https?:.*\.torrent([?#]|$)/i.test(url)) {
+          toast("Torrent downloads are not supported in this version", "err");
+          return;
+        }
         const fn = nameInp.value.trim() || url.split("/").pop() || `download_${Date.now()}`;
         const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
         try {
@@ -159,6 +184,15 @@ export function openSettings() {
         </div>
       </div>
       <div class="field">
+        <label>Per-site proxy rules (first match wins; "DIRECT" bypasses global)</label>
+        <div id="st-proxies" style="display:flex;flex-direction:column;gap:6px"></div>
+        <div style="display:flex;gap:8px;padding-top:8px">
+          <input class="input" id="st-px-domain" placeholder="github.com or *.example.com" spellcheck="false" style="flex:1" />
+          <input class="input" id="st-px-url" placeholder="http://127.0.0.1:8080 / socks5://… / DIRECT" spellcheck="false" style="flex:1" />
+          <button class="tbtn" id="st-px-add">Add</button>
+        </div>
+      </div>
+      <div class="field">
         <label>YouTube cookies (optional)</label>
         <div style="display:flex;gap:8px;align-items:center">
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer;white-space:nowrap">
@@ -205,6 +239,9 @@ export function openSettings() {
             <input type="checkbox" id="st-notif" ${s.notifications ? "checked" : ""} /> Notify on completion
           </label>
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="st-sounds" ${s.sounds ?? true ? "checked" : ""} /> Notification sounds (completion / error chime)
+          </label>
+          <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
             <input type="checkbox" id="st-cat" ${s.categorize_folders ? "checked" : ""} /> Sort into folders by type (Videos / Audio / etc.)
           </label>
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
@@ -225,10 +262,10 @@ export function openSettings() {
             <input type="checkbox" id="st-embed" ${s.embed_subs ? "checked" : ""} /> Embed official subtitles into video downloads
           </label>
           <span style="font-size:12.5px;color:var(--text-2)">Language(s)</span>
-          <input class="input" id="st-sublangs" value="${escapeAttr(s.sub_langs)}" placeholder="en" style="width:130px" spellcheck="false" />
+          <input class="input" id="st-sublangs" value="${escapeAttr(s.sub_langs)}" placeholder="all" style="width:130px" spellcheck="false" />
         </div>
         <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          ON = only manual/official subtitles are embedded (auto-generated captions are never used). OFF = video downloads with no subtitles at all. Down arrow <b>▾ Subs</b> in the extension downloads a standalone .srt/.vtt into the Subtitles folder.
+          <b>all</b> = automatically embed any official language available (e.g. English, Bengali, Hindi). Use comma-separated codes like <b>en, bn</b> to restrict. ON = only manual/official subtitles are embedded (auto-generated captions are never used). OFF = video downloads with no subtitles at all. Down arrow <b>▾ Subs</b> in the extension downloads a standalone .srt/.vtt into the Subtitles folder.
         </div>
       </div>
       <div class="field">
@@ -304,6 +341,57 @@ export function openSettings() {
         });
       });
 
+      // Per-site proxy rules: working copy edited live, persisted on Save.
+      type PxRule = { id: string; domain_pattern: string; proxy_url: string; enabled: boolean };
+      let pxRules: PxRule[] = (s.per_site_proxies || []).map((r) => ({ ...r }));
+      const pxBox = root.querySelector<HTMLElement>("#st-proxies")!;
+      const renderPx = () => {
+        pxBox.innerHTML = pxRules.length
+          ? pxRules
+              .map(
+                (r) => `
+            <div style="display:flex;align-items:center;gap:8px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);border-radius:7px;padding:6px 8px">
+              <input type="checkbox" data-px-on="${r.id}" ${r.enabled ? "checked" : ""} title="Enabled" style="flex:none" />
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--text-1)" title="${escapeAttr(r.domain_pattern)}">${escapeAttr(r.domain_pattern)}</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-3)" title="${escapeAttr(r.proxy_url)}">${escapeAttr(r.proxy_url)}</span>
+              <button class="tbtn" data-px-del="${r.id}" title="Delete rule">${icon("close", 12)}</button>
+            </div>`,
+              )
+              .join("")
+          : '<span style="font-size:11.5px;color:var(--text-3)">No rules — everything uses the global proxy.</span>';
+        pxBox.querySelectorAll<HTMLInputElement>("[data-px-on]").forEach((c) => {
+          c.onchange = () => {
+            const rule = pxRules.find((x) => x.id === c.dataset.pxOn);
+            if (rule) rule.enabled = c.checked;
+          };
+        });
+        pxBox.querySelectorAll<HTMLElement>("[data-px-del]").forEach((b) => {
+          b.onclick = () => {
+            pxRules = pxRules.filter((x) => x.id !== b.dataset.pxDel);
+            renderPx();
+          };
+        });
+      };
+      renderPx();
+      root.querySelector<HTMLButtonElement>("#st-px-add")!.onclick = () => {
+        const dom = root.querySelector<HTMLInputElement>("#st-px-domain")!.value.trim();
+        const url = root.querySelector<HTMLInputElement>("#st-px-url")!.value.trim();
+        if (!dom) return toast("Enter a domain pattern", "err");
+        if (!url) return toast("Enter a proxy URL or DIRECT", "err");
+        const low = url.toLowerCase();
+        const okUrl =
+          low === "direct" ||
+          low.startsWith("http://") ||
+          low.startsWith("https://") ||
+          low.startsWith("socks5://") ||
+          low.startsWith("socks5h://");
+        if (!okUrl) return toast("Proxy must be http(s)://, socks5(h):// or DIRECT", "err");
+        pxRules.push({ id: `px_${Date.now()}`, domain_pattern: dom, proxy_url: url, enabled: true });
+        root.querySelector<HTMLInputElement>("#st-px-domain")!.value = "";
+        root.querySelector<HTMLInputElement>("#st-px-url")!.value = "";
+        renderPx();
+      };
+
       // Tools & Dependencies: status + update
       const toolsEl = root.querySelector<HTMLElement>("#st-tools")!;
       const renderTools = () => {
@@ -365,19 +453,21 @@ export function openSettings() {
           segments: Number(seg.value),
           speed_limit: Math.max(0, Number(root.querySelector<HTMLInputElement>("#st-limit")!.value) * 1024),
           notifications: root.querySelector<HTMLInputElement>("#st-notif")!.checked,
+          sounds: root.querySelector<HTMLInputElement>("#st-sounds")!.checked,
           auto_start: root.querySelector<HTMLInputElement>("#st-autostart")!.checked,
           categorize_folders: root.querySelector<HTMLInputElement>("#st-cat")!.checked,
           delete_part: s.delete_part,
           max_active: Math.max(1, Number(root.querySelector<HTMLInputElement>("#st-maxact")!.value) || 5),
           auto_retries: Math.max(0, Number(root.querySelector<HTMLInputElement>("#st-retries")!.value) || 0),
           proxy: root.querySelector<HTMLInputElement>("#st-proxy")!.value.trim(),
+          per_site_proxies: pxRules,
           use_cookies: root.querySelector<HTMLInputElement>("#st-cookies")!.checked,
           cookies: ckPath.value.trim(),
           on_complete: root.querySelector<HTMLSelectElement>("#st-oncomplete")!.value,
           show_dropbox: root.querySelector<HTMLInputElement>("#st-dropbox")!.checked,
           clipboard_monitor: root.querySelector<HTMLInputElement>("#st-clip")!.checked,
           embed_subs: root.querySelector<HTMLInputElement>("#st-embed")!.checked,
-          sub_langs: root.querySelector<HTMLInputElement>("#st-sublangs")!.value.trim() || "en",
+          sub_langs: root.querySelector<HTMLInputElement>("#st-sublangs")!.value.trim() || "all",
           embed_thumbnail: root.querySelector<HTMLInputElement>("#st-thumb")!.checked,
           credentials: s.credentials || [],
           stop_at: (() => {
@@ -385,11 +475,15 @@ export function openSettings() {
             return v ? new Date(v).getTime() || null : null;
           })(),
         };
-        await api.saveSettings(next);
-        store.settings = next;
-        void syncDropbox(next.show_dropbox);
-        toast("Settings saved", "ok");
-        close();
+        try {
+          await api.saveSettings(next);
+          store.settings = next;
+          void syncDropbox(next.show_dropbox).catch((e) => console.error("[dropbox sync]", e));
+          toast("Settings saved", "ok");
+          close();
+        } catch (e: unknown) {
+          toast("Save failed: " + String(e), "err");
+        }
       };
     },
   );

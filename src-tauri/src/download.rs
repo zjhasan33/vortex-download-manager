@@ -168,6 +168,8 @@ pub enum DlStatus {
     Cancelled,
     /// Waiting for the user to supply login credentials (HTTP 401/407).
     NeedsAuth,
+    /// Torrent magnet resolving metadata over DHT (auto-flips to Downloading).
+    Resolving,
 }
 
 impl DlStatus {
@@ -181,6 +183,7 @@ impl DlStatus {
             Self::Error => "error",
             Self::Cancelled => "cancelled",
             Self::NeedsAuth => "needs_auth",
+            Self::Resolving => "resolving",
         }
     }
 }
@@ -212,6 +215,10 @@ pub struct DlView {
     pub completed_at: Option<u64>,
     #[serde(default)]
     pub format_id: Option<String>,
+    /// Final on-disk output files (multi-file jobs: playlists, subtitles).
+    /// Used by remove-with-delete; empty for single-file downloads.
+    #[serde(default)]
+    pub produced: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -244,7 +251,7 @@ pub struct StartOpts {
 
 impl Default for StartOpts {
     fn default() -> Self {
-        Self::new(16)
+        Self::new(8)
     }
 }
 
@@ -295,7 +302,9 @@ pub struct Task {
     pub done: AtomicU64,
     pub num_segments: usize,
     /// Max simultaneous connections (segments are split into smaller chunks than this).
-    pub max_conns: usize,
+    /// Atomic: the adaptive scaler in `monitor_task` grows this 8 → 32 while
+    /// throttled; `run()` picks up the new value every worker round.
+    pub max_conns: AtomicUsize,
     /// Number of worker connections currently running (real-time, for stats).
     pub live: AtomicUsize,
     pub status: RwLock<DlStatus>,
@@ -522,7 +531,7 @@ fn parse_total(resp: &reqwest::Response) -> u64 {
 
 impl Task {
     pub fn view(&self) -> DlView {
-        let status = *self.status.read().unwrap();
+        let status = *self.status.read().unwrap_or_else(|e| e.into_inner());
         let total = self.total.load(Ordering::Relaxed);
         let done = self.done.load(Ordering::Relaxed);
         let speed = self.peek_speed();
@@ -543,18 +552,23 @@ impl Task {
             connections: self.connections(),
             live: self.live.load(Ordering::Relaxed),
             status,
-            error: self.error.lock().unwrap().clone(),
+            error: self.error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             thumbnail: self.thumbnail.clone(),
             source: self.source.clone(),
             save_path: self.save_path.display().to_string(),
             created_at: self.created_at,
-            completed_at: *self.completed_at.lock().unwrap(),
+            completed_at: *self.completed_at.lock().unwrap_or_else(|e| e.into_inner()),
             format_id: None,
+            produced: Vec::new(),
         }
     }
 
     fn connections(&self) -> usize {
-        if self.source == "youtube" { 1 } else { self.max_conns.max(1) }
+        if self.source == "youtube" {
+            1
+        } else {
+            self.max_conns.load(Ordering::Relaxed).max(1)
+        }
     }
 
     fn peek_speed(&self) -> u64 {
@@ -565,7 +579,9 @@ impl Task {
         let (t0, b0) = *h.front().unwrap();
         let (t1, b1) = *h.back().unwrap();
         let dt = t1.duration_since(t0).as_secs_f64().max(0.05);
-        ((b1 - b0) as f64 / dt) as u64
+        // `done` can move backwards on straggler truncate: saturate instead
+        // of wrapping to a gigantic fake speed.
+        (b1.saturating_sub(b0) as f64 / dt) as u64
     }
 
     fn push_history(&self) {
@@ -623,15 +639,18 @@ pub async fn start(
     let base = PathBuf::from(save_path.trim());
     let mut url = url;
 
+    let settings = crate::state::load_settings(&app);
+    // Per-site proxy override wins over the global proxy for this URL
+    // ("DIRECT" bypasses it); no match → global proxy (or direct).
+    let eff_proxy = crate::state::proxy_for_url(&settings.per_site_proxies, &opts.proxy, &url);
     let extra = opts.extra_headers();
     let mut client = if extra.is_empty() {
-        build_client(&opts.proxy)?
+        build_client(&eff_proxy)?
     } else {
-        build_client_with_headers(&opts.proxy, &extra)?
+        build_client_with_headers(&eff_proxy, &extra)?
     };
 
     // Auto-login with any credential already saved for this host (Basic/Digest).
-    let settings = crate::state::load_settings(&app);
     let mut auth = auth::find_cred(&settings.credentials, &url).map(|cred| AuthCtx {
         hdr: auth::basic_auth_value(&cred.username, &cred.password),
         cred,
@@ -648,9 +667,9 @@ pub async fn start(
             // with a neutral tool UA like IDM/wget do.
             log_net_err(&e, "probe redirect-loop; retrying with tool UA");
             client = if extra.is_empty() {
-                build_tool_client(&opts.proxy)?
+                build_tool_client(&eff_proxy)?
             } else {
-                build_tool_client_with_headers(&opts.proxy, &extra)?
+                build_tool_client_with_headers(&eff_proxy, &extra)?
             };
             let (p, a) = send_authorized(&client, &url, Some("bytes=0-0"), &mut auth)
                 .await
@@ -686,6 +705,13 @@ pub async fn start(
 
     let got_206 = probe.status() == StatusCode::PARTIAL_CONTENT;
     let total = parse_total(&probe);
+    // Absurd Content-Length (e.g. spoofed u64::MAX) would wrap segment math
+    // and preallocate exabytes: refuse early with a clean error instead of
+    // OOMing. 1 TiB is far above any legitimate single file.
+    const MAX_DOWNLOAD_BYTES: u64 = 1 << 40;
+    if total > MAX_DOWNLOAD_BYTES {
+        return Err(format!("Server claims an absurd file size ({total} bytes) — refused"));
+    }
 
     // Some servers reply 200 to `bytes=0-0` but still honour real ranges; re-probe once.
     let mut ranged = got_206;
@@ -749,7 +775,7 @@ pub async fn start(
         claimed: Mutex::new(vec![false; num_segments]),
         split_at: Mutex::new(vec![u64::MAX; num_segments]),
         num_segments,
-        max_conns,
+        max_conns: AtomicUsize::new(max_conns),
         live: AtomicUsize::new(0),
         status: RwLock::new(DlStatus::Queued),
         error: Mutex::new(None),
@@ -804,7 +830,7 @@ pub fn restore(
         total: AtomicU64::new(view.total_size),
         done: AtomicU64::new(view.downloaded),
         num_segments,
-        max_conns: view.connections.clamp(1, 32),
+        max_conns: AtomicUsize::new(view.connections.clamp(1, 32)),
         live: AtomicUsize::new(0),
         status: RwLock::new(status),
         error: Mutex::new(view.error.clone()),
@@ -882,8 +908,9 @@ pub async fn run(task: Arc<Task>) {
 
         // Spin up to `max_conns` workers; each one pulls the next available chunk
         // until none are left, so fast connections take over slow connections' work.
+        // (Reloaded every round: the adaptive scaler may have grown it.)
         let mut workers = Vec::new();
-        for _ in 0..task.max_conns {
+        for _ in 0..task.max_conns.load(Ordering::Relaxed).max(1) {
             if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
                 break;
             }
@@ -914,7 +941,7 @@ pub async fn run(task: Arc<Task>) {
         }
 
         if all_chunks_done(&task) {
-            finalize(&task);
+            finalize(&task).await;
             break;
         }
 
@@ -1123,7 +1150,21 @@ fn all_chunks_done(task: &Task) -> bool {
     (0..segs.len()).all(|i| segment_done(task, &segs[i], i))
 }
 
-fn finalize(task: &Arc<Task>) {
+async fn finalize(task: &Arc<Task>) {
+    // Multi-GB merges must never run on a Tokio worker: hand the whole
+    // blocking pass to the blocking pool.
+    let t = task.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        finalize_blocking(&t);
+    })
+    .await;
+    if r.is_err() {
+        task.set_error("Merge task failed");
+        task.set_status(DlStatus::Error);
+    }
+}
+
+fn finalize_blocking(task: &Arc<Task>) {
     task.set_status(DlStatus::Merging);
     let mut parts: Vec<PathBuf> = {
         let mut segs = task.segments.lock().unwrap().clone();
@@ -1237,7 +1278,8 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
     }
 
     let limit = task.limit.load(Ordering::Relaxed);
-    let per_conn = if limit > 0 { limit / task.max_conns.max(1) as u64 } else { 0 };
+    let max_conns = task.max_conns.load(Ordering::Relaxed).max(1) as u64;
+    let per_conn = if limit > 0 { limit / max_conns } else { 0 };
 
     let std_file = match OpenOptions::new().create(true).append(true).open(&seg.part) {
         Ok(f) => f,
@@ -1459,11 +1501,34 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
     true
 }
 
+/// Smart-adaptive scaling decision (pure, unit-tested): grow while the last
+/// window kept up with the previous one (server still has headroom), never
+/// past 32 connections, and only when enough bytes remain to be worth the
+/// extra part files.
+fn should_grow(prev_bps: f64, recent_bps: f64, max_conns: usize, remaining: u64) -> bool {
+    if max_conns >= 32 || remaining < 32 * 1024 * 1024 {
+        return false;
+    }
+    if prev_bps <= 0.0 {
+        return recent_bps > 0.0;
+    }
+    recent_bps >= prev_bps * 0.9
+}
+
 async fn monitor_task(task: Arc<Task>) {
     let mut last = Instant::now();
     let mut last_done = task.done.load(Ordering::Relaxed);
+    // IPC throttle: emit at most every 250 ms, and only when bytes moved
+    // (plus a 1 s heartbeat so a stalled ETA still refreshes). This caps IPC
+    // at 4/s and frees the CPU for network + disk I/O on fast links.
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut sent_done = u64::MAX;
+    // Adaptive windows: 20 ticks x 250 ms = 5 s per evaluation.
+    let mut win_bytes = 0u64;
+    let mut win_ticks = 0u32;
+    let mut prev_bps = 0.0f64;
     loop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let now = task.done.load(Ordering::Relaxed);
         let t = Instant::now();
         {
@@ -1473,26 +1538,47 @@ async fn monitor_task(task: Arc<Task>) {
                 h.pop_front();
             }
         }
-        let dt = t.duration_since(last).as_secs_f64().max(0.2);
-        let speed = ((now.saturating_sub(last_done)) as f64 / dt) as u64;
+        let dt = t.duration_since(last).as_secs_f64().max(0.05);
+        let tick_bytes = now.saturating_sub(last_done);
+        let speed = (tick_bytes as f64 / dt) as u64;
         last = t;
         last_done = now;
         let total = task.total.load(Ordering::Relaxed);
         let progress = if total > 0 { (now as f64 / total as f64) * 100.0 } else { 0.0 };
         let eta = if speed > 0 && total > now { (total - now) / speed } else { 0 };
-        let _ = task.app.emit(
-            "download-progress",
-            serde_json::json!({
-                "id": task.id,
-                "downloaded": now,
-                "total_size": total,
-                "speed": speed,
-                "progress": progress.min(100.0),
-                "eta": eta,
-                "segments": task.num_segments,
-                "connections": task.live.load(Ordering::Relaxed),
-            }),
-        );
+        if now != sent_done || last_emit.elapsed() >= Duration::from_secs(1) {
+            last_emit = Instant::now();
+            sent_done = now;
+            let _ = task.app.emit(
+                "download-progress",
+                serde_json::json!({
+                    "id": task.id,
+                    "downloaded": now,
+                    "total_size": total,
+                    "speed": speed,
+                    "progress": progress.min(100.0),
+                    "eta": eta,
+                    "segments": task.num_segments,
+                    "connections": task.live.load(Ordering::Relaxed),
+                }),
+            );
+        }
+
+        // Adaptive scaling: additive increase (+4 / 5 s) while throughput
+        // holds — the classic sign of per-connection throttling.
+        win_bytes += tick_bytes;
+        win_ticks += 1;
+        if win_ticks >= 20 {
+            let recent_bps = win_bytes as f64 / 5.0;
+            let remaining = total.saturating_sub(now);
+            let cur = task.max_conns.load(Ordering::Relaxed);
+            if should_grow(prev_bps, recent_bps, cur, remaining) {
+                task.max_conns.store((cur + 4).min(32), Ordering::Relaxed);
+            }
+            prev_bps = recent_bps;
+            win_bytes = 0;
+            win_ticks = 0;
+        }
 
         let st = *task.status.read().unwrap();
         if st != DlStatus::Downloading && st != DlStatus::Merging {
@@ -1516,10 +1602,15 @@ fn split_range(total: u64, connections: usize, save_path: &Path) -> Vec<Segment>
     let mut start = 0u64;
     let mut i = 0usize;
     while start < total {
-        let end = (start + chunk - 1).min(total - 1);
+        // Saturating arithmetic: even a hostile `total` can never wrap the
+        // tiling into an infinite loop (the caller caps at 1 TiB anyway).
+        let end = start.saturating_add(chunk).saturating_sub(1).min(total.saturating_sub(1));
         out.push(Segment { start, end, part: part_of(save_path, i) });
-        start = end + 1;
+        start = end.saturating_add(1);
         i += 1;
+        if out.len() as u64 > max_chunks + 1 {
+            break;
+        }
     }
     out
 }
@@ -1597,11 +1688,27 @@ mod step_tests {
     }
 
     #[test]
+    fn should_grow_table() {
+        // capped, tiny tail, dead link, regressing speed → no growth
+        assert!(!should_grow(1e6, 1e6, 32, 1 << 30));
+        assert!(!should_grow(1e6, 1e6, 8, 1024));
+        assert!(!should_grow(1e6, 0.0, 8, 1 << 30));
+        assert!(!should_grow(1e6, 5e5, 8, 1 << 30));
+        // climbing / flat / first movement with room → grow
+        assert!(should_grow(1e6, 1.2e6, 8, 1 << 30));
+        assert!(should_grow(1e6, 0.95e6, 8, 1 << 30));
+        assert!(should_grow(0.0, 1e5, 8, 1 << 30));
+        assert!(should_grow(0.0, 0.0, 8, 1 << 30) == false);
+        // exactly at the remaining threshold grows; 31 conns still allowed
+        assert!(should_grow(1e6, 1e6, 31, 32 * 1024 * 1024));
+    }
+
+    #[test]
     fn split_range_tiles_without_gaps() {
         // Steps 1+3 interplay: whatever split_range emits, chained splits +
         // merge must cover every byte exactly once.
         let dir = std::env::temp_dir();
-        for total in [1u64, 1024, 1024 * 1024, 40 * 1024 * 1024 + 7, 1024 * 1024 * 1024] {
+        for total in [1u64, 1024, 1024 * 1024, 40 * 1024 * 1024 + 7, 1024 * 1024 * 1024, u64::MAX] {
             let chunks = split_range(total, 8, &dir.join("probe.bin"));
             assert!(!chunks.is_empty());
             let mut cursor = 0u64;

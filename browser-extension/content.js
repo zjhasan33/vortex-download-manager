@@ -15,8 +15,30 @@
   const MEDIA_EXT = ["mp4", "webm", "mov", "m4v", "mkv", "flv", "m4a", "mp3", "ogg", "oga", "opus", "wav", "aac", "flac", "m3u8"];
   const MEDIA_SITES = ["youtube.com", "youtu.be", "youtube-nocookie.com", "tiktok.com", "instagram.com", "facebook.com", "fb.watch", "twitter.com", "x.com", "dailymotion.com", "vimeo.com", "soundcloud.com", "bilibili.com", "twitch.tv", "reddit.com"];
 
-  const pageUrl = location.href;
-  const pageTitle = document.title || "";
+  // SPA-proof current URL — NEVER cache location.href: YouTube navigates
+  // (watch→watch, Shorts scroll) without reloading, so a cached URL keeps
+  // pointing at the previous video. Evaluate on demand, every time.
+  function getCurrentUrl() {
+    try {
+      const path = location.pathname || "";
+      const pm = path.match(/^\/shorts\/([\w-]{6,})/);
+      if (pm) return "https://www.youtube.com/shorts/" + pm[1];
+      // Shorts scrolled but URL lagging: use the reel actually in viewport.
+      const reels = document.querySelectorAll("ytd-reel-video-renderer");
+      for (const r of reels) {
+        const rect = r.getBoundingClientRect();
+        if (!rect || rect.width <= 0) continue;
+        const vis = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+        if (vis > 80) {
+          const a = r.querySelector('a[href*="/shorts/"]');
+          const href = a && a.getAttribute("href");
+          const m = href && href.match(/\/shorts\/([\w-]{6,})/);
+          if (m) return "https://www.youtube.com/shorts/" + m[1];
+        }
+      }
+    } catch (e) { /* fall through to location */ }
+    return location.href;
+  }
 
   function hostOf(url) {
     try { return new URL(url).hostname.toLowerCase(); } catch (e) { return ""; }
@@ -118,7 +140,7 @@
     }
     media.set(url, { url, title: fileName(url), kind, size: 0 });
     if (el && el.duration && !isNaN(el.duration) && el.duration > 0) {
-      media.get(url).title = String(pageTitle || fileName(url));
+      media.get(url).title = String(document.title || fileName(url));
     }
   }
 
@@ -130,7 +152,7 @@
         if (/^https?:/.test(src) && MEDIA_EXT.includes(e)) {
           register(v, src, e === "m3u8" ? "hls" : "media");
         } else if (v.duration && !isNaN(v.duration) && (v.readyState >= 1 || !v.paused)) {
-          register(v, pageUrl, "page");
+          register(v, getCurrentUrl(), "page");
         }
       } else {
         for (const s of v.querySelectorAll("source[src]")) {
@@ -140,8 +162,8 @@
       }
     }
     // youtube-like: video uses blob: — mark page-level
-    if (onlyHost(hostOf(pageUrl)) && document.querySelector("video")) {
-      if (!media.has("__page__")) media.set("__page__", { url: pageUrl, title: "This page's video", kind: "page" });
+    if (onlyHost(hostOf(getCurrentUrl())) && document.querySelector("video")) {
+      if (!media.has("__page__")) media.set("__page__", { url: getCurrentUrl(), title: "This page's video", kind: "page" });
     }
     bindBarVideos();
   }
@@ -202,10 +224,10 @@
 
   async function renderPanel() {
     const body = panel.querySelector(".vx-panel-body");
-    const host = hostOf(pageUrl);
+    const host = hostOf(getCurrentUrl());
     const isVa = onlyHost(host);
 
-    panel.querySelector(".vx-title").textContent = (pageTitle || host).slice(0, 60);
+    panel.querySelector(".vx-title").textContent = (document.title || host).slice(0, 60);
 
     let html = "";
     if (isVa || media.has("__page__")) {
@@ -219,7 +241,7 @@
         if (fetchBusy) return;
         fetchBusy = true;
         fetchBtn.innerHTML = '<span class="vx-spin"></span> Fetching formats…';
-        const url = pageUrl;
+        const url = getCurrentUrl();
         const res = await send({ type: "analyze", url });
         fetchBusy = false;
         if (res && res.info && (res.info.formats || []).length) {
@@ -340,7 +362,7 @@
   // ---------------- IDM-style hover bar over the video ----------------
 
   function mediaSite() {
-    return onlyHost(hostOf(pageUrl));
+    return onlyHost(hostOf(getCurrentUrl()));
   }
 
   function ensureHbarEls() {
@@ -512,7 +534,7 @@
     if (!btn) return;
     btn.disabled = true;
     btn.textContent = "…";
-    const res = await send({ type: "start_ytdl", url: pageUrl, format_id: formatId });
+    const res = await send({ type: "start_ytdl", url: getCurrentUrl(), format_id: formatId });
     if (res && res.ok) {
       btn.classList.add("vx-hb-added");
       btn.textContent = "Added ✓";
@@ -535,7 +557,7 @@
     hbarFmts.classList.remove("vx-hide");
     hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching formats…</div>';
     placeFmtsBelow();
-    const u = pageUrl;
+    const u = getCurrentUrl();
     const res = await send({ type: "analyze", url: u });
     const subs = (res && res.info && res.info.subtitles || []).filter((s) => !s.auto).slice(0, 15);
     if (!res || !res.info || !(res.info.formats || []).length) {
@@ -564,14 +586,14 @@
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url: u, format_id: btn.dataset.fid });
+        void send({ type: "start_ytdl", url: getCurrentUrl(), format_id: btn.dataset.fid });
       });
     });
     hbarFmts.querySelectorAll("[data-sub]").forEach((btn) => {
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url: u, format_id: "subs:srt:" + btn.dataset.sub });
+        void send({ type: "start_ytdl", url: getCurrentUrl(), format_id: "subs:srt:" + btn.dataset.sub });
       });
     });
     placeFmtsBelow();
@@ -583,7 +605,7 @@
     hbarFmts.classList.remove("vx-hide");
     hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching subtitles…</div>';
     placeFmtsBelow();
-    const u = pageUrl;
+    const u = getCurrentUrl();
     const res = await send({ type: "analyze", url: u });
     const subs = ((res && res.info && res.info.subtitles) || []).filter((s) => !s.auto);
     if (!subs.length) {
@@ -620,7 +642,7 @@
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url, format_id: "subs:" + hbarSubFmt + ":" + btn.dataset.sub });
+        void send({ type: "start_ytdl", url: getCurrentUrl(), format_id: "subs:" + hbarSubFmt + ":" + btn.dataset.sub });
       });
     });
     placeFmtsBelow();
@@ -641,6 +663,23 @@
 
   window.addEventListener("scroll", () => { if (hbarTarget) placeHbar(); }, true);
   window.addEventListener("resize", () => { if (hbarTarget) placeHbar(); });
+
+  // YouTube SPA navigation (watch→watch, Shorts scroll): no reload happens,
+  // so drop cached hover state + re-detect on the new video immediately.
+  // getCurrentUrl() is already live, but the bar target / media registry /
+  // open dropdown belong to the previous video.
+  function resetForNav() {
+    try { hbarHide(0); } catch (e) {}
+    hbarTarget = null;
+    try { if (hbarFmts) hbarFmts.classList.add("vx-hide"); } catch (e) {}
+    fmtsOpen = false;
+    media.clear();
+    try { scan(); } catch (e) {}
+    try { refreshUI(); } catch (e) {}
+  }
+  window.addEventListener("yt-navigate-finish", resetForNav);
+  document.addEventListener("yt-navigate-finish", resetForNav);
+  window.addEventListener("yt-page-data-updated", resetForNav);
 
   // ---------------- runtime hooks ----------------
 
