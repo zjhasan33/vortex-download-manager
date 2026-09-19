@@ -310,6 +310,9 @@ pub struct Task {
     /// Atomic: the adaptive scaler in `monitor_task` grows this 8 → 32 while
     /// throttled; `run()` picks up the new value every worker round.
     pub max_conns: AtomicUsize,
+    /// AIMD penalty window (epoch ms): set when the server protests with
+    /// 429/503 — adaptive growth stays off until this passes.
+    pub penalty_until: AtomicU64,
     /// Number of worker connections currently running (real-time, for stats).
     pub live: AtomicUsize,
     pub status: RwLock<DlStatus>,
@@ -624,6 +627,21 @@ impl Task {
         *self.error.lock().unwrap() = Some(msg.to_string());
     }
 
+    /// AIMD fallback: the server protested with 429/503 — halve parallelism
+    /// (floor 2, takes effect next worker round) and suppress adaptive
+    /// growth for 30 s, so the download keeps flowing on throttling hosts
+    /// instead of hammering into a ban. Re-arming is automatic: growth
+    /// resumes once throughput holds outside the penalty window.
+    pub fn note_congestion(&self) {
+        let cur = self.max_conns.load(Ordering::Relaxed);
+        let next = (cur / 2).max(2);
+        if next < cur {
+            self.max_conns.store(next, Ordering::Relaxed);
+            eprintln!("[vortex-net] congestion (429/503): connections {cur} -> {next}");
+        }
+        self.penalty_until.store(now_ms() + 30_000, Ordering::Relaxed);
+    }
+
     /// Apply a fresh login and queue for retry. Digest auth is negotiated
     /// automatically against the server's challenge on the next request.
     pub fn set_auth_ctx(&self, cred: Cred) {
@@ -703,6 +721,21 @@ pub async fn start(
             return Err(format!("Connection failed: {e}"));
         }
     };
+
+    // A probe answered with an HTTP error (403 bot-wall, 404, 5xx…) is not a
+    // file: fail fast with a clean message instead of building a degenerate
+    // task (e.g. total=Content-Length:1) whose workers all die with
+    // "too many consecutive failures". 401/407 flow into the login dialog via
+    // the workers, so they are exempt here.
+    {
+        let st = probe.status();
+        if (st.is_client_error() || st.is_server_error())
+            && st != StatusCode::UNAUTHORIZED
+            && st != StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        {
+            return Err(format!("Server refused the download (HTTP {})", st.as_u16()));
+        }
+    }
 
     let accept_ranges = probe
         .headers()
@@ -808,6 +841,7 @@ pub async fn start(
         split_at: Mutex::new(vec![u64::MAX; num_segments]),
         num_segments,
         max_conns: AtomicUsize::new(max_conns),
+        penalty_until: AtomicU64::new(0),
         live: AtomicUsize::new(0),
         status: RwLock::new(DlStatus::Queued),
         error: Mutex::new(None),
@@ -863,6 +897,7 @@ pub fn restore(
         done: AtomicU64::new(view.downloaded),
         num_segments,
         max_conns: AtomicUsize::new(view.connections.clamp(1, 32)),
+        penalty_until: AtomicU64::new(0),
         live: AtomicUsize::new(0),
         status: RwLock::new(status),
         error: Mutex::new(view.error.clone()),
@@ -1372,8 +1407,10 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             return false;
         }
         if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            // Transient: rate limit / wobbly mirror. Honor Retry-After, else
-            // back off; the chunk resumes from the cursor afterwards.
+            // Transient: rate limit / wobbly mirror. Back the connection count
+            // off (AIMD) so throttling hosts stay usable, honor Retry-After,
+            // else back off; the chunk resumes from the cursor afterwards.
+            task.note_congestion();
             attempts += 1;
             if attempts > MAX_CHUNK_ATTEMPTS {
                 task.set_error(&format!("HTTP {} (server keeps failing)", status.as_u16()));
@@ -1597,14 +1634,16 @@ async fn monitor_task(task: Arc<Task>) {
         }
 
         // Adaptive scaling: additive increase (+4 / 5 s) while throughput
-        // holds — the classic sign of per-connection throttling.
+        // holds — the classic sign of per-connection throttling. Suspended
+        // inside the AIMD penalty window after 429/503 congestion.
         win_bytes += tick_bytes;
         win_ticks += 1;
         if win_ticks >= 20 {
             let recent_bps = win_bytes as f64 / 5.0;
             let remaining = total.saturating_sub(now);
             let cur = task.max_conns.load(Ordering::Relaxed);
-            if should_grow(prev_bps, recent_bps, cur, remaining) {
+            let penalized = now_ms() < task.penalty_until.load(Ordering::Relaxed);
+            if !penalized && should_grow(prev_bps, recent_bps, cur, remaining) {
                 task.max_conns.store((cur + 4).min(32), Ordering::Relaxed);
             }
             prev_bps = recent_bps;
