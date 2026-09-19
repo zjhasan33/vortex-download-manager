@@ -492,14 +492,29 @@
     hbarFmts.style.top = y + "px";
   }
 
+  // Exotic stream sniffer: background.js pushes the playing page's HLS/DASH
+  // manifest here so the hover bar appears even with no direct file URL.
+  // Freshness-guarded (60 s + same page): a stale stream never downloads.
+  let pendingStream = null;
+  function streamFresh(s) {
+    if (!s || !s.url) return null;
+    if (Date.now() - (s.at || 0) > 60000) return null;
+    try {
+      if (s.pageUrl && !location.href.startsWith(s.pageUrl.split("?")[0].split("#")[0])) return null;
+    } catch (e) { /* compare failed: trust recency */ }
+    return s;
+  }
+
   function hbarShow(video) {
     clearTimeout(hbarHideT);
     if (!video || !document.contains(video)) return;
     const direct = findMediaForVideo(video);
-    if (!mediaSite() && !direct) return;
+    const stream = !direct ? streamFresh(pendingStream) : null;
+    if (!mediaSite() && !direct && !stream) return;
     ensureHbarEls();
     hbarTarget = video;
-    if (mediaSite()) barForMediaSite();
+    if (stream) barForStream(stream);
+    else if (mediaSite()) barForMediaSite();
     else barForDirect(direct);
     hbar.classList.remove("vx-hide");
     placeHbar();
@@ -528,13 +543,45 @@
     return null;
   }
 
-  async function hbarStart(formatId, label2) {
+  // Hover bar for a sniffed HLS/DASH stream: analyze the manifest, then
+  // download best video+audio through yt-dlp (page headers replayed).
+  function barForStream(stream) {
+    const tag = stream.kind === "dash" ? "DASH" : "HLS";
+    hbar.innerHTML = '<span class="vx-hb-grip" title="Drag to move">⋮⋮</span><span class="vx-logo"></span><span class="vx-hb-label">Download Video (' + tag + "):</span>";
+    hbar.appendChild(makeHbarBtn("Download", () => hbarStartStream(stream)));
+    hbar.appendChild(makeHbarBtn("▾ Formats", () => hbarFormats(stream.url)));
+  }
+
+  async function hbarStartStream(stream) {
+    const btn = [...hbar.querySelectorAll(".vx-hb-btn")].find((x) => x.textContent.trim() === "Download");
+    if (btn) { btn.disabled = true; btn.textContent = "…"; }
+    const done = (txt, added) => {
+      if (!btn) return;
+      btn.classList.toggle("vx-hb-added", !!added);
+      btn.textContent = txt;
+      setTimeout(() => {
+        btn.classList.remove("vx-hb-added");
+        btn.textContent = "Download";
+        btn.disabled = false;
+      }, 2500);
+    };
+    const res = await send({ type: "analyze", url: stream.url });
+    const f = res && res.info && res.info.formats && res.info.formats.find((x) => x.has_video && x.has_audio);
+    if (f) {
+      const r2 = await send({ type: "start_ytdl", url: stream.url, format_id: f.id });
+      done(r2 && r2.ok ? "Added ✓" : String((r2 && r2.error) || "Vortex off?").slice(0, 28), r2 && r2.ok);
+    } else {
+      done(String((res && res.error) || "No formats").slice(0, 28), false);
+    }
+  }
+
+  async function hbarStart(formatId, label2, urlOverride) {
     if (hbarFmts) hbarFmts.classList.add("vx-hide");
     const btn = [...hbar.querySelectorAll(".vx-hb-btn")].find((x) => x.textContent.trim() === label2);
     if (!btn) return;
     btn.disabled = true;
     btn.textContent = "…";
-    const res = await send({ type: "start_ytdl", url: getCurrentUrl(), format_id: formatId });
+    const res = await send({ type: "start_ytdl", url: urlOverride || getCurrentUrl(), format_id: formatId });
     if (res && res.ok) {
       btn.classList.add("vx-hb-added");
       btn.textContent = "Added ✓";
@@ -552,12 +599,12 @@
     }, 2500);
   }
 
-  async function hbarFormats() {
+  async function hbarFormats(urlOverride) {
     fmtsOpen = true;
     hbarFmts.classList.remove("vx-hide");
     hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching formats…</div>';
     placeFmtsBelow();
-    const u = getCurrentUrl();
+    const u = urlOverride || getCurrentUrl();
     const res = await send({ type: "analyze", url: u });
     const subs = (res && res.info && res.info.subtitles || []).filter((s) => !s.auto).slice(0, 15);
     if (!res || !res.info || !(res.info.formats || []).length) {
@@ -600,12 +647,12 @@
   }
 
   // Dedicated "▾ Subs" dropdown: list official subtitle languages + choose SRT/VTT.
-  async function hbarSubs() {
+  async function hbarSubs(urlOverride) {
     fmtsOpen = true;
     hbarFmts.classList.remove("vx-hide");
     hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching subtitles…</div>';
     placeFmtsBelow();
-    const u = getCurrentUrl();
+    const u = urlOverride || getCurrentUrl();
     const res = await send({ type: "analyze", url: u });
     const subs = ((res && res.info && res.info.subtitles) || []).filter((s) => !s.auto);
     if (!subs.length) {
@@ -671,6 +718,7 @@
   function resetForNav() {
     try { hbarHide(0); } catch (e) {}
     hbarTarget = null;
+    pendingStream = null;
     try { if (hbarFmts) hbarFmts.classList.add("vx-hide"); } catch (e) {}
     fmtsOpen = false;
     media.clear();
@@ -685,6 +733,13 @@
 
   browser.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "file_captured" && msg.capture) showToast(msg.capture);
+    if (msg && msg.type === "stream_detected" && msg.url) {
+      pendingStream = { url: msg.url, kind: msg.kind || "hls", pageUrl: msg.pageUrl || "", at: Date.now() };
+      media.set(msg.url, { url: msg.url, title: document.title || "Stream video", kind: "hls", size: 0 });
+      const v = document.querySelector("video");
+      if (v) hbarShow(v);
+      refreshUI();
+    }
   });
 
   document.addEventListener("loadedmetadata", (e) => {

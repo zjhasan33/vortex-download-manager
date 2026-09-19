@@ -454,6 +454,14 @@ pub struct Settings {
     pub on_complete: String,
     /// Optional epoch-ms: pause all HTTP downloads once reached.
     pub stop_at: Option<u64>,
+    /// Daily queue scheduler: resume everything at `sched_start`, pause at
+    /// `sched_stop` ("HH:MM", local time). Empty string = unset.
+    #[serde(default)]
+    pub sched_enabled: bool,
+    #[serde(default)]
+    pub sched_start: String,
+    #[serde(default)]
+    pub sched_stop: String,
     /// Show the floating always-on-top drop box.
     pub show_dropbox: bool,
     /// Watch the clipboard for URLs and auto-start download (like IDM).
@@ -535,10 +543,11 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             path: default_download_dir(),
-            // Start at 8; the adaptive scaler in monitor_task grows toward 32
-            // while per-connection throttling leaves bandwidth on the table
-            // (benchmarked: 8 ≈ 2.5 MB/s, 32 ≈ 3.8 MB/s on a throttled mirror).
-            segments: 8,
+            // Start at 16; the adaptive scaler in monitor_task grows toward 32
+            // while per-connection throttling leaves bandwidth on the table.
+            // 16 saturates typical broadband out of the box; servers that cap
+            // per-connection speed still gain from the wider fan-out.
+            segments: 16,
             speed_limit: 0,
             notifications: true,
             sounds: true,
@@ -552,6 +561,9 @@ impl Default for Settings {
             cookies: String::new(),
             on_complete: "none".into(),
             stop_at: None,
+            sched_enabled: false,
+            sched_start: String::new(),
+            sched_stop: String::new(),
             show_dropbox: false,
             clipboard_monitor: false,
             embed_subs: true,
@@ -941,6 +953,7 @@ pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
                             proxy: settings.proxy.clone(),
                             referer: None,
                             cookies: None,
+                            on_exists: None,
                         };
                         if let Ok(task) = crate::download::start(app.clone(), url.clone(), settings.path.clone(), opts, mgr.limit.clone()).await {
                             let id = task.id.clone();
@@ -990,10 +1003,32 @@ pub fn sleep_block_loop(mgr: Arc<DlManager>) {
 
 /// Watch for queue-idle transitions to run the on-complete action
 /// (shutdown / sleep / hibernate / exit) and the stop_at scheduler.
+/// Parse a daily "HH:MM" scheduler time into (day, epoch-ms) for today (local).
+/// None when blank or malformed.
+fn sched_today_ms(hhmm: &str) -> Option<(String, u64)> {
+    let (h, m) = hhmm.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    let now = chrono::Local::now();
+    let target = now
+        .date_naive()
+        .and_hms_opt(h, m, 0)?
+        .and_local_timezone(chrono::Local)
+        .single()?
+        .timestamp_millis()
+        .max(0) as u64;
+    Some((now.format("%Y-%m-%d").to_string(), target))
+}
+
 pub fn completion_watch_loop(app: AppHandle, mgr: Arc<DlManager>) {
     tauri::async_runtime::spawn(async move {
         let mut was_busy = false;
         let mut hist_len = mgr.history.lock().unwrap().len();
+        let mut last_start_day = String::new();
+        let mut last_stop_day = String::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let views = mgr.views();
@@ -1009,6 +1044,29 @@ pub fn completion_watch_loop(app: AppHandle, mgr: Arc<DlManager>) {
             }
             hist_len = hl;
             let mut settings = load_settings(&app);
+            // Daily queue scheduler: resume everything at sched_start, pause at
+            // sched_stop (local "HH:MM", fire-once-per-day so it never loops).
+            if settings.sched_enabled {
+                let now_ms = crate::download::now_ms();
+                if let Some((day, at)) = sched_today_ms(settings.sched_start.trim()) {
+                    if now_ms >= at && last_start_day != day {
+                        last_start_day = day;
+                        let n = mgr.resume_all();
+                        let _ = app.emit("downloads-changed", ());
+                        notify_done(&app, &format!("Scheduler: queue started ({n} resumed)"), "Start time reached");
+                    }
+                }
+                if let Some((day, at)) = sched_today_ms(settings.sched_stop.trim()) {
+                    if now_ms >= at && last_stop_day != day {
+                        last_stop_day = day;
+                        for task in mgr.http.lock().unwrap().values() {
+                            task.paused.store(true, Ordering::Relaxed);
+                        }
+                        let _ = app.emit("downloads-changed", ());
+                        notify_done(&app, "Scheduler: downloads paused", "Stop time reached");
+                    }
+                }
+            }
             // Scheduler: pause all HTTP downloads once the stop time is reached.
             if let Some(t) = settings.stop_at {
                 if crate::download::now_ms() >= t {

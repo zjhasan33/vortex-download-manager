@@ -71,8 +71,8 @@ async function cmd<T>(name: string, args?: Record<string, unknown>): Promise<T> 
 }
 
 export const api = {
-  startDownload: (url: string, savePath: string, segments: number, filename?: string, startAt?: number, startPaused?: boolean) =>
-    cmd<Download>("start_download", { url, savePath, segments, filename, startAt, startPaused }),
+  startDownload: (url: string, savePath: string, segments: number, filename?: string, startAt?: number, startPaused?: boolean, onExists?: string) =>
+    cmd<Download>("start_download", { url, savePath, segments, filename, startAt, startPaused, onExists }),
   pauseDownload: (id: string) => cmd<void>("pause_download", { id }),
   resumeDownload: (id: string) => cmd<void>("resume_download", { id }),
   retryAllDownloads: () => cmd<number>("retry_all_downloads"),
@@ -86,7 +86,9 @@ export const api = {
   listDownloads: () => cmd<Download[]>("list_downloads"),
   getStats: () => cmd<AppStats>("get_stats"),
 
-  fetchYtdlInfo: (url: string) => cmd<YtdlInfo>("fetch_ytdl_info", { url }),
+  fetchYtdlInfo: (url: string, referer?: string, userAgent?: string) =>
+    cmd<YtdlInfo>("fetch_ytdl_info", { url, referer, user_agent: userAgent }),
+  cancelShutdown: () => cmd<void>("cancel_shutdown"),
   grabSite: (url: string, maxPages?: number, kinds?: string[]) =>
     cmd<GrabItem[]>("grab_site", { url, maxPages, kinds }),
   grabStop: () => cmd<void>("grab_stop"),  startYtdl: (
@@ -100,6 +102,9 @@ export const api = {
     subLangs?: string,
     embedThumbnail?: boolean,
     autoSubs?: boolean,
+    referer?: string,
+    userAgent?: string,
+    cookies?: string,
   ) =>
     cmd<Download>("start_ytdl", {
       url,
@@ -112,6 +117,9 @@ export const api = {
       subLangs,
       embed_thumbnail: embedThumbnail,
       autoSubs,
+      referer,
+      user_agent: userAgent,
+      cookies,
     }),
 
   openFolder: (path: string) => cmd<void>("open_folder", { path }),

@@ -50,9 +50,28 @@ fn harden_token_file(p: &std::path::Path) {
 
 pub async fn run(app: AppHandle) {
     let token = ws_token(&app);
-    let listener = match TcpListener::bind(("127.0.0.1", PORT)).await {
-        Ok(l) => l,
-        Err(_) => return, // another instance already running
+    // Retry the bind briefly: a previous instance shutting down (or a slow
+    // port release after a crash) must not leave the bridge silently dead —
+    // without it the extension only sees ERR_CONNECTION_REFUSED.
+    let mut listener = None;
+    for attempt in 1..=5 {
+        match TcpListener::bind(("127.0.0.1", PORT)).await {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(e) => {
+                eprintln!("[vortex-ws] bind 127.0.0.1:{PORT} failed (attempt {attempt}/5): {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+    let listener = match listener {
+        Some(l) => l,
+        None => {
+            eprintln!("[vortex-ws] bridge disabled: port {PORT} busy (another instance already running?)");
+            return;
+        }
     };
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
@@ -364,7 +383,12 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     if url.is_empty() {
                         err("url required")
                     } else {
-                        match ytdlp::fetch_info(app.clone(), url.clone()).await {
+                        let ctx = ytdlp::StreamCtx {
+                            referer: p["referer"].as_str().map(|s| s.to_string()),
+                            user_agent: p["user_agent"].as_str().map(|s| s.to_string()),
+                            cookies: p["cookies"].as_str().map(|s| s.to_string()),
+                        };
+                        match ytdlp::fetch_info(app.clone(), url.clone(), ctx).await {
                             Ok(info) => json!({"type":"info","ok":true,"url":url,"info":info}).to_string(),
                             Err(e) => err(&e),
                         }
@@ -388,8 +412,13 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                         let sub_langs = p["sub_langs"].as_str().map(|s| s.to_string());
                         let embed_thumbnail = p["embed_thumbnail"].as_bool();
                         let auto_subs = p["auto_subs"].as_bool();
+                        let ctx = ytdlp::StreamCtx {
+                            referer: p["referer"].as_str().map(|s| s.to_string()),
+                            user_agent: p["user_agent"].as_str().map(|s| s.to_string()),
+                            cookies: p["cookies"].as_str().map(|s| s.to_string()),
+                        };
                         let sp = settings_path(app);
-                        start_ytdl(app, &mgr, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail, auto_subs).await
+                        start_ytdl(app, &mgr, url, fid, sp, playlist, playlist_items, start_at, embed_subs, sub_langs, embed_thumbnail, auto_subs, ctx).await
                     }
                 }
                 "resume" => {
@@ -497,7 +526,12 @@ async fn download_op(app: &AppHandle, mgr: &Arc<DlManager>, p: &Value) -> String
     let segments = p["segments"].as_u64().map(|n| n as usize).unwrap_or(settings.segments);
     let force_yt = p["via"].as_str() == Some("yt");
     if force_yt {
-        let info = match ytdlp::fetch_info(app.clone(), url.clone()).await {
+        let ctx = ytdlp::StreamCtx {
+            referer: p["referer"].as_str().map(|s| s.to_string()),
+            user_agent: p["user_agent"].as_str().map(|s| s.to_string()),
+            cookies: p["cookies"].as_str().map(|s| s.to_string()),
+        };
+        let info = match ytdlp::fetch_info(app.clone(), url.clone(), ctx.clone()).await {
             Ok(i) => i,
             Err(e) => return err(&e),
         };
@@ -508,7 +542,7 @@ async fn download_op(app: &AppHandle, mgr: &Arc<DlManager>, p: &Value) -> String
             .or_else(|| info.formats.iter().find(|f| f.has_video && f.has_audio))
             .or_else(|| info.formats.iter().find(|f| f.has_video));
         let Some(fmt) = fmt else { return err("no suitable format") };
-        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None, None, None, None, None).await;
+        return start_ytdl(app, mgr, url, fmt.id.clone(), settings.path.clone(), false, "".into(), None, None, None, None, None, ctx).await;
     }
     let opts = download::StartOpts {
         segments,
@@ -519,6 +553,7 @@ async fn download_op(app: &AppHandle, mgr: &Arc<DlManager>, p: &Value) -> String
         proxy: settings.proxy.clone(),
         referer: p["referer"].as_str().map(|s| s.to_string()),
         cookies: p["cookies"].as_str().map(|s| s.to_string()),
+        on_exists: None,
     };
     match download::start(app.clone(), url.clone(), settings.path.clone(), opts, mgr.limit.clone()).await {
         Ok(task) => {
@@ -550,6 +585,7 @@ async fn start_ytdl(
     sub_langs: Option<String>,
     embed_thumbnail: Option<bool>,
     auto_subs: Option<bool>,
+    ctx: ytdlp::StreamCtx,
 ) -> String {
     let settings = crate::state::load_settings(app);
     let embed = embed_subs.unwrap_or(settings.embed_subs);
@@ -569,6 +605,7 @@ async fn start_ytdl(
         langs,
         embed_thumb,
         auto_subs.unwrap_or(false),
+        ctx,
     )
     .await
     {

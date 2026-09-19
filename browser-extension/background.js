@@ -18,6 +18,48 @@ const MEDIA_SITES = ["youtube.com", "youtu.be", "youtube-nocookie.com", "tiktok.
 const CAPTURES_KEY = "vx_captures";
 const NOTIFY_KEY = "vx_notify";
 
+// ---- Exotic stream sniffer (HLS .m3u8 / DASH .mpd) ----
+const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl"];
+const DASH_CT = ["application/dash+xml"];
+// Real browser UA so CDNs that gate on it don't 403 our backend replays.
+const EXT_UA = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+function streamKindOf(url) {
+  const u = String(url || "");
+  if (extOf(u) === "m3u8" || u.includes(".m3u8")) return "hls";
+  if (extOf(u) === "mpd" || u.includes(".mpd")) return "dash";
+  return "";
+}
+// Master/index manifests only: skip segments, chunks, maps and init files.
+// (Single-variant streams often serve only a chunklist — that still works,
+// so chunklist itself is accepted; per-segment playlists are not.)
+function isMasterManifest(url) {
+  if (!streamKindOf(url)) return false;
+  let path = "";
+  try { path = new URL(String(url).split("#")[0]).pathname.toLowerCase(); } catch (e) { return false; }
+  if (/\.(ts|m4s|mp4)$/.test(path)) return false;
+  if (/(^|[/_-])(chunk[-_]?\d+|seg[-_]?\d+|segment[-_]?\d+|part[-_]?\d+|frag[-_]?\d+|range)/i.test(path)) return false;
+  return true;
+}
+// Patch stored capture fields (e.g. cookies resolved async after sniffing).
+function patchCapture(url, fields) {
+  browser.storage.local.get({ [CAPTURES_KEY]: [] }).then((r) => {
+    const list = r[CAPTURES_KEY] || [];
+    if (!list.some((c) => c.url === url)) return;
+    browser.storage.local.set({ [CAPTURES_KEY]: list.map((c) => (c.url === url ? { ...c, ...fields } : c)) });
+  }).catch(() => {});
+}
+// Tell the tab's content script a stream is playing so the hover bar appears.
+function notifyStreamTab(tabId, cap) {
+  if (!(tabId > 0)) return;
+  browser.tabs.sendMessage(tabId, { type: "stream_detected", url: cap.url, kind: cap.kind, pageUrl: cap.pageUrl || "" }).catch(() => {});
+}
+// Enrich a fresh capture with page cookies (async) for 403-proof replays.
+function enrichCaptureCookies(cap) {
+  cookieHeaderFor([cap.url, cap.pageUrl]).then((ck) => {
+    if (ck) patchCapture(cap.url, { cookies: ck });
+  }).catch(() => {});
+}
+
 // User preference: show desktop/browser notification on detected link.
 // DEFAULT: disabled — notifications for link detection are off unless the user opts in.
 let notifyEnabled = false;
@@ -296,26 +338,38 @@ let capturedUrls = new Set();
 
 browser.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (!(details.type === "media" || details.type === "object")) return;
     const url = details.url;
     if (!url.startsWith("http")) return;
     if (capturedUrls.has(url)) return;
     const ext = extOf(url);
-    if (!MEDIA_EXT.includes(ext) && !url.includes("mime=")) return;
+    const sk = streamKindOf(url);
+    if (sk) {
+      // Stream manifests usually arrive as XHR — only master/index ones count.
+      if (!isMasterManifest(url)) return;
+    } else {
+      if (!(details.type === "media" || details.type === "object")) return;
+      if (!MEDIA_EXT.includes(ext) && !url.includes("mime=")) return;
+    }
     capturedUrls.add(url);
     const tab = details.tabId > 0 ? details.tabId : undefined;
     const pageUrl = details.documentUrl || (tab ? "" : "");
-    addCapture({
+    const cap = {
       url,
       filename: fileNameFromUrl(url),
-      kind: ext === "m3u8" ? "hls" : "media",
+      kind: sk || "media",
       pageUrl,
+      referer: pageUrl || undefined,
       tabId: tab,
       viaHtml: false,
       at: Date.now(),
-    });
+    };
+    addCapture(cap);
+    if (sk) {
+      enrichCaptureCookies(cap);
+      notifyStreamTab(tab, cap);
+    }
   },
-  { urls: ["<all_urls>"], types: ["media", "object"] },
+  { urls: ["<all_urls>"], types: ["media", "object", "xmlhttprequest", "other"] },
   []
 );
 
@@ -324,7 +378,11 @@ browser.webRequest.onHeadersReceived.addListener(
     if (details.url.startsWith("data:") || details.url.startsWith("blob:")) return;
     const headers = {};
     for (const h of details.responseHeaders || []) headers[h.name.toLowerCase()] = h.value || "";
-    if (!looksDownloadable(details.url, headers)) return;
+    const ct = (headers["content-type"] || "").toLowerCase();
+    const sk = streamKindOf(details.url);
+    const isStreamCt = HLS_CT.some((t) => ct.includes(t)) || DASH_CT.some((t) => ct.includes(t));
+    const isStream = !!sk && (isStreamCt || isMasterManifest(details.url));
+    if (!isStream && !looksDownloadable(details.url, headers)) return;
     if (capturedUrls.has(details.url)) return;
     capturedUrls.add(details.url);
     const cdFilename = filenameFromDisposition(headers["content-disposition"]);
@@ -332,19 +390,27 @@ browser.webRequest.onHeadersReceived.addListener(
     const cl = headers["content-length"];
     if (cl) size = parseInt(cl, 10) || 0;
     // skip tiny inline responses unless it's an actual attachment
-    if (!headers["content-disposition"] && size > 0 && size < 1024 * 1024 && !FILE_EXT.includes(extOf(details.url))) return;
+    // (stream manifests ARE tiny — exempt them or nothing is ever caught)
+    if (!isStream && !headers["content-disposition"] && size > 0 && size < 1024 * 1024 && !FILE_EXT.includes(extOf(details.url))) return;
 
     const tabId = details.tabId > 0 ? details.tabId : undefined;
-    addCapture({
+    const pageUrl = tabId ? details.documentUrl || "" : "";
+    const cap = {
       url: details.url,
       filename: cdFilename || fileNameFromUrl(details.url),
       size,
-      kind: "file",
-      pageUrl: tabId ? details.documentUrl || "" : "",
+      kind: isStream ? sk : "file",
+      pageUrl,
+      referer: pageUrl || undefined,
       tabId,
       viaHtml: false,
       at: Date.now(),
-    });
+    };
+    addCapture(cap);
+    if (isStream) {
+      enrichCaptureCookies(cap);
+      notifyStreamTab(tabId, cap);
+    }
   },
   { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "other", "xmlhttprequest", "object"] },
   ["responseHeaders"]
@@ -538,23 +604,25 @@ async function handleGrabAll(tab) {
 
 // ---------------- action dispatcher (used by content + popup + menus) ----------------
 
-async function handleStart({ type, url, filename, pageUrl, referer, cookies }) {
+async function handleStart({ type, url, filename, pageUrl, referer, cookies, userAgent }) {
   if (!url) return { error: "no url" };
   if (type === "direct" || isMediaSite(url) || type === "auto") {
     const isYT = isMediaSite(url);
-    const isHLS = extOf(url) === "m3u8" || url.includes(".m3u8");
+    const sk = streamKindOf(url);
+    const isStream = !!sk;
     const payload = { url, filename: filename || undefined };
-    if (isYT || isHLS) payload.via = "yt";
+    if (isYT || isStream) payload.via = "yt";
     // Browser-takeover metadata so the desktop can replay authenticated downloads.
     if (referer) payload.referer = referer;
     if (cookies) payload.cookies = cookies;
+    if (userAgent || EXT_UA) payload.user_agent = userAgent || EXT_UA;
     const res = await rpc("download", payload);
     if (online) {
       // The desktop acks immediately with { success:true, action:... }.
       if (res && res.error) return res;
       return { success: true, ok: true, action: (res && res.action) || "download_started" };
     }
-    if (isYT || isHLS) {
+    if (isYT || isStream) {
       await launchVortex("capture", { url, via: "yt", filename: filename || "" });
       return { ok: true, launched: true };
     }
@@ -569,9 +637,14 @@ async function handleStart({ type, url, filename, pageUrl, referer, cookies }) {
 }
 
 async function handleAnalyze(url, tab) {
-  const res = await rpc("analyze", { url });
+  const pageUrl = (tab && tab.url) || url;
+  const res = await rpc("analyze", {
+    url,
+    referer: pageUrl || undefined,
+    cookies: await cookieHeaderFor([url, pageUrl]),
+    user_agent: EXT_UA,
+  });
   if (online) return res;
-  const pageUrl = tab && tab.url ? tab.url : url;
   const title = tabTitles.get(tab && tab.id) || "";
   await launchVortex("capture", { url: pageUrl, via: "yt" });
   return { ok: false, launched: true, analyzeUrl: url, title, error: res.error };
@@ -627,7 +700,12 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await launchVortex("capture", { url: pageUrl, via: "yt" });
           return { ok: false, action: "analyze", launched: true, title };
         }
-        return handleStart({ type: "direct", url, filename: msg.filename, pageUrl });
+        return handleStart({
+          type: "direct", url, filename: msg.filename, pageUrl,
+          referer: msg.referer || pageUrl || undefined,
+          cookies: msg.cookies || await cookieHeaderFor([url, pageUrl]),
+          userAgent: msg.userAgent || EXT_UA,
+        });
       },
       30000
     );
@@ -638,8 +716,13 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ error: "no url" });
       return;
     }
-    return safeRespond(sendResponse, () =>
-      handleStart({ type: "direct", url: msg.url, filename: msg.filename, pageUrl })
+    return safeRespond(sendResponse, async () =>
+      handleStart({
+        type: "direct", url: msg.url, filename: msg.filename, pageUrl,
+        referer: msg.referer || pageUrl || undefined,
+        cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
+        userAgent: msg.userAgent || EXT_UA,
+      })
     );
   }
 
@@ -649,10 +732,15 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "start_ytdl") {
     if (online) {
-      return safeRespond(sendResponse, () => {
+      return safeRespond(sendResponse, async () => {
         // Explicit embed override so the popup toggle works both ways
         // (when OFF, we must send false — otherwise the desktop uses its own settings).
-        const payload = { url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled };
+        const payload = {
+          url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled,
+          referer: msg.referer || pageUrl || undefined,
+          cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
+          user_agent: msg.userAgent || EXT_UA,
+        };
         return rpc("start_ytdl", payload);
       });
     }

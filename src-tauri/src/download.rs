@@ -247,11 +247,15 @@ pub struct StartOpts {
     pub referer: Option<String>,
     /// Cookie header string (e.g. "sid=abc; pref=1") for authenticated downloads.
     pub cookies: Option<String>,
+    /// Existing-file policy: None = silent auto-rename (default, headless
+    /// flows); Some("prompt") = abort with `EXISTS::<path>` so the UI can ask;
+    /// Some("replace") = delete the existing file + parts and reuse its path.
+    pub on_exists: Option<String>,
 }
 
 impl Default for StartOpts {
     fn default() -> Self {
-        Self::new(8)
+        Self::new(16)
     }
 }
 
@@ -266,6 +270,7 @@ impl StartOpts {
             proxy: String::new(),
             referer: None,
             cookies: None,
+            on_exists: None,
         }
     }
 
@@ -661,11 +666,21 @@ pub async fn start(
             auth = a;
             p
         }
-        Err(e) if e.is_redirect() => {
+        Err(e)
+            if e.is_redirect()
+                || e.is_request()
+                || e.is_connect()
+                || e.is_body()
+                || e.is_decode()
+                || e.is_timeout() =>
+        {
             // Mirror anti-hotlinking guards bounce browser-like UAs in an endless
-            // 302 loop (e.g. mirrors.nju.edu.cn redirects to itself); retry once
-            // with a neutral tool UA like IDM/wget do.
-            log_net_err(&e, "probe redirect-loop; retrying with tool UA");
+            // 302 loop (e.g. mirrors.nju.edu.cn redirects to itself); other hosts
+            // (e.g. Hetzner speed servers) reset browser-UA connections outright.
+            // Retry once with a neutral tool UA like IDM/wget do — the rebuilt
+            // client then serves the whole task, since the browser UA would fail
+            // every segment the same way.
+            log_net_err(&e, "probe failed; retrying with tool UA");
             client = if extra.is_empty() {
                 build_tool_client(&eff_proxy)?
             } else {
@@ -734,7 +749,24 @@ pub async fn start(
 
     let eff_dir = crate::state::save_dir_for(&base, &name, opts.categorize);
     fs::create_dir_all(&eff_dir).map_err(|e| format!("Cannot create folder: {e}"))?;
-    let save_path_final = unique_path(&eff_dir, &name);
+    // Existing-file policy (IDM-style): "prompt" aborts before any byte is
+    // fetched so the UI can ask Replace / Keep both / Cancel; "replace"
+    // deletes the old file + its parts and reuses the exact path; anything
+    // else keeps the historical silent auto-rename.
+    let candidate = eff_dir.join(&name);
+    let save_path_final = match opts.on_exists.as_deref() {
+        Some("prompt") if candidate.exists() => {
+            return Err(format!("EXISTS::{}", candidate.display()));
+        }
+        Some("replace") => {
+            if candidate.exists() {
+                let _ = fs::remove_file(&candidate);
+                crate::state::cleanup_parts_for(&candidate);
+            }
+            candidate
+        }
+        _ => unique_path(&eff_dir, &name),
+    };
 
     let segs;
     let max_conns;

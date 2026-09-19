@@ -392,8 +392,52 @@ fn cookie_args(use_cookies: bool, path: &str) -> Vec<String> {
     vec!["--no-cookies-from-browser".into()]
 }
 
-pub async fn fetch_info(app: AppHandle, url: String) -> Result<YtdlInfo, String> {
+/// Browser-captured request context (stream sniffer / download takeover):
+/// lets yt-dlp replay CDN requests that 403 without the page's headers.
+#[derive(Clone, Default)]
+pub struct StreamCtx {
+    pub referer: Option<String>,
+    pub user_agent: Option<String>,
+    pub cookies: Option<String>,
+}
+
+impl StreamCtx {
+    fn clean(opt: &Option<String>) -> Option<String> {
+        opt.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string())
+    }
+    pub fn referer(&self) -> Option<String> {
+        Self::clean(&self.referer)
+    }
+    pub fn user_agent(&self) -> Option<String> {
+        Self::clean(&self.user_agent)
+    }
+    pub fn cookies(&self) -> Option<String> {
+        Self::clean(&self.cookies)
+    }
+}
+
+/// Extra yt-dlp args carrying the browser context (`--referer`,
+/// `--user-agent`, `Cookie` header). Empty when nothing was captured.
+fn ctx_args(ctx: &StreamCtx) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(r) = ctx.referer() {
+        out.push("--referer".into());
+        out.push(r);
+    }
+    if let Some(u) = ctx.user_agent() {
+        out.push("--user-agent".into());
+        out.push(u);
+    }
+    if let Some(c) = ctx.cookies() {
+        out.push("--add-header".into());
+        out.push(format!("Cookie: {c}"));
+    }
+    out
+}
+
+pub async fn fetch_info(app: AppHandle, url: String, ctx: StreamCtx) -> Result<YtdlInfo, String> {
     let bin = tools::ensure_ytdlp(&app).await?;
+    let ctx_args = ctx_args(&ctx);
     let settings = crate::state::load_settings(&app);
     let cooks = cookie_args(settings.use_cookies, &settings.cookies);
     let eff_proxy = crate::state::proxy_for_url(&settings.per_site_proxies, &settings.proxy, &url);
@@ -411,6 +455,7 @@ pub async fn fetch_info(app: AppHandle, url: String) -> Result<YtdlInfo, String>
             cmd.arg("--no-playlist");
         }
         cmd.args(&cooks);
+        cmd.args(&ctx_args);
         if !eff_proxy.trim().is_empty() {
             cmd.arg("--proxy").arg(eff_proxy.trim());
         }
@@ -733,6 +778,11 @@ pub struct YtTask {
     pub produced: Mutex<Vec<std::path::PathBuf>>,
     /// Fetch auto-generated captions when no official track matches.
     pub auto_subs: bool,
+    /// Browser-captured request context (Referer / UA / cookies) so CDN
+    /// streams that 403 anonymous requests still download.
+    pub referer: String,
+    pub user_agent: String,
+    pub cookies: String,
 }
 
 impl YtTask {
@@ -816,6 +866,8 @@ pub async fn start(
     // Also fetch auto-generated captions (for videos with no official
     // subtitle track). Off by default: auto captions are machine quality.
     auto_subs: bool,
+    // Browser-captured request context (stream sniffer / takeover).
+    ctx: StreamCtx,
 ) -> Result<Arc<YtTask>, String> {
     // NOTE: no tool downloads here — `start()` must stay fast and synchronous
     // (extension WS calls time out on slow fetches). Tools are ensured in
@@ -902,6 +954,9 @@ pub async fn start(
         playlist_total: AtomicU64::new(0),
         produced: Mutex::new(Vec::new()),
         auto_subs,
+        referer: ctx.referer().unwrap_or_default(),
+        user_agent: ctx.user_agent().unwrap_or_default(),
+        cookies: ctx.cookies().unwrap_or_default(),
     });
 
     Ok(task)
@@ -1074,6 +1129,12 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
     }
     let settings = crate::state::load_settings(&task.app);
     args.extend(cookie_args(settings.use_cookies, &settings.cookies));
+    // Replay the browser's request context so CDN streams don't 403.
+    args.extend(ctx_args(&StreamCtx {
+        referer: Some(task.referer.clone()),
+        user_agent: Some(task.user_agent.clone()),
+        cookies: Some(task.cookies.clone()),
+    }));
     // Keep temp/thumbnail artifacts out of the Downloads folder.
     args.push("--paths".into());
     args.push(format!("temp:{}", tmp_root.display()));

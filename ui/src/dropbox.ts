@@ -51,7 +51,7 @@ export async function bootDropbox() {
     let n = 0;
     for (const u of urls.slice(0, 50)) {
       try {
-        await api.startDownload(u, settings()?.path || "", settings()?.segments ?? 8);
+        await api.startDownload(u, settings()?.path || "", settings()?.segments ?? 16);
         n++;
       } catch {
         /* keep going */

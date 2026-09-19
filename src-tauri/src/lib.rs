@@ -155,6 +155,7 @@ fn handle_capture(app: &tauri::AppHandle, cap: CapturePayload) {
                 proxy: settings.proxy.clone(),
                 referer: None,
                 cookies: None,
+                on_exists: None,
             };
             match download::start(app.clone(), cap.url, settings.path, opts, mgr.limit.clone()).await {
                 Ok(task) => {
@@ -184,7 +185,7 @@ async fn launch_yt_from_capture(
     let fmt = match cap.format_id {
         Some(fid) => Some(fid),
         None => {
-            let info = ytdlp::fetch_info(app.clone(), cap.url.clone()).await.ok()?;
+            let info = ytdlp::fetch_info(app.clone(), cap.url.clone(), ytdlp::StreamCtx::default()).await.ok()?;
             info.formats
                 .iter()
                 .find(|f| f.kind == "video" && f.has_video && f.has_audio && f.height == Some(720))
@@ -208,6 +209,7 @@ async fn launch_yt_from_capture(
         settings.sub_langs,
         settings.embed_thumbnail,
         false,
+        ytdlp::StreamCtx::default(),
     )
     .await
     .ok()?;
@@ -230,6 +232,7 @@ async fn start_download(
     filename: Option<String>,
     start_at: Option<u64>,
     start_paused: Option<bool>,
+    on_exists: Option<String>,
 ) -> Result<download::DlView, String> {
     let settings = state::load_settings(&app);
     let opts = download::StartOpts {
@@ -241,6 +244,7 @@ async fn start_download(
         proxy: settings.proxy.clone(),
         referer: None,
         cookies: None,
+        on_exists,
     };
     let task = download::start(app.clone(), url, save_path, opts, state.limit.clone()).await?;
     // Add in "Paused" state (Grabber "Start immediately" OFF) so the batch
@@ -432,6 +436,21 @@ async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
     Ok(())
 }
 
+/// Abort a pending Vortex-scheduled shutdown (`shutdown /s /t 60` grace window).
+#[tauri::command]
+async fn cancel_shutdown(app: tauri::AppHandle) -> Result<(), String> {
+    let out = crate::tools::silent(std::process::Command::new("shutdown"))
+        .args(["/a"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        crate::state::notify_done(&app, "Scheduled shutdown cancelled", "Shutdown aborted");
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
 #[tauri::command]
 async fn remove_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String, delete_file: Option<bool>) -> Result<(), String> {
     remove_one(&app, &state, &id, delete_file.unwrap_or(false));
@@ -483,8 +502,18 @@ async fn get_stats(state: State<'_, Arc<DlManager>>) -> Result<serde_json::Value
 }
 
 #[tauri::command]
-async fn fetch_ytdl_info(app: tauri::AppHandle, url: String) -> Result<ytdlp::YtdlInfo, String> {
-    ytdlp::fetch_info(app, url).await
+async fn fetch_ytdl_info(
+    app: tauri::AppHandle,
+    url: String,
+    referer: Option<String>,
+    user_agent: Option<String>,
+) -> Result<ytdlp::YtdlInfo, String> {
+    ytdlp::fetch_info(
+        app,
+        url,
+        ytdlp::StreamCtx { referer, user_agent, cookies: None },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -527,6 +556,9 @@ async fn start_ytdl(
     sub_langs: Option<String>,
     embed_thumbnail: Option<bool>,
     auto_subs: Option<bool>,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    cookies: Option<String>,
 ) -> Result<download::DlView, String> {
     let settings = state::load_settings(&app);
     let task = ytdlp::start(
@@ -543,6 +575,7 @@ async fn start_ytdl(
         sub_langs.unwrap_or_else(|| settings.sub_langs.clone()),
         embed_thumbnail.unwrap_or(settings.embed_thumbnail),
         auto_subs.unwrap_or(false),
+        ytdlp::StreamCtx { referer, user_agent, cookies },
     )
     .await?;
     let id = task.id.clone();
@@ -889,6 +922,7 @@ pub fn run() {
             retry_all_downloads,
             resume_all_downloads,
             pause_all_downloads,
+            cancel_shutdown,
             cancel_all_active,
             cancel_download,
             remove_download,

@@ -6,7 +6,7 @@ import { syncDropbox } from "../lib/dropbox";
 import type { Settings, GrabItem } from "../types";
 
 export function openAddUrl() {
-  const segments = store.settings?.segments ?? 8;
+  const segments = store.settings?.segments ?? 16;
   const importBtn = `
       <div class="field">
         <label>Batch import (.txt)</label>
@@ -119,12 +119,28 @@ export function openAddUrl() {
         }
         const fn = nameInp.value.trim() || url.split("/").pop() || `download_${Date.now()}`;
         const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
-        try {
-          await api.startDownload(url, pathInp.value.trim() || store.settings?.path || "", Number(segInp.value), fn, when);
+        const startWith = (mode?: string) =>
+          api.startDownload(url, pathInp.value.trim() || store.settings?.path || "", Number(segInp.value), fn, when, undefined, mode);
+        const doneOk = () => {
           toast(when ? "Scheduled" : "Download started", "ok");
           close();
+        };
+        try {
+          await startWith("prompt");
+          doneOk();
         } catch (e: unknown) {
-          toast(String(e), "err");
+          // IDM-style: file exists → ask Replace / Keep both / Cancel.
+          const m = String(e).match(/^EXISTS::([\s\S]*)$/);
+          if (!m) {
+            toast(String(e), "err");
+            return;
+          }
+          openConfirmExists(m[1], (choice) => {
+            if (choice === "cancel") return;
+            void startWith(choice === "replace" ? "replace" : undefined)
+              .then(doneOk)
+              .catch((e2: unknown) => toast(String(e2), "err"));
+          });
         }
       };
       urlInp.addEventListener("keydown", (e) => e.key === "Enter" && go());
@@ -233,6 +249,24 @@ export function openSettings() {
         </div>
       </div>
       <div class="field">
+        <label style="display:flex;gap:9px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="st-sched" ${s.sched_enabled ? "checked" : ""} /> Queue scheduler (daily start / stop)
+        </label>
+        <div class="row2" style="padding-top:8px">
+          <div class="field">
+            <label>Start queue at</label>
+            <input class="input" id="st-sched-start" type="time" value="${escapeAttr(s.sched_start || "")}" />
+          </div>
+          <div class="field">
+            <label>Stop queue at</label>
+            <input class="input" id="st-sched-stop" type="time" value="${escapeAttr(s.sched_stop || "")}" />
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
+          At start time everything paused resumes; at stop time active downloads pause. Times are daily (local). Overnight ranges like 22:00 → 06:00 work.
+        </div>
+      </div>
+      <div class="field">
         <label>Options</label>
         <div style="display:grid;gap:8px;padding-top:2px">
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
@@ -309,11 +343,20 @@ export function openSettings() {
     </div>
     <div class="modal-foot">
       <button class="btn-ghost" data-close>Cancel</button>
+      <button class="btn-ghost" id="st-abort-shutdown" title="Abort a pending Windows shutdown (shutdown /a)">Abort shutdown</button>
       <button class="tbtn primary" id="st-save">Save</button>
     </div>
   </div>`,
     (root, close) => {
       root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = close));
+      root.querySelector<HTMLButtonElement>("#st-abort-shutdown")!.onclick = async () => {
+        try {
+          await api.cancelShutdown();
+          toast("Shutdown aborted", "ok");
+        } catch (e: unknown) {
+          toast("No shutdown to abort: " + String(e), "info");
+        }
+      };
       const pathInp = root.querySelector<HTMLInputElement>("#st-path")!;
       root.querySelector<HTMLButtonElement>("#st-browse")!.onclick = async () => {
         const p = await api.chooseFolder();
@@ -474,6 +517,9 @@ export function openSettings() {
             const v = root.querySelector<HTMLInputElement>("#st-stopat")!.value;
             return v ? new Date(v).getTime() || null : null;
           })(),
+          sched_enabled: root.querySelector<HTMLInputElement>("#st-sched")!.checked,
+          sched_start: root.querySelector<HTMLInputElement>("#st-sched-start")!.value.trim(),
+          sched_stop: root.querySelector<HTMLInputElement>("#st-sched-stop")!.value.trim(),
         };
         try {
           await api.saveSettings(next);
@@ -693,7 +739,7 @@ export function openGrabber(initialUrl = "", autoStart = false) {
         const checked = body.querySelectorAll<HTMLInputElement>("input[data-idx]:checked");
         if (!checked.length) return toast("Nothing selected", "err");
         const path = store.settings?.path ?? "";
-        const segs = store.settings?.segments ?? 8;
+        const segs = store.settings?.segments ?? 16;
         submitting = true;
         stopSubmit = false;
         find.disabled = true;
@@ -873,6 +919,40 @@ export function openConfirmRemove(name: string, onYes: (deleteFile: boolean) => 
         onYes(del);
         close();
       };
+    },
+  );
+  return close;
+}
+
+/** IDM-style "file already exists" choice: Replace / Keep both / Cancel. */
+export function openConfirmExists(path: string, onChoice: (action: "replace" | "rename" | "cancel") => void) {
+  const close = openModal(
+    () => `
+  <div class="modal" style="width:460px">
+    <div class="modal-head">
+      <h3>File already exists</h3>
+      <div class="spacer"></div>
+      <button class="x" data-close>✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:13px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeAttr(path)}">${escapeAttr(path)}</div>
+      <div style="font-size:12.5px;color:var(--text-3)">Replace overwrites it (partial files are discarded). Keep both saves as “name (1).ext”.</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" id="ce-cancel">Cancel</button>
+      <button class="tbtn" id="ce-keep">Keep both</button>
+      <button class="tbtn danger" id="ce-replace">Replace</button>
+    </div>
+  </div>`,
+    (root, close) => {
+      const done = (a: "replace" | "rename" | "cancel") => {
+        onChoice(a);
+        close();
+      };
+      root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = () => done("cancel")));
+      root.querySelector<HTMLButtonElement>("#ce-cancel")!.onclick = () => done("cancel");
+      root.querySelector<HTMLButtonElement>("#ce-keep")!.onclick = () => done("rename");
+      root.querySelector<HTMLButtonElement>("#ce-replace")!.onclick = () => done("replace");
     },
   );
   return close;

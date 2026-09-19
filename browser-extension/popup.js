@@ -88,7 +88,7 @@ async function loadCaptures(on) {
     name.title = c.url;
     const k = document.createElement("div");
     k.className = "k";
-    k.textContent = c.kind === "hls" ? "HLS" : c.kind;
+    k.textContent = c.kind === "hls" ? "STREAM / HLS" : c.kind === "dash" ? "STREAM / DASH" : c.kind;
     const dl = document.createElement("button");
     dl.className = "btn primary";
     dl.style.padding = "5px 9px";
@@ -99,7 +99,7 @@ async function loadCaptures(on) {
       dl.disabled = true;
       dl.textContent = "Sending…";
       const res = await send(
-        { type: "download_direct", url: c.url, filename: c.filename },
+        { type: "download_direct", url: c.url, filename: c.filename, referer: c.referer, cookies: c.cookies },
         5000
       );
       if (res && res.error && !res.launched) {

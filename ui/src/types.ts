@@ -112,6 +112,9 @@ export interface Settings {
   cookies: string;
   on_complete: string;
   stop_at?: number | null;
+  sched_enabled: boolean;
+  sched_start: string;
+  sched_stop: string;
   show_dropbox: boolean;
   clipboard_monitor: boolean;
   embed_subs: boolean;

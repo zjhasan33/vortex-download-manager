@@ -255,6 +255,7 @@ export class VortexApp {
       <div class="sv-item"><b>${s.segments}</b> segments</div>
       <div class="sv-item"><b>${formatBytes(s.total_downloaded)}</b> downloaded today</div>
       <div class="spacer" style="flex:1"></div>
+      <div class="sv-item" id="armed-ind" style="display:none"></div>
       <div class="sv-item">${icon("file", 13)} <b>${s.completed}</b> completed</div>
     </div>`.replace('<div class="spacer" style="flex:1"></div>', '<div style="flex:1"></div>');
   }
@@ -513,6 +514,25 @@ export class VortexApp {
         b[3].textContent = formatBytes(s.total_downloaded);
         b[4].textContent = String(s.completed);
       }
+      // Armed automation indicator (shutdown-on-finish / queue scheduler).
+      const ind = el.querySelector<HTMLElement>("#armed-ind");
+      if (ind) {
+        const st = store.settings;
+        const bits: string[] = [];
+        if (st && st.on_complete && st.on_complete !== "none") {
+          const lbl =
+            st.on_complete === "shutdown" ? "Auto-shutdown" :
+            st.on_complete === "sleep" ? "Auto-sleep" :
+            st.on_complete === "hibernate" ? "Auto-hibernate" : "Auto-exit";
+          bits.push(`⚡ ${lbl} armed`);
+        }
+        if (st && st.sched_enabled && (st.sched_start || st.sched_stop)) {
+          const range = [st.sched_start, st.sched_stop].filter(Boolean).join(" → ");
+          bits.push(`🕑 Scheduler ${range}`);
+        }
+        ind.style.display = bits.length ? "" : "none";
+        ind.innerHTML = bits.map((x) => `<span class="armed">${esc(x)}</span>`).join("");
+      }
     });
   }
 
@@ -616,7 +636,7 @@ export class VortexApp {
             const urls = await api.readUrls();
             if (!urls.length) return toast("No URLs found", "err");
             for (const u of urls) {
-              await api.startDownload(u, store.settings?.path || "", store.settings?.segments ?? 8);
+              await api.startDownload(u, store.settings?.path || "", store.settings?.segments ?? 16);
             }
             toast(`${urls.length} download(s) queued`, "ok");
           } catch (e: unknown) {
@@ -778,7 +798,7 @@ export class VortexApp {
                 }), "Download");
               }
             } else {
-              run(api.startDownload(d.url, store.settings?.path || "", store.settings?.segments ?? 8), "Download");
+              run(api.startDownload(d.url, store.settings?.path || "", store.settings?.segments ?? 16), "Download");
             }
           } else {
             // HTTP error/cancelled: resume the SAME task so kept part files
@@ -811,7 +831,7 @@ export class VortexApp {
         if (magnets.length) toast("Torrent downloads are not supported in this version", "err");
         if (!urls.length) return;
         for (const u of urls) {
-          void api.startDownload(u, store.settings?.path || "", store.settings?.segments ?? 8).catch((err) =>
+          void api.startDownload(u, store.settings?.path || "", store.settings?.segments ?? 16).catch((err) =>
             toast(String(err), "err"),
           );
         }
