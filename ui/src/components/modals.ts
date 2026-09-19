@@ -774,7 +774,7 @@ export function openWelcome(toolsMissing: boolean, onSettings: () => void) {
     () => `
   <div class="modal" style="width:520px">
     <div class="modal-head">
-      <span style="color:var(--acc-1)">${icon("logo", 20)}</span>
+      <img src="/app-icon.png" alt="Vortex" style="width:26px;height:26px;border-radius:7px" />
       <h3>Welcome to Vortex</h3>
       <div class="spacer"></div>
       <button class="x" data-close>${icon("close", 16)}</button>

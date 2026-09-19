@@ -87,6 +87,11 @@ button {
   color: #fff; font-size: 12px;
   box-shadow: 0 0 16px rgba(129, 140, 248, 0.6);
 }
+.titlebar .brand .logo-img {
+  width: 24px; height: 24px;
+  border-radius: 8px;
+  box-shadow: 0 0 16px rgba(129, 140, 248, 0.6);
+}
 .titlebar .tagline {
   color: var(--text-3);
   font-size: 11px;

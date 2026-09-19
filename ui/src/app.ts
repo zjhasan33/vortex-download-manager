@@ -146,7 +146,7 @@ export class VortexApp {
   private titlebar() {
     return `
     <div class="titlebar">
-      <div class="brand"><span class="logo">${icon("logo", 14)}</span>VORTEX</div>
+      <div class="brand"><img class="logo-img" src="/app-icon.png" alt="Vortex" />VORTEX</div>
       <span class="tagline">Download Manager</span>
       <div class="spacer"></div>
       <div class="tb-actions">
