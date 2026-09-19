@@ -316,8 +316,6 @@ export class VortexApp {
     const pct = Number.isFinite(d.progress) ? d.progress.toFixed(1) : "0.0";
     const barCls = d.status === "error" ? "err" : d.status === "completed" ? "done" : "";
     const checked = this.selected.has(d.id);
-    const isTorrent = d.source === "torrent";
-    const tx = isTorrent ? store.torrentExtra(d.id) : { up: 0, peers: d.live || 0, ratio: 0 };
     // Playlist prominence (A+): "▶ k/n • title" so the current video is
     // obvious; single videos / history fall through unchanged.
     const pl = d.source === "youtube" ? playlistPos(d.filename) : null;
@@ -339,10 +337,10 @@ export class VortexApp {
       prog: `
         <div class="dl-prog">
           <div class="bar ${barCls}"><div class="fill" style="width:${pct}%"></div></div>
-          <span class="dl-pct"><span class="dl-pct-val">${pct}%</span> <span class="dl-seg" style="color:var(--text-3)">${isTorrent ? `Peers ${tx.peers}` : `${d.segments} seg`}</span></span>
+          <span class="dl-pct"><span class="dl-pct-val">${pct}%</span> <span class="dl-seg" style="color:var(--text-3)">${d.segments} seg</span></span>
         </div>`,
-      speed: `<span class="dl-speed">${d.status === "downloading" || d.status === "merging" ? (isTorrent ? `↓ ${formatSpeed(d.speed)} ↑ ${formatSpeed(tx.up)}` : formatSpeed(d.speed)) : "–"}</span>`,
-      eta: `<span class="dl-eta">${d.status === "downloading" ? (isTorrent ? `Ratio ${tx.ratio.toFixed(2)}` : formatEta(d.eta)) : "–"}</span>`,
+      speed: `<span class="dl-speed">${d.status === "downloading" || d.status === "merging" ? formatSpeed(d.speed) : "–"}</span>`,
+      eta: `<span class="dl-eta">${d.status === "downloading" ? formatEta(d.eta) : "–"}</span>`,
       status: `<div class="dl-status"><span class="chip ${d.status}">${statusLabel}${d.status === "error" && d.error ? ` • ${esc(d.error.slice(0, 28))}` : ""}</span></div>`,
       actions: `
         <div class="dl-actions">
@@ -384,22 +382,14 @@ export class VortexApp {
       if (pv) pv.textContent = `${pct}%`;
       const sz = el.querySelector<HTMLElement>(".dl-size");
       if (sz) sz.textContent = formatBytes(d.total_size || d.downloaded);
-      const isT = d.source === "torrent";
-      const txt = isT ? store.torrentExtra(d.id) : null;
       const segNote = el.querySelector<HTMLElement>(".dl-seg");
-      if (segNote) segNote.textContent = isT ? `Peers ${txt!.peers}` : `${d.segments} seg`;
+      if (segNote) segNote.textContent = `${d.segments} seg`;
       const sp = el.querySelector<HTMLElement>(".dl-speed");
       if (sp)
         sp.textContent =
-          d.status === "downloading" || d.status === "merging"
-            ? isT
-              ? `↓ ${formatSpeed(d.speed)} ↑ ${formatSpeed(txt!.up)}`
-              : formatSpeed(d.speed)
-            : "–";
+          d.status === "downloading" || d.status === "merging" ? formatSpeed(d.speed) : "–";
       const eta = el.querySelector<HTMLElement>(".dl-eta");
-      if (eta)
-        eta.textContent =
-          d.status === "downloading" ? (isT ? `Ratio ${txt!.ratio.toFixed(2)}` : formatEta(d.eta)) : "–";
+      if (eta) eta.textContent = d.status === "downloading" ? formatEta(d.eta) : "–";
     }
     this.refreshChrome();
   }
@@ -761,7 +751,6 @@ export class VortexApp {
         const act = t.dataset.act!;
         const d = store.downloads.find((x) => x.id === id);
         if (!d) return;
-        const isTorrent = d.source === "torrent";
         // Row actions: failures toast (no silent dead clicks); chained list
         // refreshes stay quiet (next tick/event covers them anyway).
         const quiet = (p: Promise<unknown>) =>
@@ -769,21 +758,15 @@ export class VortexApp {
         const run = (p: Promise<unknown>, what: string) =>
           p.catch((e: unknown) => toast(`${what} failed: ${String(e)}`, "err"));
         if (act === "pause") {
-          if (isTorrent) run(api.pauseTorrent(id).then(() => quiet(store.refresh())), "Pause");
-          else run(api.pauseDownload(id), "Pause");
+          run(api.pauseDownload(id), "Pause");
         } else if (act === "resume") {
-          if (isTorrent) run(api.resumeTorrent(id).then(() => quiet(store.refresh())), "Resume");
-          else run(api.resumeDownload(id), "Resume");
+          run(api.resumeDownload(id), "Resume");
         } else if (act === "stop") {
-          if (isTorrent) run(api.cancelTorrent(id, false).then(() => quiet(store.refresh())), "Stop");
-          else run(api.cancelDownload(id).then(() => quiet(store.refresh())), "Stop");
+          run(api.cancelDownload(id).then(() => quiet(store.refresh())), "Stop");
         } else if (act === "folder") run(api.openFolder(d.save_path), "Open folder");
         else if (act === "open") run(api.openFile(d.save_path), "Open file");
         else if (act === "reload") {
-          if (isTorrent) {
-            // Re-seed / restart the same session task.
-            run(api.resumeTorrent(id).then(() => quiet(store.refresh())), "Reload");
-          } else if (d.source === "youtube" || d.status === "completed") {
+          if (d.source === "youtube" || d.status === "completed") {
             if (d.source === "youtube") {
               const path = store.settings?.path || "";
               if (d.format_id) {
@@ -797,9 +780,6 @@ export class VortexApp {
             } else {
               run(api.startDownload(d.url, store.settings?.path || "", store.settings?.segments ?? 8), "Download");
             }
-          } else if (isTorrent) {
-            // Torrent error/cancelled: unpause the SAME session task.
-            run(api.resumeTorrent(id).then(() => quiet(store.refresh())), "Resume");
           } else {
             // HTTP error/cancelled: resume the SAME task so kept part files
             // continue instead of downloading from zero.

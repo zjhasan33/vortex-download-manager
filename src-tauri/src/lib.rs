@@ -11,7 +11,6 @@ mod grabber;
 mod md5;
 mod state;
 mod tools;
-pub mod torrent;
 mod ws_server;
 mod ytdlp;
 
@@ -256,7 +255,7 @@ async fn start_download(
 }
 
 #[tauri::command]
-async fn pause_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
+async fn pause_download(_app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
     // Scoped lookups: std Mutex guards must not live across awaits (not Send).
     let ht = state.http.lock().unwrap().get(&id).cloned();
     if let Some(t) = ht {
@@ -267,10 +266,6 @@ async fn pause_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>,
     if let Some(t) = yt {
         t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         return Ok(());
-    }
-    let tt = state.torrents.lock().unwrap().get(&id).cloned();
-    if let Some(t) = tt {
-        t.pause(&app).await?;
     }
     Ok(())
 }
@@ -314,12 +309,7 @@ async fn remove_credential(
 }
 
 #[tauri::command]
-async fn resume_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
-    let tt = state.torrents.lock().unwrap().get(&id).cloned();
-    if let Some(t) = tt {
-        t.resume(&app).await?;
-        return Ok(());
-    }
+async fn resume_download(_app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
     let m = state.http.lock().unwrap();
     if let Some(t) = m.get(&id) {
         // Never double-run an already live task (two loops would corrupt).
@@ -355,32 +345,7 @@ async fn retry_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlManag
 
 #[tauri::command]
 async fn resume_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>) -> Result<usize, String> {
-    let mut n = state.resume_all();
-    // Torrents (Phase 3): unpause stopped tasks, same sweep.
-    let tts: Vec<Arc<torrent::TorrentTask>> = {
-        state
-            .torrents
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|t| {
-                matches!(
-                    *t.status.read().unwrap(),
-                    download::DlStatus::Paused
-                        | download::DlStatus::Cancelled
-                        | download::DlStatus::Error
-                )
-            })
-            .cloned()
-            .collect()
-    };
-    for t in tts {
-        // A dead torrent (peerless magnet etc.) must not block the rest.
-        let _ = t.error.lock().unwrap().take();
-        if t.resume(&app).await.is_ok() {
-            n += 1;
-        }
-    }
+    let n = state.resume_all();
     if n > 0 {
         let _ = app.emit("downloads-changed", ());
     }
@@ -391,35 +356,12 @@ async fn resume_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlMana
 /// queued task (grabber batches, multi-downloads) to wipe a bandwidth storm.
 #[tauri::command]
 async fn cancel_all_active(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>) -> Result<usize, String> {
-    let mut n = state.cancel_all_active();
-    // Torrents (Phase 3): stop traffic but keep entries resumable.
-    let tts: Vec<Arc<torrent::TorrentTask>> = {
-        state
-            .torrents
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|t| {
-                matches!(
-                    *t.status.read().unwrap(),
-                    download::DlStatus::Downloading
-                        | download::DlStatus::Merging
-                        | download::DlStatus::Queued
-                )
-            })
-            .cloned()
-            .collect()
-    };
-    for t in tts {
-        if t.stop(&app).await.is_ok() {
-            n += 1;
-        }
-    }
+    let n = state.cancel_all_active();
     let _ = app.emit("downloads-changed", ());
     Ok(n)
 }
 
-/// Pause every active (downloading/merging/queued) HTTP + youtube + torrent task.
+/// Pause every active (downloading/merging/queued) HTTP + youtube task.
 async fn pause_all_inner(app: &tauri::AppHandle, mgr: Arc<DlManager>) -> usize {
     let ids: Vec<String> = mgr
         .views()
@@ -435,17 +377,7 @@ async fn pause_all_inner(app: &tauri::AppHandle, mgr: Arc<DlManager>) -> usize {
         })
         .map(|v| v.id.clone())
         .collect();
-    let mut n = mgr.bulk_pause(&ids);
-    // Torrents (Phase 3): session-level pause, same sweep.
-    let tts: Vec<Arc<torrent::TorrentTask>> = {
-        let map = mgr.torrents.lock().unwrap();
-        ids.iter().filter_map(|id| map.get(id).cloned()).collect()
-    };
-    for t in tts {
-        if t.pause(app).await.is_ok() {
-            n += 1;
-        }
-    }
+    let n = mgr.bulk_pause(&ids);
     if n > 0 {
         let _ = app.emit("downloads-changed", ());
     }
@@ -466,7 +398,6 @@ async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
     enum Target {
         Http(Arc<crate::download::Task>),
         Yt(Arc<crate::ytdlp::YtTask>),
-        Torrent(Arc<torrent::TorrentTask>),
         None,
     }
     let target = {
@@ -474,8 +405,6 @@ async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
             Target::Http(t)
         } else if let Some(t) = state.yt.lock().unwrap().get(&id).cloned() {
             Target::Yt(t)
-        } else if let Some(t) = state.torrents.lock().unwrap().get(&id).cloned() {
-            Target::Torrent(t)
         } else {
             Target::None
         }
@@ -497,11 +426,6 @@ async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
             t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             true
         }
-        // Torrent rows: stop traffic, keep the resumable entry.
-        Target::Torrent(t) => {
-            t.stop(&app).await?;
-            true
-        }
         Target::None => false,
     };
     if should_emit { let _ = app.emit("downloads-changed", ()); }
@@ -510,11 +434,6 @@ async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
 
 #[tauri::command]
 async fn remove_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String, delete_file: Option<bool>) -> Result<(), String> {
-    // Torrent rows shut down the session (no headless seeding leaks).
-    if state.torrents.lock().unwrap().contains_key(&id) {
-        torrent::delete_task(&app, &state, &id, delete_file.unwrap_or(false)).await?;
-        return Ok(());
-    }
     remove_one(&app, &state, &id, delete_file.unwrap_or(false));
     let _ = app.emit("downloads-changed", ());
     Ok(())
@@ -553,93 +472,9 @@ fn remove_one(_app: &tauri::AppHandle, state: &Arc<DlManager>, id: &str, delete_
     state.remove_with_file(id, delete_file);
 }
 
-/// Parse a `.torrent` file into metadata (Phase 1: no downloading yet).
-/// File I/O runs on a blocking thread so the async runtime never stalls.
-#[tauri::command]
-async fn parse_torrent_file(path: String) -> Result<torrent::TorrentMetadata, String> {
-    tokio::task::spawn_blocking(move || torrent::parse_torrent_file(&path))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Parse a `magnet:` URI locally (instant, offline). File-list resolution
-/// over DHT arrives with the Phase 2 session.
-#[tauri::command]
-async fn parse_magnet_link(url: String) -> Result<torrent::TorrentMetadata, String> {
-    torrent::parse_magnet_link(&url)
-}
-
-/// Resolve a magnet / remote-.torrent URL into its full file tree over DHT
-/// (list-only: nothing is downloaded or registered). For the torrent modal.
-#[tauri::command]
-async fn resolve_magnet_metadata(
-    app: tauri::AppHandle,
-    tm: State<'_, Arc<torrent::TorrentManager>>,
-    source: String,
-    output_dir: Option<String>,
-    timeout_secs: Option<u64>,
-) -> Result<torrent::TorrentMetadata, String> {
-    let dir = match output_dir {
-        Some(d) if !d.trim().is_empty() => d,
-        _ => state::load_settings(&app).path,
-    };
-    torrent::resolve_magnet(&tm, source, dir, timeout_secs.unwrap_or(15)).await
-}
-
-/// Start a torrent/magnet download (Phase 2). Returns the info-hash id.
-#[tauri::command]
-async fn add_torrent(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<DlManager>>,
-    tm: State<'_, Arc<torrent::TorrentManager>>,
-    source: String,
-    output_dir: Option<String>,
-    files: Option<Vec<usize>>,
-) -> Result<String, String> {
-    let dir = match output_dir {
-        Some(d) if !d.trim().is_empty() => d,
-        _ => state::load_settings(&app).path,
-    };
-    torrent::TorrentManager::add_torrent_task(&tm, &app, &state, source, dir, files).await
-}
-
-#[tauri::command]
-async fn pause_torrent(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<DlManager>>,
-    info_hash: String,
-) -> Result<(), String> {
-    torrent::pause_task(&app, &state, &info_hash).await
-}
-
-#[tauri::command]
-async fn resume_torrent(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<DlManager>>,
-    info_hash: String,
-) -> Result<(), String> {
-    torrent::resume_task(&app, &state, &info_hash).await
-}
-
-#[tauri::command]
-async fn cancel_torrent(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<DlManager>>,
-    info_hash: String,
-    delete_files: Option<bool>,
-) -> Result<(), String> {
-    torrent::delete_task(&app, &state, &info_hash, delete_files.unwrap_or(false)).await
-}
-
 #[tauri::command]
 async fn list_downloads(state: State<'_, Arc<DlManager>>) -> Result<Vec<download::DlView>, String> {
-    let v = state.views();
-    eprintln!(
-        "[list] returning {} item(s) (torrents in map: {})",
-        v.len(),
-        state.torrents.lock().unwrap_or_else(|e| e.into_inner()).len()
-    );
-    Ok(v)
+    Ok(state.views())
 }
 
 #[tauri::command]
@@ -922,7 +757,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(DlManager::new()))
-        .manage(Arc::new(torrent::TorrentManager::new()))
         .setup(|app| {
             let handle = app.handle();
             let settings = state::load_settings(handle);
@@ -1062,13 +896,6 @@ pub fn run() {
             read_urls,
             get_ws_token,
             window_action,
-            parse_torrent_file,
-            parse_magnet_link,
-            resolve_magnet_metadata,
-            add_torrent,
-            pause_torrent,
-            resume_torrent,
-            cancel_torrent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Vortex");

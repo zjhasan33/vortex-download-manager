@@ -9,7 +9,6 @@ import type {
   GrabItem,
   Settings,
   AppStats,
-  TorrentMetadata,
 } from "../types";
 import { toast } from "./ui";
 import { playSuccess, playError, playBatch } from "./sound";
@@ -25,19 +24,6 @@ export interface ProgressPayload {
   connections?: number;
 }
 
-export interface TorrentProgress {
-  id: string;
-  downloaded: number;
-  total_size: number;
-  down_speed: number;
-  up_speed: number;
-  peers: number;
-  seeders: number;
-  progress: number;
-  eta: number;
-  ratio: number;
-}
-
 const events: UnlistenFn[] = [];
 
 export interface AuthRequiredPayload {
@@ -51,9 +37,6 @@ export async function initApi() {
   events.push(
     await listen<ProgressPayload>("download-progress", (e) => {
       store.updateProgress(e.payload);
-    }),
-    await listen<TorrentProgress>("torrent-progress", (e) => {
-      store.updateTorrent(e.payload);
     }),
     await listen<{ id: string; status: Download["status"]; error?: string }>(
       "download-status",
@@ -106,15 +89,6 @@ export const api = {
   fetchYtdlInfo: (url: string) => cmd<YtdlInfo>("fetch_ytdl_info", { url }),
   grabSite: (url: string, maxPages?: number, kinds?: string[]) =>
     cmd<GrabItem[]>("grab_site", { url, maxPages, kinds }),
-  parseTorrentFile: (path: string) => cmd<TorrentMetadata>("parse_torrent_file", { path }),
-  parseMagnetLink: (url: string) => cmd<TorrentMetadata>("parse_magnet_link", { url }),
-  resolveMagnet: (source: string, outputDir?: string, timeoutSecs?: number) =>
-    cmd<TorrentMetadata>("resolve_magnet_metadata", { source, outputDir, timeoutSecs }),
-  addTorrent: (source: string, outputDir?: string, files?: number[]) =>
-    cmd<string>("add_torrent", { source, outputDir, files }),
-  pauseTorrent: (infoHash: string) => cmd<void>("pause_torrent", { infoHash }),
-  resumeTorrent: (infoHash: string) => cmd<void>("resume_torrent", { infoHash }),
-  cancelTorrent: (infoHash: string, deleteFiles?: boolean) => cmd<void>("cancel_torrent", { infoHash, deleteFiles }),
   grabStop: () => cmd<void>("grab_stop"),  startYtdl: (
     url: string,
     formatId: string,
@@ -172,9 +146,6 @@ class Store {
   stats: AppStats = { total_speed: 0, active: 0, completed: 0, total_downloaded: 0, segments: 0, connections: 0 };
   tools: ToolsStatus | null = null;
   settings: Settings | null = null;
-  /** Live per-torrent extras (up speed / peers / ratio) keyed by info-hash.
-   *  Survives list refreshes; rows read it when `source === "torrent"`. */
-  tstats: Record<string, { up: number; peers: number; ratio: number }> = {};
   private listeners = new Set<Listener>();
   private ticking = false;
 
@@ -190,10 +161,6 @@ class Store {
     const [dl, st] = await Promise.all([api.listDownloads(), api.getStats()]);
     this.downloads = dl;
     this.stats = st;
-    const alive = new Set(dl.map((d) => d.id));
-    for (const id of Object.keys(this.tstats)) {
-      if (!alive.has(id)) delete this.tstats[id];
-    }
     this.emit();
   }
 
@@ -225,34 +192,6 @@ class Store {
     }
     this.stats = { ...this.stats, total_speed: speed, active, segments: segs, connections: conns };
     this.emit();
-  }
-
-  updateTorrent(p: TorrentProgress) {
-    const d = this.downloads.find((x) => x.id === p.id);
-    if (d) {
-      d.downloaded = p.downloaded;
-      d.total_size = p.total_size;
-      d.speed = p.down_speed;
-      d.progress = p.progress;
-      d.eta = p.eta;
-      d.live = p.peers;
-    }
-    this.tstats[p.id] = { up: p.up_speed, peers: p.peers, ratio: p.ratio };
-    // Fold torrent speed into the live statusbar like HTTP downloads.
-    let speed = 0,
-      active = 0;
-    for (const x of this.downloads) {
-      if (x.status === "downloading" || x.status === "merging") {
-        active += 1;
-        speed += x.speed;
-      }
-    }
-    this.stats = { ...this.stats, total_speed: speed, active };
-    this.emit();
-  }
-
-  torrentExtra(id: string): { up: number; peers: number; ratio: number } {
-    return this.tstats[id] ?? { up: 0, peers: 0, ratio: 0 };
   }
 
   updateStatus(p: { id: string; status: Download["status"]; error?: string }) {

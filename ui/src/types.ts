@@ -89,15 +89,6 @@ export interface AppStats {
   connections: number;
 }
 
-export interface TorrentMetadata {
-  info_hash: string;
-  name: string;
-  total_size: number;
-  files: { path: string; size: number }[];
-  trackers: string[];
-  is_magnet: boolean;
-  magnet_url?: string | null;
-}
 
 export interface GrabItem {
   url: string;

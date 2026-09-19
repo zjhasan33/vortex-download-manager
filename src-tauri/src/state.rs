@@ -13,8 +13,6 @@ use crate::download::{self, DlStatus, DlView};
 pub struct DlManager {
     pub http: Mutex<HashMap<String, Arc<crate::download::Task>>>,
     pub yt: Mutex<HashMap<String, Arc<crate::ytdlp::YtTask>>>,
-    /// Native torrent tasks (Phase 2) — shown in the same list as HTTP/YouTube.
-    pub torrents: Mutex<HashMap<String, Arc<crate::torrent::TorrentTask>>>,
     pub limit: Arc<AtomicU64>,
     /// Concurrency gate state.
     pub max_active: AtomicUsize,
@@ -37,7 +35,6 @@ impl DlManager {
         DlManager {
             http: Mutex::new(HashMap::new()),
             yt: Mutex::new(HashMap::new()),
-            torrents: Mutex::new(HashMap::new()),
             limit: Arc::new(AtomicU64::new(0)),
             max_active: AtomicUsize::new(5),
             active: AtomicUsize::new(0),
@@ -130,9 +127,6 @@ impl DlManager {
             v.push(t.view());
         }
         for t in self.yt.lock().unwrap_or_else(|e| e.into_inner()).values() {
-            v.push(t.view());
-        }
-        for t in self.torrents.lock().unwrap_or_else(|e| e.into_inner()).values() {
             v.push(t.view());
         }
         for h in self.history.lock().unwrap_or_else(|e| e.into_inner()).iter() {
