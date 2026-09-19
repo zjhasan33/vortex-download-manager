@@ -275,11 +275,90 @@ fn finalize_file(src: &std::path::Path, dir: &std::path::Path, clean: &str) -> O
         target = dir.join(format!("{} ({}){}", stem, n, ext));
         n += 1;
     }
-    if std::fs::rename(src, &target).is_ok() {
+    if move_file(src, &target) {
         Some(target)
     } else {
         None
     }
+}
+
+/// Rename, with a copy+delete fallback for cross-volume moves
+/// (TEMP and Downloads may live on different drives).
+fn move_file(src: &std::path::Path, dst: &std::path::Path) -> bool {
+    if std::fs::rename(src, dst).is_ok() {
+        return true;
+    }
+    if std::fs::copy(src, dst).is_ok() {
+        let _ = std::fs::remove_file(src);
+        return true;
+    }
+    false
+}
+
+/// True for finished yt-dlp products; false for in-progress/intermediate
+/// artifacts (`.part`, `-FragN` pieces, `.ytdl` manifests, `.temp`/`.tmp`).
+/// yt-dlp's `-N` fragment parts land next to `-o` even with `--paths temp:`,
+/// so completion must tell them apart from the real output.
+fn is_final_output(name: &str) -> bool {
+    if name.ends_with(".ytdl") || name.ends_with(".temp") || name.ends_with(".tmp") || name.ends_with(".part") {
+        return false;
+    }
+    if name.contains(".part.") || name.contains(".part-") || name.contains("-Frag") {
+        return false;
+    }
+    true
+}
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+/// Move every finished file under `src_root` to the mirrored path under
+/// `dst_root` (creating folders as needed, never overwriting: a " (n)"
+/// suffix is added on collision). Intermediates are left behind for the
+/// staging-dir cleanup. Returns how many files were moved.
+fn move_staged_tree(src_root: &std::path::Path, dst_root: &std::path::Path) -> usize {
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    collect_files(src_root, &mut files);
+    let mut n = 0;
+    for src in files {
+        let Ok(rel) = src.strip_prefix(src_root) else { continue };
+        let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !is_final_output(name) {
+            continue;
+        }
+        let mut dst = dst_root.join(rel);
+        if dst.exists() {
+            let stem = dst
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let ext = dst
+                .extension()
+                .map(|s| format!(".{}", s.to_string_lossy()))
+                .unwrap_or_default();
+            let mut i = 1;
+            while dst.exists() {
+                dst = dst.with_file_name(format!("{stem} ({i}){ext}"));
+                i += 1;
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if move_file(&src, &dst) {
+            n += 1;
+        }
+    }
+    n
 }
 
 fn split_num_unit(s: &str) -> (f64, &str) {
@@ -1025,8 +1104,23 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
     } else {
         task.save_path.lock().unwrap().display().to_string()
     };
+    // Route ALL yt-dlp output through the per-task staging dir: `-N` fragments,
+    // `.part` files, subtitles and thumbnails would otherwise land next to the
+    // final file in the user's Downloads folder (`--paths temp:` does NOT
+    // relocate concurrent `-Frag` parts). Only finished files are moved out
+    // at completion; the staging dir is deleted afterwards.
+    let real_base = task.save_base.lock().unwrap().clone();
+    let staged_tmpl = {
+        let p = std::path::Path::new(&tmpl);
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| tmpl.clone());
+        tmp_root.join(name).display().to_string()
+    };
+    let _ = std::fs::create_dir_all(&real_base);
     args.push("-o".into());
-    args.push(tmpl);
+    args.push(staged_tmpl);
     args.push(task.url.clone());
 
     let mut child = crate::tools::silent(std::process::Command::new(bin))
@@ -1253,9 +1347,12 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
 
     if status.success() {
         if task.include_playlist {
+            // Whole-playlist job: yt-dlp staged into tmp_root — move finished
+            // videos into the real playlist folder first, then summarize.
+            let base = task.save_base.lock().unwrap().clone();
+            move_staged_tree(&tmp_root, &base);
             // Whole-playlist job: locate the videos inside a "NN - Title.ext"
             // folder (or any sub-folder) and summarize them on the row.
-            let base = task.save_base.lock().unwrap().clone();
             let outputs = find_playlist_outputs(&base, started);
             if !outputs.is_empty() {
                 // Remember every produced video for remove-with-delete.
@@ -1284,10 +1381,20 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                 *task.error.lock().unwrap() = Some("Output file not found".into());
             }
         } else {
-            // Locate the built output file(s) via the unique prefix and record the real path.
-            let dir = task.save_path.lock().unwrap().parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            // yt-dlp staged into tmp_root: pick finished files via the unique
+            // prefix (skipping `.part`/`-Frag`/`.ytdl` intermediates) and move
+            // them into the real destination folder with clean names.
+            let dir = task.save_base.lock().unwrap().clone();
             let prefix = format!("vx_{}_", task.id);
-            let outputs = find_outputs(&dir, &prefix);
+            let outputs = find_outputs(&tmp_root, &prefix)
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(is_final_output)
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
             if !outputs.is_empty() {
                 // Strip the temporary prefix from final filename(s).
                 let mut real_names: Vec<String> = Vec::new();

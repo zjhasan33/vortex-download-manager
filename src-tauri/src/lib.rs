@@ -756,6 +756,21 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Second launch focuses the running window instead of starting a
+        // ghost instance whose downloads would be invisible (empty list).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let show = |w: tauri::WebviewWindow| {
+                let _ = w.show();
+                #[cfg(desktop)]
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            };
+            if let Some(w) = app.get_webview_window("main") {
+                show(w);
+            } else if let Some((_, w)) = app.webview_windows().into_iter().next() {
+                show(w);
+            }
+        }))
         .manage(Arc::new(DlManager::new()))
         .setup(|app| {
             let handle = app.handle();
