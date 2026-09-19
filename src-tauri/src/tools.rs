@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Prevent console windows from flashing for spawned console apps (yt-dlp, ffmpeg, reg, ...).
 pub(crate) fn silent(mut cmd: Command) -> Command {
@@ -92,7 +92,7 @@ pub async fn ensure_ytdlp(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(p);
     }
     let target = tools_dir(app).map_err(|e| e.to_string())?.join("yt-dlp.exe");
-    download_to(&YTDLP_URL, &target).await.map_err(|e| format!("Failed to download yt-dlp: {e}"))?;
+    download_to(app, "yt-dlp", &YTDLP_URL, &target).await.map_err(|e| format!("Failed to download yt-dlp: {e}"))?;
     Ok(target)
 }
 
@@ -111,7 +111,7 @@ pub async fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
     let _ = fs::remove_file(&zip_path); // drop any stale partial archive
 
     eprintln!("[vortex-tools] downloading ffmpeg from {FFMPEG_URL} -> {zip_path:?}");
-    download_to(&FFMPEG_URL, &zip_path)
+    download_to(app, "ffmpeg", &FFMPEG_URL, &zip_path)
         .await
         .map_err(|e| {
             eprintln!("[vortex-tools] ffmpeg download FAILED: {e}");
@@ -180,13 +180,16 @@ fn extract_ffmpeg(zip_path: &std::path::Path, dir: &std::path::Path) -> Result<(
 /// Download with resume + retries: a truncated tool fetch (killed app, cut
 /// connection — the classic 7 MB ffmpeg.zip) continues from its partial bytes
 /// instead of restarting from zero and failing the same way again.
-async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> {
+async fn download_to(app: &AppHandle, kind: &str, url: &str, target: &std::path::Path) -> Result<(), String> {
     const MAX_ATTEMPTS: u64 = 5;
     let mut attempt = 0u64;
     loop {
         attempt += 1;
-        match download_once(url, target).await {
-            Ok(()) => return Ok(()),
+        match download_once(app, kind, url, target).await {
+            Ok(()) => {
+                let _ = app.emit("tools-progress", serde_json::json!({"kind": kind, "done": true, "progress": 100}));
+                return Ok(());
+            },
             Err(e) => {
                 eprintln!("[vortex-tools] attempt {attempt} failed: {e}");
                 if attempt >= MAX_ATTEMPTS {
@@ -200,7 +203,7 @@ async fn download_to(url: &str, target: &std::path::Path) -> Result<(), String> 
     }
 }
 
-async fn download_once(url: &str, target: &std::path::Path) -> Result<(), String> {
+async fn download_once(app: &AppHandle, kind: &str, url: &str, target: &std::path::Path) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .user_agent(BROWSER_UA)
@@ -271,6 +274,7 @@ async fn download_once(url: &str, target: &std::path::Path) -> Result<(), String
         if written >= next_log {
             let pct = if total > 0 { (written * 100 / total) as u32 } else { 0 };
             eprintln!("[vortex-tools]   {written} / {total} ({pct}%)");
+            let _ = app.emit("tools-progress", serde_json::json!({"kind": kind, "downloaded": written, "total": total, "progress": pct}));
             next_log = written + 2 * 1024 * 1024;
             out.flush().await.ok();
         }
@@ -343,7 +347,7 @@ pub async fn update_ytdlp(app: &AppHandle) -> Result<(), String> {
             eprintln!("[vortex-tools] yt-dlp --update => {combined}");
             if !status.map(|s| s.success()).unwrap_or(false) {
                 eprintln!("[vortex-tools] yt-dlp updater failed — re-downloading");
-                return download_to(&YTDLP_URL, &target)
+                    return download_to(app, "yt-dlp", &YTDLP_URL, &target)
                     .await
                     .map_err(|e| format!("yt-dlp update failed: {e}"));
             }
@@ -360,7 +364,7 @@ pub async fn update_ffmpeg(app: &AppHandle) -> Result<(), String> {
     let _ = fs::remove_file(&zip_path); // drop any stale partial archive
 
     eprintln!("[vortex-tools] force-refreshing ffmpeg from {FFMPEG_URL}");
-    download_to(&FFMPEG_URL, &zip_path)
+    download_to(app, "ffmpeg", &FFMPEG_URL, &zip_path)
         .await
         .map_err(|e| {
             let _ = fs::remove_file(&zip_path);

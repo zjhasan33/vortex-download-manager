@@ -233,6 +233,8 @@ async fn start_download(
     start_at: Option<u64>,
     start_paused: Option<bool>,
     on_exists: Option<String>,
+    referer: Option<String>,
+    cookies: Option<String>,
 ) -> Result<download::DlView, String> {
     let settings = state::load_settings(&app);
     let opts = download::StartOpts {
@@ -242,8 +244,8 @@ async fn start_download(
         start_at,
         auto_retries: settings.auto_retries,
         proxy: settings.proxy.clone(),
-        referer: None,
-        cookies: None,
+        referer,
+        cookies,
         on_exists,
     };
     let task = download::start(app.clone(), url, save_path, opts, state.limit.clone()).await?;

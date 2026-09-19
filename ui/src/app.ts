@@ -4,7 +4,7 @@ import { toast } from "./lib/ui";
 import { formatBytes, formatSpeed, formatEta } from "./lib/format";
 import { SpeedChart } from "./lib/chart";
 import type { CategoryId, Download } from "./types";
-import { openAddUrl, openSettings, openConfirmRemove, openConfirmBulkRemove, openGrabber, openAuthDialog, openWelcome } from "./components/modals";
+import { openAddUrl, openSettings, openConfirmRemove, openConfirmBulkRemove, openGrabber, openAuthDialog, openWelcome, openIntercept } from "./components/modals";
 import { openYoutube } from "./components/youtube";
 
 // When a download hits HTTP 401, pop the login dialog.
@@ -16,6 +16,16 @@ api.onPlaylistClip = (url) => openYoutube({ url, playlist: true });
 // "Grab All Links on This Page" from the browser extension popup opens the
 // Site Grabber modal pre-filled and starts the crawl automatically.
 api.onGrabberOpen = (url) => openGrabber(url || "", true);
+api.onIntercept = async (p) => {
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const win = getCurrentWindow();
+    await win.show().catch(() => {});
+    await (win as unknown as { unminimize?: () => Promise<void> }).unminimize?.().catch(() => {});
+    await win.setFocus().catch(() => {});
+  } catch {}
+  openIntercept(p.url, p.filename, p.referer, p.cookies);
+};
 
 const CATS: { id: CategoryId; label: string; icon: "video" | "audio" | "doc" | "program" | "zip" | "other" }[] = [
   { id: "all", label: "All Downloads", icon: "other" },
@@ -475,7 +485,22 @@ export class VortexApp {
     await store.refresh();
   }
 
+  private refreshTaskbar() {
+    try {
+      const active = store.downloads.filter((d) => d.status === "downloading" || d.status === "merging" || d.status === "queued");
+      if (!active.length) {
+        import("@tauri-apps/api/window").then(({ getCurrentWindow }) => getCurrentWindow().setProgressBar({ status: "none" } as never)).catch(() => {});
+        return;
+      }
+      const total = active.reduce((s, d) => s + (d.total_size || 0), 0);
+      const done = active.reduce((s, d) => s + (d.downloaded || 0), 0);
+      const pct = total > 0 ? done / total : active.reduce((s, d) => s + (d.progress || 0), 0) / active.length / 100;
+      import("@tauri-apps/api/window").then(({ getCurrentWindow }) => getCurrentWindow().setProgressBar({ status: pct >= 1 ? "normal" : "normal", progress: Math.round(pct * 100) } as never)).catch(() => {});
+    } catch {}
+  }
+
   private refreshChrome() {
+    this.refreshTaskbar();
     const counts: Record<string, number> = {};
     for (const d of store.downloads) counts[d.category] = (counts[d.category] ?? 0) + 1;
     this.root.querySelectorAll<HTMLElement>(".side-item").forEach((el) => {
@@ -576,14 +601,43 @@ export class VortexApp {
     return () => clearInterval(id);
   }
 
+  // Live tools-download progress (ffmpeg/yt-dlp first fetch).
+  private toolsProg: { kind: string; downloaded: number; total: number; progress: number } | null = null;
+  private toolsProgUnlisten: (() => void) | null = null;
+
+  private setupToolsProgress() {
+    if (this.toolsProgUnlisten) return;
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen<{ kind: string; downloaded: number; total: number; progress: number; done?: boolean }>("tools-progress", (e) => {
+        if (e.payload.done) {
+          this.toolsProg = null;
+        } else {
+          this.toolsProg = {
+            kind: e.payload.kind,
+            downloaded: e.payload.downloaded || 0,
+            total: e.payload.total || 0,
+            progress: e.payload.progress || 0,
+          };
+        }
+        this.refreshTools();
+      }).then((fn) => (this.toolsProgUnlisten = fn));
+    });
+  }
+
   private refreshTools() {
+    if (!this.toolsProgUnlisten) this.setupToolsProgress();
     const tools = store.tools;
     if (!tools) return;
     const el = this.root.querySelector<HTMLElement>(".tools-status");
     if (!el) return;
+    const tp = this.toolsProg;
+    const progHtml = tp && tp.total > 0
+      ? `<div class="tools-prog"><div class="tools-prog-bar"><div class="tools-prog-fill" style="width:${tp.progress}%"></div></div><span class="tools-prog-label">${esc(tp.kind)} ${tp.progress}% • ${formatBytes(tp.downloaded)} / ${formatBytes(tp.total)}</span></div>`
+      : tp ? `<div class="tools-prog"><div class="tools-prog-bar"><div class="tools-prog-fill" style="width:${tp.progress}%"></div></div><span class="tools-prog-label">${esc(tp.kind)} ${formatBytes(tp.downloaded)}…</span></div>` : "";
     el.innerHTML = `<div class="side-head" style="padding:0">Tools</div>
       <div class="row"><span class="dot ${tools.ytdlp ? "ok" : "missing"}"></span> yt-dlp ${tools.ytdlp_version ? "v" + tools.ytdlp_version : tools.ytdlp ? "" : "(not found)"}</div>
       <div class="row"><span class="dot ${tools.ffmpeg ? "ok" : "missing"}"></span> ffmpeg ${tools.ffmpeg_version ? "v" + tools.ffmpeg_version : tools.ffmpeg ? "" : "(auto-download)"}</div>
+      ${progHtml}
       <button class="tbtn tools-update" id="tools-update">↻ Update Tools</button>`;
     this.root.querySelector<HTMLButtonElement>(".tools-update")!.onclick = () => {
       void this.runToolsUpdate(el);

@@ -467,8 +467,14 @@ async function takeOverDownload(item) {
   try { await browser.downloads.cancel(item.id); } catch (e) {}
   try { await browser.downloads.erase({ id: item.id }); } catch (e) {}
   try { await browser.downloads.removeFile(item.id); } catch (e) {}
-  // Hand the download to Vortex (no-op when the desktop is offline: the
-  // browser naturally keeps its own download because we skip the handler).
+  // IDM-style: show Start / Download Later / Cancel in Vortex — then Vortex
+  // decides (direct start, queued paused, or cancel).
+  if (online) {
+    try {
+      await rpc("intercept", { url, filename: filename || undefined, referer: referrer || undefined, cookies: cookies || undefined });
+      return;
+    } catch (e) { /* fall through to direct */ }
+  }
   await handleStart({ type: "direct", url, filename, pageUrl: referrer, referer: referrer || undefined, cookies });
 }
 

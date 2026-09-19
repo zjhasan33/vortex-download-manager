@@ -63,6 +63,9 @@ export async function initApi() {
       const url = typeof p === "string" ? p : (p as { url?: string } | null)?.url;
       if (url) api.onGrabberOpen?.(url);
     }),
+    await listen<{ url: string; filename?: string; referer?: string; cookies?: string }>("download-intercept", (e) => {
+      api.onIntercept?.(e.payload);
+    }),
   );
 }
 
@@ -71,8 +74,8 @@ async function cmd<T>(name: string, args?: Record<string, unknown>): Promise<T> 
 }
 
 export const api = {
-  startDownload: (url: string, savePath: string, segments: number, filename?: string, startAt?: number, startPaused?: boolean, onExists?: string) =>
-    cmd<Download>("start_download", { url, savePath, segments, filename, startAt, startPaused, onExists }),
+  startDownload: (url: string, savePath: string, segments: number, filename?: string, startAt?: number, startPaused?: boolean, onExists?: string, referer?: string, cookies?: string) =>
+    cmd<Download>("start_download", { url, savePath, segments, filename, startAt, startPaused, onExists, referer, cookies }),
   pauseDownload: (id: string) => cmd<void>("pause_download", { id }),
   resumeDownload: (id: string) => cmd<void>("resume_download", { id }),
   retryAllDownloads: () => cmd<number>("retry_all_downloads"),
@@ -144,6 +147,8 @@ export const api = {
   onPlaylistClip: null as ((url: string) => void) | null,
   /** Set by app.ts to open the Site Grabber modal (extension "Grab This Page"). */
   onGrabberOpen: null as ((url: string) => void) | null,
+  /** Fired when the browser intercepts a download — show the IDM-style Start/Later/Cancel. */
+  onIntercept: null as ((p: { url: string; filename?: string; referer?: string; cookies?: string }) => void) | null,
 };
 
 // ---- Lightweight reactive store ----

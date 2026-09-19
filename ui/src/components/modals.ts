@@ -845,6 +845,8 @@ export function openWelcome(toolsMissing: boolean, onSettings: () => void) {
         </div>
       </div>
     </div>
+      ${toolsMissing ? `<div id="wc-prog" style="display:none;margin-top:4px"><div style="height:6px;background:rgba(148,163,255,0.12);border-radius:999px;overflow:hidden"><div id="wc-fill" style="height:100%;background:linear-gradient(135deg,#22d3ee,#818cf8);width:0%;transition:width 0.3s"></div></div><span id="wc-label" style="font-size:11px;color:var(--text-3);font-family:var(--mono);margin-top:4px;display:block"></span></div>` : ""}
+    </div>
     <div class="modal-foot">
       <button class="btn-ghost" data-close>Close</button>
       <button class="tbtn" id="wc-key">${icon("key", 14)} Copy pairing key</button>
@@ -865,6 +867,24 @@ export function openWelcome(toolsMissing: boolean, onSettings: () => void) {
         }
       };
       const dl = root.querySelector<HTMLButtonElement>("#wc-tools")!;
+      const progBox = root.querySelector<HTMLElement>("#wc-prog");
+      const progFill = root.querySelector<HTMLElement>("#wc-fill");
+      const progLabel = root.querySelector<HTMLElement>("#wc-label");
+      let unlisten: (() => void) | null = null;
+      if (progBox) {
+        import("@tauri-apps/api/event").then(({ listen }) => {
+          listen<{ kind: string; downloaded: number; total: number; progress: number; done?: boolean }>("tools-progress", (e) => {
+            if (e.payload.done) {
+              if (progLabel) progLabel.textContent = "Finishing…";
+              if (progFill) progFill.style.width = "100%";
+              return;
+            }
+            if (progBox) progBox.style.display = "";
+            if (progFill) progFill.style.width = `${e.payload.progress || 0}%`;
+            if (progLabel) progLabel.textContent = `${e.payload.kind} ${e.payload.progress || 0}% • ${Math.round((e.payload.downloaded || 0) / 1024 / 1024)}MB / ${Math.round((e.payload.total || 0) / 1024 / 1024) || "?"}MB`;
+          }).then((fn) => (unlisten = fn));
+        });
+      }
       dl.onclick = async () => {
         if (busy) return;
         busy = true;
@@ -879,6 +899,7 @@ export function openWelcome(toolsMissing: boolean, onSettings: () => void) {
             ffmpeg_version: res.ffmpeg_version,
           };
           toast(res.ytdlp && res.ffmpeg ? "Tools ready — both dots green" : "Still missing something — try Update Tools again", res.ytdlp && res.ffmpeg ? "ok" : "err");
+          if (unlisten) try { unlisten(); } catch {}
           doClose();
         } catch (e) {
           toast("Download failed: " + String(e), "err");
@@ -985,6 +1006,123 @@ export function openConfirmBulkRemove(count: number, onYes: (deleteFile: boolean
         onYes(del);
         close();
       };
+    },
+  );
+  return close;
+}
+
+/** IDM-style intercept: link clicked → Start Download / Download Later (paused) / Cancel. */
+export function openIntercept(url: string, filename?: string, referer?: string, cookies?: string) {
+  const name = filename || url.split("/").pop() || url;
+  const saveTo = store.settings?.path || "";
+  const close = openModal(
+    () => `
+  <div class="modal" style="width:480px">
+    <div class="modal-head">
+      <span style="color:var(--acc-1)">${icon("download", 18)}</span>
+      <h3>Download file?</h3>
+      <div class="spacer"></div>
+      <button class="x" data-close>${icon("close", 16)}</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:13px;color:var(--text-1);word-break:break-all">${escapeAttr(name)}</div>
+      <div style="font-size:11px;color:var(--text-3);word-break:break-all">${escapeAttr(url)}</div>
+      <div class="field">
+        <label>Save to</label>
+        <div style="display:flex;gap:8px">
+          <input class="input ext" id="ic-path" value="${escapeAttr(saveTo)}" spellcheck="false" />
+          <button class="tbtn" id="ic-browse" title="Browse">${icon("folder", 15)}</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" data-close>Cancel</button>
+      <button class="tbtn" id="ic-later">Download later</button>
+      <button class="tbtn primary" id="ic-start">${icon("download", 15)} Start download</button>
+    </div>
+  </div>`,
+    (root, close) => {
+      root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = close));
+      root.querySelector<HTMLButtonElement>("#ic-browse")!.onclick = async () => {
+        const p = await api.chooseFolder();
+        if (p) root.querySelector<HTMLInputElement>("#ic-path")!.value = p;
+      };
+      const go = async (later: boolean) => {
+        const savePath = root.querySelector<HTMLInputElement>("#ic-path")!.value.trim() || store.settings?.path || "";
+        const segs = store.settings?.segments ?? 16;
+        // start_paused = true queues as Paused (Download Later)
+        const start = (mode?: string) => api.startDownload(url, savePath, segs, filename || undefined, undefined, later, mode ?? (later ? undefined : "prompt"), referer, cookies);
+        let dl: Awaited<ReturnType<typeof api.startDownload>> | null = null;
+        try {
+          dl = await start();
+        } catch (e: unknown) {
+          const m = String(e).match(/^EXISTS::([\s\S]*)$/);
+          if (!m) {
+            toast(String(e), "err");
+            return;
+          }
+          const choice: "replace" | "rename" | "cancel" = await new Promise((res) => openConfirmExists(m[1], res));
+          if (choice === "cancel") return;
+          try {
+            dl = await api.startDownload(url, savePath, segs, filename || undefined, undefined, later, choice === "replace" ? "replace" : undefined, referer, cookies);
+          } catch (e2: unknown) {
+            toast(String(e2), "err");
+            return;
+          }
+        }
+        if (later) {
+          toast("Queued — will start later", "ok");
+          close();
+          return;
+        }
+        if (!dl) {
+          close();
+          return;
+        }
+        // IDM-style: morph into live progress dialog (Pause/Cancel + Minimize to app)
+        const id = dl.id;
+        const body = root.querySelector<HTMLElement>(".modal-body")!;
+        const foot = root.querySelector<HTMLElement>(".modal-foot")!;
+        body.innerHTML = `
+          <div style="display:grid;gap:10px">
+            <div style="font-size:13px;color:var(--text-1);word-break:break-all">${escapeAttr(name)}</div>
+            <div style="height:8px;background:rgba(148,163,255,0.12);border-radius:999px;overflow:hidden"><div id="ic-fill" style="height:100%;background:var(--grad);width:0%;transition:width 0.3s"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-3);font-family:var(--mono)"><span id="ic-pct">0%</span><span id="ic-speed">–</span></div>
+            <div id="ic-eta" style="font-size:11px;color:var(--text-3)"></div>
+          </div>`;
+        foot.innerHTML = `<button class="btn-ghost" id="ic-min">Minimize to app</button><button class="tbtn" id="ic-pause">${icon("pause", 14)} Pause</button><button class="tbtn danger" id="ic-cancel">${icon("close", 14)} Cancel</button>`;
+        foot.querySelector<HTMLButtonElement>("#ic-min")!.onclick = close;
+        const pauseBtn = foot.querySelector<HTMLButtonElement>("#ic-pause")!;
+        const cancelBtn = foot.querySelector<HTMLButtonElement>("#ic-cancel")!;
+        let paused = false;
+        pauseBtn.onclick = async () => {
+          try {
+            if (paused) { await api.resumeDownload(id); paused = false; pauseBtn.innerHTML = `${icon("pause", 14)} Pause`; }
+            else { await api.pauseDownload(id); paused = true; pauseBtn.innerHTML = `${icon("play", 14)} Resume`; }
+          } catch (e: unknown) { toast(String(e), "err"); }
+        };
+        cancelBtn.onclick = async () => {
+          try { await api.cancelDownload(id); } catch {}
+          close();
+        };
+        const unsub = store.subscribe(() => {
+          const d = store.downloads.find((x) => x.id === id);
+          if (!d) return;
+          const fill = root.querySelector<HTMLElement>("#ic-fill");
+          const pctEl = root.querySelector<HTMLElement>("#ic-pct");
+          const spEl = root.querySelector<HTMLElement>("#ic-speed");
+          const etaEl = root.querySelector<HTMLElement>("#ic-eta");
+          if (fill) fill.style.width = `${(d.progress || 0).toFixed(1)}%`;
+          if (pctEl) pctEl.textContent = `${(d.progress || 0).toFixed(1)}% • ${formatBytes(d.downloaded)} / ${formatBytes(d.total_size || d.downloaded)}`;
+          if (spEl) spEl.textContent = d.speed ? `${formatBytes(d.speed)}/s` : "–";
+          if (etaEl) etaEl.textContent = d.eta ? `ETA ${Math.floor(d.eta / 60)}m ${d.eta % 60}s` : "";
+          if (d.status === "completed") { toast("Download completed", "ok"); setTimeout(close, 900); unsub(); }
+          if (d.status === "error" || d.status === "cancelled") { unsub(); }
+        });
+        // Also handle YouTube the same way — ytdlp tasks emit same store events
+      };
+      root.querySelector<HTMLButtonElement>("#ic-start")!.onclick = () => void go(false);
+      root.querySelector<HTMLButtonElement>("#ic-later")!.onclick = () => void go(true);
     },
   );
   return close;

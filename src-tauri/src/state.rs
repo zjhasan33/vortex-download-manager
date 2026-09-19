@@ -225,15 +225,6 @@ impl DlManager {
         });
     }
 
-    pub fn is_running(&self) -> bool {
-        self.views().iter().any(|v| {
-            matches!(
-                v.status,
-                DlStatus::Downloading | DlStatus::Merging | DlStatus::Queued | DlStatus::Resolving
-            )
-        })
-    }
-
     /// Retry every failed/cancelled HTTP task. Returns how many were restarted.
     pub fn retry_all(self: &Arc<DlManager>) -> usize {
         let ids: Vec<String> = self

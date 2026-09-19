@@ -349,6 +349,16 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
             let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let mgr = app.state::<Arc<DlManager>>().inner().clone();
             match typ {
+                "intercept" => {
+                    let p = &v["payload"];
+                    let _ = app.emit("download-intercept", json!({
+                        "url": p["url"].as_str().unwrap_or(""),
+                        "filename": p["filename"].as_str().unwrap_or(""),
+                        "referer": p["referer"].as_str().unwrap_or(""),
+                        "cookies": p["cookies"].as_str().unwrap_or(""),
+                    }));
+                    json!({"type":"ack","ok":true,"intercepted":true}).to_string()
+                }
                 "ping" => json!({"type":"pong"}).to_string(),
                 "download" => {
                     let p = &v["payload"];

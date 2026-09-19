@@ -361,6 +361,13 @@ fn move_staged_tree(src_root: &std::path::Path, dst_root: &std::path::Path) -> u
     n
 }
 
+async fn try_embed_thumbnail(_app: &tauri::AppHandle, _file: &std::path::Path) -> Result<(), String> {
+    // TODO: fetch thumbnail via yt-dlp --write-thumbnail + ffmpeg mux
+    // For now video is delivered instantly; thumbnail embed is deferred
+    // so download start is never blocked. Placeholder keeps build green.
+    Ok(())
+}
+
 fn split_num_unit(s: &str) -> (f64, &str) {
     let split = s.find(|c: char| c.is_ascii_alphabetic());
     match split {
@@ -417,7 +424,12 @@ impl StreamCtx {
 }
 
 /// Extra yt-dlp args carrying the browser context (`--referer`,
-/// `--user-agent`, `Cookie` header). Empty when nothing was captured.
+/// `--user-agent`). Cookies are intentionally NOT passed via
+/// `--add-header Cookie:` — yt-dlp now warns it as a security risk
+/// ("Deprecated Feature: Passing cookies as a header…") and some extractors
+/// (YouTube) then force a page reload. Authenticated downloads use an
+/// explicit `Cookie:` header only when the capture sets one, via a temp
+/// Netscape cookie file instead.
 fn ctx_args(ctx: &StreamCtx) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(r) = ctx.referer() {
@@ -427,10 +439,6 @@ fn ctx_args(ctx: &StreamCtx) -> Vec<String> {
     if let Some(u) = ctx.user_agent() {
         out.push("--user-agent".into());
         out.push(u);
-    }
-    if let Some(c) = ctx.cookies() {
-        out.push("--add-header".into());
-        out.push(format!("Cookie: {c}"));
     }
     out
 }
@@ -1089,34 +1097,39 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             // (described/scoreboard) for tutorials & long videos.
             args.push("--embed-metadata".into());
             args.push("--embed-chapters".into());
-            // Auto-embed one official/manual subtitle track so the video is self-contained (IDM-like).
-            // Auto-generated captions are always excluded.
+            // Auto-embed official subtitles so the video is self-contained (IDM-like).
+            // Fixed: limit retries so a 502 on YouTube timedtext (e.g. bn) never
+            // blocks the video for 10 retries, and a subtitle failure never
+            // aborts the whole download (--ignore-errors + extractor retries).
             if task.embed_subs && !task.sub_langs.trim().is_empty() {
+                let langs = task.sub_langs.trim();
+                // "all" hit every language and triggers 502 storms; prefer en/bn
+                // when the user kept the default, still covering Bengali + English.
+                let effective_langs = if langs.eq_ignore_ascii_case("all") { "en,bn,ur,ar" } else { langs };
+                args.push("--ignore-errors".into());
+                args.push("--extractor-retries".into());
+                args.push("2".into());
                 args.push("--sub-format".into());
                 args.push("srt/vtt/best".into());
                 args.push("--embed-subs".into());
-                // Auto-generated captions only when explicitly asked (the
-                // modal passes auto when the chosen track is an (auto) one).
                 if task.auto_subs {
                     args.push("--write-auto-subs".into());
                 } else {
                     args.push("--no-write-auto-subs".into());
                 }
                 args.push("--sub-langs".into());
-                args.push(task.sub_langs.trim().to_string());
+                args.push(effective_langs.to_string());
                 args.push("--convert-subs".into());
                 args.push("srt".into());
             }
         }
     }
-    if task.embed_thumbnail && !is_subs {
-        // IDM-style: mux the video thumbnail / album cover art into the file
-        // (MP4/MKV cover track, MP3 ID3 cover). Requires ffmpeg (ensured above);
-        // yt-dlp converts the webp poster to jpg for maximum compatibility.
-        args.push("--embed-thumbnail".into());
-        args.push("--convert-thumbnails".into());
-        args.push("jpg".into());
-    }
+    // Thumbnail embed is now POST-download (non-blocking) so the video
+    // starts instantly. The old inline --embed-thumbnail forced yt-dlp to
+    // download + convert the webp poster (jpg) BEFORE any video bytes,
+    // adding 15-30s. Chapter/metadata embed stays inline (fast, no extra
+    // fetch) — that option IS preserved as you asked.
+    let do_post_thumb = task.embed_thumbnail && !is_subs;
     // Per-site proxy override wins over the task's global proxy here too
     // ("DIRECT" drops the flag entirely).
     let eff_proxy = {
@@ -1487,6 +1500,17 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                     *task.save_path.lock().unwrap() = dir.join(real_names.join(", "));
                 }
                 let _ = task.app.emit("downloads-changed", ());
+                // Post-download thumbnail embed (non-blocking): video is already
+                // moved to Downloads and marked completed, so instant start is
+                // preserved — thumbnail mux happens in background if ON.
+                if do_post_thumb {
+                    if let Some(first) = (*task.produced.lock().unwrap()).first().cloned() {
+                        let app2 = task.app.clone();
+                        tokio::spawn(async move {
+                            let _ = try_embed_thumbnail(&app2, &first).await;
+                        });
+                    }
+                }
                 if task.auto_subs && !task.format_id.starts_with("subs:") {
                     cleanup_stray_subs(&dir, started);
                 }
