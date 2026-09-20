@@ -2,14 +2,31 @@
 
 [বাংলা](./README.bn.md)
 
-Vortex is a fast, modern, IDM-style download manager built with **Rust (Tauri)** and a
-browser extension. Segmented multi-connection downloads, YouTube/media tooling via
-**yt-dlp**, HTTP Basic/Digest authentication, scheduler, tray, clipboard monitor, and a
-clean dark UI — all free, private, and dependency-managed on first run.
+<p align="center">
+  <img src="./vortex.png" alt="Vortex" width="420" />
+</p>
 
-> **Status:** v1.0.1 — Windows (x64). NSIS installer in
-> `src-tauri/target/release/bundle/nsis/` after building. Installers are unsigned, so
-> SmartScreen shows a warning.
+<p align="center">
+  <b>Fast, IDM-grade download manager — free, private, and modern.</b><br/>
+  Rust (Tauri) • TypeScript + Vite • Browser Extension (MV3)
+</p>
+
+<p align="center">
+  <img alt="version" src="https://img.shields.io/badge/version-1.3.0-818cf8?style=flat-square" />
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20x64-22d3ee?style=flat-square" />
+  <img alt="license" src="https://img.shields.io/badge/license-TBD-6b7a9e?style=flat-square" />
+</p>
+
+> **Status:** v1.3.0 — Windows (x64). NSIS installer at `src-tauri/target/release/bundle/nsis/Vortex_1.3.0_x64-setup.exe` after building. Unsigned → SmartScreen warning is normal.
+
+---
+
+## ✨ Highlights
+
+- **IDM parity where it matters** — segmented multi-connection, work-stealing, hover download bar, browser takeover, YouTube/playlist/media via yt-dlp, standalone *Download File Info* dialog (540×390, always-on-top), duplicate guard (Replace / Keep Both / Cancel).
+- **Exotic streaming** — HLS `.m3u8` & DASH `.mpd` sniffed in the extension, forwarded with Referer/Cookies/UA to yt-dlp/ffmpeg → clean `.mp4`.
+- **Scheduler & power** — per-download `Start at`, global `Stop at`, daily Start/Stop (02:00→06:00), and *On completion*: Shutdown (60s cancel window) / Sleep / Hibernate / Exit.
+- **Polished UX** — taskbar progress fill, live intercept dialog (Pause/Cancel + Minimize to app), EMA-smoothed speed & graph, adaptive chunks (16–64 MB for >1 GB), AIMD 429/503 backoff, tray, clipboard monitor, speed chart.
 
 ---
 
@@ -17,119 +34,81 @@ clean dark UI — all free, private, and dependency-managed on first run.
 
 | Area | What you get |
 |---|---|
-| **Download engine** | Multi-connection segmented download (1–32 segments), dynamic work-stealing (`claim_chunk`), permanent `.vtx.part` resume, async 1 MB buffered I/O, per-connection speed limit, auto-retry |
-| **YouTube & media** | Full yt-dlp power: 4K/8K where published, playlists + `playlist_items` ranges, **MP3 (128–320 kbps) / FLAC / WAV** audio conversion, official-subtitle embedding (auto-captions never used), standalone `.srt`/`.vtt` output |
-| **Authentication** | HTTP **Basic** and **Digest (RFC 2617)** at 401/407, per-host saved logins, auto-login callback via `auth-required` event + Settings "Site logins" manager |
-| **Browser extension** | MV3 (Chrome + Firefox), hover download bar with quality + subtitle dropdowns, download interception with telemetry/noise filtering, pairing by **WS token + Origin allowlist** on `ws://127.0.0.1:17190` |
-| **Desktop integration** | System tray + hide-to-tray, clipboard URL monitor (Win32 FFI), completion notifications, `start-at` per download + `stop-at` global scheduler, shutdown/sleep after queue |
-| **UI/UX** | Dark theme, responsive, Shift+Click bulk actions, site grabber, speed chart, auto-categorize folders, built-in logins manager |
-| **Tools self-update** | One-click `↻ Update Tools` — fast yt-dlp self-update (15 s timeout, no pipe deadlock), ffmpeg only refreshed when missing/forced |
-
-### Roadmap / known gaps
-- FTP/FTPS — **not implemented yet**
-- RTMP / live-stream capture — not implemented (yt-dlp covers a subset)
-- Per-site proxy rules (single global proxy today)
+| **Engine** | 16→32 segments (adaptive), dynamic work-stealing, `.vtx.part` resume (kept on cancel/pause), 1 MB buffered I/O → 1 GB+ uses 16–64 MB chunks, per-connection throttle, auto-retry with 429/503 AIMD |
+| **YouTube & media** | yt-dlp: 4K/8K, playlists + ranges, **MP3 128–320 / FLAC / WAV / Opus**, official subs embed (never auto-captions for “all”), **VTT/SRT** standalone, thumbnail/cover, chapters/metadata, temp-isolated fragments |
+| **HLS / DASH** | `.m3u8` / `.mpd` master detection (chunk filtering), background → content `stream_detected` → hover bar `Download Video (HLS/DASH)`, all via yt-dlp |
+| **Auth** | **Basic & Digest (RFC 2617)** with custom `md5.rs`, per-host saved logins, `auth-required` dialog |
+| **Extension** | MV3 Chrome + Firefox 1.3.0, hover bar (draggable, opacity), `stream_detected` + `file_captured`, takeover, WS `ws://127.0.0.1:17190` with token + Origin allowlist |
+| **Desktop** | System tray + hide-to-tray, clipboard monitor, notifications + sounds, scheduler, shutdown/sleep, drop box |
+| **UI** | Dark theme, Shift+Click bulk, grabber (Stop + *Add to Queue Paused* / *Download Now*), emergency batch bar, sort, speed chart, categories |
+| **Tools** | `Update Tools` with live `tools-progress` bars (sidebar + welcome modal), yt-dlp self-update (15 s cap), ffmpeg on-demand |
 
 ## Tech stack
 
-- **Rust + Tauri 2** backend (`src-tauri/`) — `tokio`, `reqwest`, `tauri-plugin-dialog`,
-  `tauri-plugin-notification`
-- **TypeScript + Vite** frontend (`ui/`) — vanilla TS app, no UI framework
-- **Browser extension** (`browser-extension/`) — MV3, plain JS
-- **no external runtime deps**: a hand-rolled `md5.rs` (RFC 2617 digest) and a pure MD5
-  mean zero transitive unsafe auth code
-
-## Project layout
+- **Rust + Tauri 2** — `tokio`, `reqwest` (rustls), `tauri-plugin-dialog/notification/single-instance`
+- **TypeScript + Vite** — vanilla TS, no framework
+- **Extension** — MV3 plain JS, `webRequest` sniffing, `all_frames: true` + shadow-DOM piercing
 
 ```
-├── browser-extension/   MV3 extension source + dist (chrome/, firefox/)
-├── scripts/             helper scripts (release.ps1, make-icon.mjs)
-├── src-tauri/           Rust backend, Tauri config, NSIS bundling
-│   └── src/             auth.rs, download.rs, state.rs, tools.rs, ws_server.rs, ytdlp.rs, ...
-└── ui/                  TypeScript/Vite frontend (ember-free, framework-free)
+├── browser-extension/   MV3 source + dist (chrome/, firefox/)
+├── scripts/             release.ps1 helpers
+├── src-tauri/           Rust backend + Tauri config + NSIS
+│   └── src/             download.rs, ytdlp.rs, state.rs, tools.rs, ws_server.rs, ...
+└── ui/                  TS/Vite frontend
 ```
 
-## Building from source (Windows)
+## Building (Windows)
 
-Prerequisites: **Rust (stable) + MSVC toolchain**, **Node.js 18+**, **Git**.
+Prereqs: **Rust stable + MSVC**, **Node.js 18+**, **Git**.
 
 ```powershell
-# 1. Frontend first (mandatory order — backend embeds the built UI)
-cd ui
-npm install
-npm run build
-cd ..
+# 1. Frontend first (backend embeds the built UI)
+cd ui; npm install; npm run build; cd ..
 
-# 2. Rust backend (release)
-cd src-tauri
-cargo build --release
+# 2. Backend (release)
+cd src-tauri; cargo build --release
 
-# 3. Dev mode (changes hot-reload)
-& ..\ui\node_modules\.bin\tauri.cmd dev
+# 3. Dev (hot-reload)
+..\ui\node_modules\.bin\tauri.cmd dev
+# binary → src-tauri/target/release/vortex.exe
+# first media download auto-fetches yt-dlp + ffmpeg to %APPDATA%\com.vortex.downloader\tools
 ```
 
-**Build & run:** the app binary lands at `src-tauri/target/release/vortex.exe`.
-On first media download, yt-dlp + ffmpeg are auto-downloaded to
-`%APPDATA%\com.vortex.downloader\tools` (GitHub release assets / Gyan essentials build).
+**Extension:** `cd browser-extension && node build.mjs` → `dist/chrome` / `dist/firefox`; load unpacked, paste pairing key from *Settings → Browser extension key*.
 
-**Browser extension:** `cd browser-extension && node build.mjs` writes `dist/chrome` and
-`dist/firefox`; load the unpacked folder in the browser, then copy the app's pairing key
-(Settings → Browser extension key) into the popup.
-
-## Making a release installer (NSIS)
-
-The whole flow is wrapped in [`scripts/release.ps1`](./scripts/release.ps1):
+## Release installer (NSIS)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -Version 1.0.1
+powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -Version 1.3.0
+# → src-tauri/target/release/bundle/nsis/Vortex_1.3.0_x64-setup.exe
+# Manual:
+Get-Process vortex -ErrorAction SilentlyContinue | Stop-Process -Force
+cd ui; npm run build; cd ..\src-tauri; ..\ui\node_modules\.bin\tauri.cmd build
 ```
 
-It will: bump `tauri.conf.json`/`Cargo.toml`/`package.json`, rebuild UI + release binary,
-bundle the NSIS installer, print the installer path + SHA-256, and (optionally) tag the
-release. Manual variant (what the script does):
+## GitHub release
 
 ```powershell
-# kill any running vortex.exe first (locks target/release/vortex.exe)
-Get-Process | Where-Object { $_.Path -like "*vortex.exe" } | Stop-Process -Force
-
-cd ui; npm run build; cd ..\src-tauri          # build order matters
-& ..\ui\node_modules\.bin\tauri.cmd build       # must run FROM src-tauri
-# -> src-tauri\target\release\bundle\nsis\Vortex_<version>_x64-setup.exe
+git tag v1.3.0; git push origin v1.3.0
+# GitHub → Releases → Draft new release → pick v1.3.0 → attach Vortex_1.3.0_x64-setup.exe + SHA-256
 ```
-
-## Publishing a GitHub release
-
-1. **Rename/confirm the repo** (if not done): GitHub → repo → Settings → General →
-   Repository name (or `gh repo rename vortex-download-manager` after
-   `winget install GitHub.cli` + `gh auth login`).
-2. Push: `git push origin main` (origin is already set to the new name).
-3. Create a tag + release notes:
-
-```powershell
-git tag v1.0.1
-git push origin v1.0.1
-```
-
-4. GitHub → Releases → **Draft new release** → pick `v1.0.1`, attach the
-   `Vortex_1.0.1_x64-setup.exe` from `src-tauri\target\release\bundle\nsis\`, paste the
-   SHA-256, publish. Unsigned exe → SmartScreen warning is expected.
 
 ## Testing
 
-- `cargo test` — MD5 vectors + auth (Basic/Digest/param parsing) + WS handshake tests
-- Manual 401 flow: `node` test server scripts live in
-  `%TEMP%\opencode\auth-test-server.js` (Basic on 8769, Digest on 8770)
+- `cargo test` — 19 unit + 1 integration (auth, WS, download steps, ytdlp, grabber)
+- Manual 401 flow via `%TEMP%\opencode\auth-test-server.js`
 
-## FAQ
+## Credits
 
-**Why is the download folder different from the save path?** Downloads are auto-routed
-into category folders (`Downloads\Video`, `Downloads\Other`, …) when
-"Sort into folders by type" is enabled.
+Built with **[opencode](https://opencode.ai)**.
 
-**Do I need ffmpeg for MP4 downloads?** Only for merging/audio conversion; otherwise no.
+- **Muse Spark 1.2** (`opencode/muse-spark-1.2-contributor-free`) — core implementation
+- **Muse Spark 1.3** (big-pickle) — speed stabilization, HLS/DASH, scheduler polish
+- **Free Buff** — community testing & feedback
+- **glm 5.3** — UI/UX iteration
 
-**Is yt-dlp bundled?** No — fetched at first use and updated through *Update Tools*.
+Thanks to **yt-dlp**, **ffmpeg (BtbN builds)**, and **Tauri**.
 
 ## License
 
-No license declared yet in this repository. Ask the owner before reusing.
+No license declared yet — ask the owner before reusing.
