@@ -155,6 +155,9 @@ export const api = {
   ytdlExpectedPath: (dir: string, title: string, ext: string, playlist: boolean) =>
     cmd<{ exists: boolean; path: string; is_dir: boolean }>("ytdl_expected_path", { dir, title, ext, playlist }),
   deleteFileAt: (path: string) => cmd<void>("delete_file_at", { path }),
+  convertToMp3: (path: string) => cmd<string>("convert_to_mp3", { path }),
+  convertMedia: (path: string, format: string, quality?: string) => cmd<string>("convert_media", { path, format, quality }),
+  autoOrganize: (path: string) => cmd<string | null>("auto_organize", { path }),
   getTools: () => cmd<ToolsStatus>("get_tools_status"),
   updateTools: (forceFfmpeg = false) => cmd<UpdateToolsResult>("update_tools", { forceFfmpeg }),
   getSettings: () => cmd<Settings>("get_settings"),

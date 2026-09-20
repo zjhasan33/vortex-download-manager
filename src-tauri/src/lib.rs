@@ -10,6 +10,7 @@ pub mod download;
 mod ftp;
 mod grabber;
 mod md5;
+mod post_actions;
 mod state;
 mod tools;
 mod ws_server;
@@ -663,6 +664,50 @@ async fn delete_file_at(path: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn convert_to_mp3(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    let dst = crate::post_actions::convert_to_mp3(&app, p).await?;
+    Ok(dst.display().to_string())
+}
+
+#[tauri::command]
+async fn convert_media(app: tauri::AppHandle, path: String, format: String, quality: Option<String>) -> Result<String, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    let fmt = format.trim().to_ascii_lowercase();
+    let q = quality.as_deref().unwrap_or("").trim().to_string();
+    let args: Vec<&str> = match fmt.as_str() {
+        "mp3" if q == "320" => vec!["-vn", "-c:a", "libmp3lame", "-b:a", "320k"],
+        "mp3" if q == "192" => vec!["-vn", "-c:a", "libmp3lame", "-b:a", "192k"],
+        "mp3" => vec!["-vn", "-c:a", "libmp3lame", "-q:a", "2"],
+        "m4a" => vec!["-vn", "-c:a", "aac", "-b:a", "256k"],
+        "flac" => vec!["-vn", "-c:a", "flac"],
+        "wav" => vec!["-vn", "-c:a", "pcm_s16le"],
+        "opus" => vec!["-vn", "-c:a", "libopus", "-b:a", "160k"],
+        _ => return Err(format!("Unsupported format: {fmt}")),
+    };
+    let dst = crate::post_actions::convert_with(&app, p, &fmt, &args).await?;
+    Ok(dst.display().to_string())
+}
+
+#[tauri::command]
+async fn auto_organize(state: State<'_, Arc<DlManager>>, path: String) -> Result<Option<String>, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err("File not found".into());
+    }
+    // URL hint — strong signal for Courses/Software routing, looked up from history/views.
+    let url = state
+        .views()
+        .iter()
+        .find(|v| v.save_path == p.display().to_string())
+        .map(|v| v.url.clone());
+    let res = tokio::task::spawn_blocking(move || crate::post_actions::keyword_route_with_url(&p, url.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(res.map(|q| q.display().to_string()))
+}
+
 /// Open (or focus) the standalone "Download File Info" dialog window with a
 /// stored payload. The main dashboard is never raised for these prompts.
 fn open_info_window(app: &tauri::AppHandle, payload: serde_json::Value) {
@@ -1246,6 +1291,9 @@ pub fn run() {
             get_settings,
             save_settings,
             delete_file_at,
+            convert_to_mp3,
+            convert_media,
+            auto_organize,
             ytdl_expected_path,
             probe_download_info,
             choose_folder,
@@ -1256,9 +1304,7 @@ pub fn run() {
             read_urls,
             get_ws_token,
             window_action,
-            probe_download_info,
             take_dialog_payload,
-            ytdl_expected_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Vortex");

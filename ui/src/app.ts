@@ -385,6 +385,8 @@ export class VortexApp {
           ${d.status === "downloading" || d.status === "queued" || d.status === "resolving" ? `<button data-act="pause" data-id="${d.id}" title="Pause">${icon("pause", 15)}</button>` : d.status === "paused" ? `<button data-act="resume" data-id="${d.id}" title="Resume">${icon("play", 15)}</button>` : ""}${d.status === "downloading" || d.status === "queued" || d.status === "paused" || d.status === "merging" || d.status === "resolving" ? `<button data-act="stop" data-id="${d.id}" title="Stop (keeps partial progress)">${icon("stop", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="folder" data-id="${d.id}" title="Show in folder">${icon("folder", 15)}</button>` : ""}
           ${d.status === "completed" ? `<button data-act="open" data-id="${d.id}" title="Open file">${icon("play", 15)}</button>` : ""}
+          ${d.status === "completed" && !d.save_path.toLowerCase().endsWith(".mp3") && (d.category === "video" || d.category === "audio") ? `<button data-act="convert" data-id="${d.id}" title="Convert to MP3">${icon("audio", 15)}</button>` : ""}
+          ${d.status === "completed" ? `<button data-act="organize" data-id="${d.id}" title="Auto-organize by name (Moves file)">${icon("other", 15)}</button>` : ""}
           ${d.source !== "youtube" && (d.status === "error" || d.status === "cancelled") ? `<button data-act="resume" data-id="${d.id}" title="Resume from partial progress">${icon("play", 15)}</button>` : ""}${d.status === "completed" || d.status === "needs_auth" || (d.source === "youtube" && (d.status === "error" || d.status === "cancelled")) ? `<button data-act="reload" data-id="${d.id}" title="Download again">${icon("redo", 15)}</button>` : ""}
           <button data-act="cancel" data-id="${d.id}" title="Remove">${icon("trash", 15)}</button>
         </div>`,
@@ -886,6 +888,38 @@ export class VortexApp {
             // continue instead of downloading from zero.
             run(api.resumeDownload(id), "Resume");
           }
+        } else if (act === "convert") {
+          // Submenu — completely isolated, no core touch.
+          const menu = document.createElement("div");
+          menu.className = "convert-menu";
+          menu.innerHTML = `
+            <button data-fmt="mp3" data-q="320">MP3 (320 kbps)</button>
+            <button data-fmt="mp3" data-q="192">MP3 (192 kbps)</button>
+            <button data-fmt="m4a">M4A (256 kbps)</button>
+            <button data-fmt="flac">FLAC (Lossless)</button>
+            <button data-fmt="wav">WAV (Lossless)</button>`;
+          const rect = (t as HTMLElement).getBoundingClientRect();
+          menu.style.cssText = `position:fixed;left:${rect.left - 140}px;top:${rect.bottom + 6}px;z-index:9999;background:var(--bg-2);border:1px solid var(--border-strong);border-radius:10px;padding:6px;display:grid;gap:4px;box-shadow:var(--shadow)`;
+          menu.querySelectorAll("button").forEach((b) => {
+            (b as HTMLElement).style.cssText = "padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text-2);font-size:12px;cursor:pointer;text-align:left";
+            b.addEventListener("mouseenter", () => ((b as HTMLElement).style.background = "var(--surface-2)"));
+            b.addEventListener("mouseleave", () => ((b as HTMLElement).style.background = "var(--surface)"));
+          });
+          document.body.appendChild(menu);
+          const close = () => menu.remove();
+          setTimeout(() => document.addEventListener("click", close, { once: true }), 100);
+          menu.querySelectorAll("[data-fmt]").forEach((b) => {
+            b.addEventListener("click", (e) => {
+              e.stopPropagation();
+              const fmt = (b as HTMLElement).dataset.fmt!;
+              const q = (b as HTMLElement).dataset.q || undefined;
+              run(api.convertMedia(d.save_path, fmt, q).then((dst) => { toast(`${fmt.toUpperCase()}: ${dst}`, "ok"); void store.refresh(); }), "Convert");
+              close();
+            });
+          });
+          return;
+        } else if (act === "organize") {
+          run(api.autoOrganize(d.save_path).then((dst) => { toast(dst ? `Moved to ${dst}` : "No rule matched", dst ? "ok" : "info"); void store.refresh(); }), "Organize");
         } else if (act === "cancel") {
           if (d.status === "completed") {
             openConfirmRemove(d.filename || d.title, (del) => run(api.removeDownload(id, del), "Remove"));
