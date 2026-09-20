@@ -25,7 +25,7 @@ export function openAddUrl() {
     <div class="modal-body">
       <div class="field">
         <label>File URL</label>
-        <input class="input" id="au-url" placeholder="https://example.com/file.zip" spellcheck="false" />
+        <input class="input" id="au-url" placeholder="https://example.com/file.zip · ftp://server/file.zip" spellcheck="false" />
       </div>
       <div class="row2">
         <div class="field">

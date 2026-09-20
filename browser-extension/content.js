@@ -546,12 +546,16 @@
     if (!video || !document.contains(video)) return;
     const direct = findMediaForVideo(video);
     const stream = !direct ? streamFresh(pendingStream) : null;
-    if (!mediaSite() && !direct && !stream) return;
+    const pageEntry = media.get("__page__");
+    const fileEntry = [...media.values()].find((m) => m.kind === "file" && /^https?:/.test(m.url));
+    if (!mediaSite() && !direct && !stream && !pageEntry && !fileEntry) return;
     ensureHbarEls();
     hbarTarget = video;
     if (stream) barForStream(stream);
     else if (mediaSite()) barForMediaSite();
-    else barForDirect(direct);
+    else if (direct) barForDirect(direct);
+    else if (fileEntry) barForDirect(fileEntry);
+    else if (pageEntry) barForDirect(pageEntry);
     hbar.classList.remove("vx-hide");
     placeHbar();
   }

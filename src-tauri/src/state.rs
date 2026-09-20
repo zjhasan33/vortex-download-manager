@@ -863,7 +863,8 @@ fn urls_in_text(text: &str) -> Vec<String> {
             end -= 1;
         }
         let t = &t[..end];
-        if t.starts_with("http://") || t.starts_with("https://") {
+        let low = t.to_ascii_lowercase();
+        if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("ftp://") {
             if !out.contains(&t.to_string()) {
                 out.push(t.to_string());
             }

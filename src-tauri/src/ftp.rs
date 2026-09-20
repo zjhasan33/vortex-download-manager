@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,6 +34,15 @@ pub struct FtpInfo {
     pub size: Option<u64>,
     /// `REST 0` accepted — ranged (multi-segment + resume) transfers work.
     pub resume: bool,
+}
+
+/// Error marker appended when a server rejects `REST` mid-download: the
+/// segment worker sees it and restarts that chunk from byte 0 instead of
+/// failing the whole task.
+pub const NO_RESUME: &str = "FTP_NO_RESUME";
+
+pub fn is_ftp_url(url: &str) -> bool {
+    url.to_ascii_lowercase().starts_with("ftp://")
 }
 
 fn percent_decode(s: &str) -> String {
@@ -63,6 +72,15 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+/// Decode and strip CR/LF so a crafted `ftp://user%0d%0aPASS%20x@…` URL can
+/// never inject extra control commands into the session.
+fn decode_control(s: &str) -> String {
+    percent_decode(s)
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect()
+}
+
 /// Parse `ftp://[user[:pass]@]host[:port]/path` (case-insensitive scheme,
 /// `;type=` params stripped, path percent-decoded).
 pub fn parse_ftp_url(url: &str) -> Result<FtpUrl, String> {
@@ -86,9 +104,9 @@ pub fn parse_ftp_url(url: &str) -> Result<FtpUrl, String> {
         None => ("", authority),
     };
     let (user, pass) = match userinfo.split_once(':') {
-        Some((u, p)) => (percent_decode(u), percent_decode(p)),
+        Some((u, p)) => (decode_control(u), decode_control(p)),
         None if userinfo.is_empty() => (ANON_USER.into(), ANON_PASS.into()),
-        None => (percent_decode(userinfo), String::new()),
+        None => (decode_control(userinfo), String::new()),
     };
 
     let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
@@ -131,10 +149,12 @@ async fn read_reply(rx: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Resul
         Ok(Err(e)) => return Err(format!("FTP read failed: {e}")),
         Err(_) => return Err("FTP server did not answer (timeout)".into()),
     }
-    if first.len() < 4 {
-        return Err(format!("Malformed FTP reply: {first:?}"));
-    }
-    let code: u16 = first[..3].parse().map_err(|_| format!("Malformed FTP reply: {first:?}"))?;
+    // First 3 bytes must be ASCII digits — `get` (not `[..3]`) so a hostile
+    // non-ASCII greeting can never panic the byte-slice.
+    let code: u16 = first
+        .get(0..3)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| format!("Malformed FTP reply: {first:?}"))?;
     let mut text = first.clone();
     // Multiline reply: "123-first…" continues until "123 …" terminates it.
     if first.as_bytes().get(3) == Some(&b'-') {
@@ -147,7 +167,9 @@ async fn read_reply(rx: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Resul
                 Err(_) => return Err("FTP server did not answer (timeout)".into()),
             }
             text.push_str(&line);
-            if line.len() >= 4 && line[..3].parse::<u16>() == Ok(code) && line.as_bytes().get(3) == Some(&b' ') {
+            if line.get(0..3).and_then(|s| s.parse::<u16>().ok()) == Some(code)
+                && line.as_bytes().get(3) == Some(&b' ')
+            {
                 break;
             }
         }
@@ -184,24 +206,27 @@ async fn connect_ctrl(u: &FtpUrl) -> Result<(BufReader<tokio::net::tcp::OwnedRea
     Ok((rx, tx))
 }
 
-async fn login(
+/// USER/PASS handshake. `230` (accepted without password), `331` (password
+/// wanted) and `332` (account wanted — empty PASS sent) all proceed; `530`
+/// and friends fail with a credential-oriented message.
+async fn ftp_login(
     u: &FtpUrl,
     tx: &mut tokio::net::tcp::OwnedWriteHalf,
     rx: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> Result<(), String> {
-    let (code, _) = cmd(tx, rx, &format!("USER {}", u.user)).await?;
-    let code = match code {
-        230 => return Ok(()),
-        331 => cmd(tx, rx, "PASS_HIDDEN").await.map(|_| 0).or_else(|_| {
-            // Placeholder replaced below; real password sent next.
-            Ok::<u16, String>(331).map(|_| 331)
-        }).and(Ok(331))? , // never taken; see real pass below
-        530 => return Err("FTP login failed (530) — wrong credentials".into()),
-        c => c,
-    };
-    let _ = code;
-    let _ = ANON_PASS;
-    unreachable!()
+    let (code, msg) = cmd(tx, rx, &format!("USER {}", u.user)).await?;
+    match code {
+        230 => Ok(()),
+        331 | 332 => {
+            let (code2, msg2) = cmd(tx, rx, &format!("PASS {}", u.pass)).await?;
+            match code2 {
+                230 => Ok(()),
+                c => Err(format!("FTP login failed ({c}) — {}", msg2.trim())),
+            }
+        }
+        530 => Err("FTP login failed (530) — wrong credentials or anonymous access not allowed".into()),
+        c => Err(format!("FTP login rejected ({c}) — {}", msg.trim())),
+    }
 }
 
 async fn binary_mode(
@@ -233,7 +258,9 @@ async fn enter_passive(
 ) -> Result<TcpStream, String> {
     if let Ok((229, text)) = cmd(tx, rx, "EPSV").await {
         if let Some(port) = extract_epsv_port(&text) {
-            return connect_data(host, port).await;
+            if port != 0 {
+                return connect_data(host, port).await;
+            }
         }
     }
     let (code, text) = cmd(tx, rx, "PASV").await?;
@@ -290,53 +317,38 @@ async fn probe_inner(
     Ok(FtpInfo { size, resume })
 }
 
-/// Open a transfer streaming from `offset` (0 = whole file). The returned
-/// handle exposes the data connection for reading; call `finish` after EOF.
+/// Open a transfer streaming from `offset` (0 = whole file). Every error path
+/// sends `QUIT` before returning, so no control connection is left hanging.
+/// The returned handle exposes the data connection for reading; call `finish`
+/// after EOF to verify the final 226/250 reply.
 pub async fn open_transfer(url: &str, offset: u64) -> Result<FtpTransfer, String> {
     let u = parse_ftp_url(url)?;
     let (mut rx, mut tx) = connect_ctrl(&u).await?;
-    let res = transfer_inner(&u, &mut rx, &mut tx, offset).await;
-    if res.is_err() {
-        let _ = cmd(&mut tx, &mut rx, "QUIT").await;
-    }
-    res
-}
-
-async fn transfer_inner(
-    u: &FtpUrl,
-    rx: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
-    tx: &mut tokio::net::tcp::OwnedWriteHalf,
-    offset: u64,
-) -> Result<FtpTransfer, String> {
-    ftp_login(u, tx, rx).await?;
-    binary_mode(tx, rx).await?;
-    if offset > 0 {
-        let (code, _) = cmd(tx, rx, &format!("REST {offset}")).await?;
-        if code != 350 {
-            return Err(format!("FTP_NO_RESUME: server rejected REST ({code}) — resume unsupported"));
+    let res = async {
+        ftp_login(&u, &mut tx, &mut rx).await?;
+        binary_mode(&mut tx, &mut rx).await?;
+        if offset > 0 {
+            let (code, _) = cmd(&mut tx, &mut rx, &format!("REST {offset}")).await?;
+            if code != 350 {
+                let e = format!("{NO_RESUME}: server rejected REST ({code}) — resume unsupported");
+                let _ = cmd(&mut tx, &mut rx, "QUIT").await;
+                return Err(e);
+            }
         }
+        let data = enter_passive(&u.host, &mut tx, &mut rx).await?;
+        let (code, msg) = cmd(&mut tx, &mut rx, &format!("RETR {}", u.path)).await?;
+        if code != 150 && code != 125 {
+            let e = format!("FTP: RETR failed ({code}) — {}", msg.trim());
+            let _ = cmd(&mut tx, &mut rx, "QUIT").await;
+            return Err(e);
+        }
+        let (data_rx, _data_tx) = data.into_split();
+        Ok(FtpTransfer { data: data_rx, ctrl_rx: rx, ctrl_tx: tx })
     }
-    let data = enter_passive(&u.host, tx, rx).await?;
-    let (code, msg) = cmd(tx, rx, &format!("RETR {}", u.path)).await?;
-    if code != 150 && code != 125 {
-        return Err(format!("FTP: RETR failed ({code}) — {}", msg.trim()));
-    }
-    let (data_rx, _data_tx) = data.into_split();
-    // Take ownership of the control halves without the &mut borrows.
-    let ctrl_rx = std::mem::replace(rx, BufReader::new(unreachable_stream()));
-    let ctrl_tx = std::mem::replace(tx, unreachable_writer());
-    Ok(FtpTransfer { data: data_rx, ctrl_rx, ctrl_tx })
-}
-
-// `std::mem::replace` needs a placeholder stream; rather than fabricate one,
-// transfer_inner is restructured below to consume the halves by value.
-
-fn unreachable_stream() -> tokio::net::tcp::OwnedReadHalf {
-    unreachable!("placeholder never constructed")
-}
-
-fn unreachable_writer() -> tokio::net::tcp::OwnedWriteHalf {
-    unreachable!("placeholder never constructed")
+    .await;
+    // On the success path `rx`/`tx` were moved into `FtpTransfer`, so nothing
+    // may touch them here; every failure path already sent QUIT above.
+    res
 }
 
 pub struct FtpTransfer {
@@ -388,6 +400,15 @@ mod tests {
         assert!(parse_ftp_url("http://h/x").is_err());
         assert!(parse_ftp_url("ftp://").is_err());
         assert!(parse_ftp_url("ftp://onlyhost").is_err());
+    }
+
+    #[test]
+    fn control_chars_never_inject_commands() {
+        // CR/LF in user/pass must be stripped, not passed to the wire.
+        let u = parse_ftp_url("ftp://evil%0d%0aPASS%20x@h/f").unwrap();
+        assert!(!u.user.contains('\r') && !u.user.contains('\n'));
+        assert!(is_ftp_url("FTP://h/f"));
+        assert!(!is_ftp_url("http://h/f"));
     }
 
     #[test]

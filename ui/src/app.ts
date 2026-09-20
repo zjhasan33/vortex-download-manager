@@ -908,7 +908,9 @@ export class VortexApp {
           .map((u) => u.trim())
           .filter(Boolean);
         const magnets = parts.filter((u) => /^magnet:/i.test(u));
-        const urls = parts.filter((u) => u.startsWith("http://") || u.startsWith("https://"));
+        const urls = parts.filter(
+          (u) => u.startsWith("http://") || u.startsWith("https://") || u.toLowerCase().startsWith("ftp://"),
+        );
         if (magnets.length) toast("Torrent downloads are not supported in this version", "err");
         if (!urls.length) return;
         for (const u of urls) {

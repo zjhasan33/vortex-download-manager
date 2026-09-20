@@ -43,7 +43,10 @@ export async function bootDropbox() {
     const urls = txt
       .split(/[\s,;]+/)
       .map((u) => u.trim())
-      .filter((u) => u.startsWith("http://") || u.startsWith("https://"));
+      .filter((u) => {
+        const low = u.toLowerCase();
+        return low.startsWith("http://") || low.startsWith("https://") || low.startsWith("ftp://");
+      });
     if (!urls.length) {
       say("No links found");
       return;

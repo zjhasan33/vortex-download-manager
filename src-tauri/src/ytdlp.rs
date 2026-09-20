@@ -1105,7 +1105,7 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                 let langs = task.sub_langs.trim();
                 // "all" hit every language and triggers 502 storms; prefer en/bn
                 // when the user kept the default, still covering Bengali + English.
-                let effective_langs = if langs.eq_ignore_ascii_case("all") { "en,bn,ur,ar" } else { langs };
+                let effective_langs = if langs.eq_ignore_ascii_case("all") { "en,bn,ur,ar,hi" } else { langs };
                 args.push("--ignore-errors".into());
                 args.push("--extractor-retries".into());
                 args.push("2".into());

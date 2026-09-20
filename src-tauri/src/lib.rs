@@ -7,6 +7,7 @@ use tauri_plugin_dialog::DialogExt;
 
 mod auth;
 pub mod download;
+mod ftp;
 mod grabber;
 mod md5;
 mod state;
@@ -565,6 +566,17 @@ async fn downloads_action(
 /// unknown size/filename just comes back empty for the dialog to display.
 #[tauri::command]
 async fn probe_download_info(url: String) -> Result<serde_json::Value, String> {
+    // FTP files: answer from SIZE/filename without any HTTP machinery.
+    if crate::ftp::is_ftp_url(&url) {
+        let filename = crate::ftp::filename_of(&url);
+        let size = crate::ftp::probe(&url).await.ok().and_then(|i| i.size).unwrap_or(0);
+        let size = if size > (1 << 40) { 0 } else { size };
+        return Ok(serde_json::json!({
+            "filename": filename,
+            "size": size,
+            "category": crate::download::category_of(&filename),
+        }));
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Vortex/1.1")
@@ -1032,7 +1044,10 @@ async fn read_urls(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let urls: Vec<String> = content
         .lines()
         .map(|l| l.trim())
-        .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
+        .filter(|l| {
+            let low = l.to_ascii_lowercase();
+            low.starts_with("http://") || low.starts_with("https://") || low.starts_with("ftp://")
+        })
         .map(|l| l.to_string())
         .collect();
     Ok(urls)
