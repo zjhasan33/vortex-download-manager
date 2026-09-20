@@ -19,6 +19,19 @@
 
 > **Status:** v1.3.0 — Windows (x64). NSIS installer at `src-tauri/target/release/bundle/nsis/Vortex_1.3.0_x64-setup.exe` after building. Unsigned → SmartScreen warning is normal.
 
+<p align="center">
+  <img src="./vortex.png" alt="Vortex logo" width="160" style="border-radius:16px" />
+</p>
+
+---
+
+## 📸 Screenshots
+
+<p align="center">
+  <img src="./vortex%20app.png" alt="Vortex App — Dashboard" width="860" />
+  <br/><em>Dashboard — dark theme, categories, live transfer rate</em>
+</p>
+
 ---
 
 ## ✨ Highlights

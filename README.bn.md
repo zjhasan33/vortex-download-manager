@@ -13,6 +13,19 @@
 
 > **স্ট্যাটাস:** v1.3.0 — Windows (x64)। NSIS installer: `src-tauri/target/release/bundle/nsis/Vortex_1.3.0_x64-setup.exe`। Unsigned → SmartScreen warning স্বাভাবিক।
 
+<p align="center">
+  <img src="./vortex.png" alt="Vortex logo" width="160" style="border-radius:16px" />
+</p>
+
+---
+
+## 📸 স্ক্রিনশট
+
+<p align="center">
+  <img src="./vortex%20app.png" alt="Vortex App — Dashboard" width="860" />
+  <br/><em>ড্যাশবোর্ড — ডার্ক থিম, ক্যাটাগরি, লাইভ ট্রান্সফার</em>
+</p>
+
 ---
 
 ## ✨ হাইলাইট
