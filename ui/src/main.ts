@@ -10,6 +10,11 @@ async function boot() {
     await bootDropbox();
     return;
   }
+  if (window.location.hash === "#/download-info") {
+    const { bootDownloadInfo } = await import("./dialog");
+    await bootDownloadInfo();
+    return;
+  }
   await initApi();
   await store.refresh();
   try {

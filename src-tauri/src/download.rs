@@ -464,7 +464,7 @@ pub fn category_of(name: &str) -> &'static str {
     else { "other" }
 }
 
-fn resolve_filename(resp: &reqwest::Response, url: &str) -> String {
+pub(crate) fn resolve_filename(resp: &reqwest::Response, url: &str) -> String {
     if let Some(cd) = resp.headers().get(CONTENT_DISPOSITION) {
         if let Ok(s) = cd.to_str() {
             if let Some(idx) = s.find("filename*=") {
@@ -517,7 +517,7 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-fn parse_total(resp: &reqwest::Response) -> u64 {
+pub(crate) fn parse_total(resp: &reqwest::Response) -> u64 {
     if let Some(cr) = resp.headers().get(CONTENT_RANGE) {
         if let Ok(s) = cr.to_str() {
             if let Some(slash) = s.rfind('/') {

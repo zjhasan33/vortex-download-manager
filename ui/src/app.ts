@@ -24,7 +24,28 @@ api.onIntercept = async (p) => {
     await (win as unknown as { unminimize?: () => Promise<void> }).unminimize?.().catch(() => {});
     await win.setFocus().catch(() => {});
   } catch {}
-  openIntercept(p.url, p.filename, p.referer, p.cookies);
+  openIntercept(
+    p.url,
+    p.filename,
+    p.referer,
+    p.cookies,
+    p.ytdl
+      ? {
+          isYtdl: true,
+          title: p.ytdl.title,
+          size: p.ytdl.size,
+          ytdl: {
+            format_id: p.ytdl.format_id,
+            playlist: p.ytdl.playlist,
+            playlist_items: p.ytdl.playlist_items,
+            embed_subs: p.ytdl.embed_subs,
+            sub_langs: p.ytdl.sub_langs,
+            embed_thumbnail: p.ytdl.embed_thumbnail,
+            auto_subs: p.ytdl.auto_subs,
+          },
+        }
+      : undefined,
+  );
 };
 
 const CATS: { id: CategoryId; label: string; icon: "video" | "audio" | "doc" | "program" | "zip" | "other" }[] = [

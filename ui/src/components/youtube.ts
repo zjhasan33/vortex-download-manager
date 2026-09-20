@@ -1,6 +1,7 @@
 import { openModal, toast } from "../lib/ui";
 import { icon } from "../lib/icons";
 import { api, store } from "../lib/api";
+import { openIntercept } from "./modals";
 import { formatBytes, formatDuration, formatNumber } from "../lib/format";
 import type { YtdlInfo } from "../types";
 
@@ -218,6 +219,31 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
           const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
           const embed = root.querySelector<HTMLInputElement>("#yt-embed")?.checked ?? true;
           const subLangs = subSel && subSel !== "all" ? subSel : store.settings?.sub_langs || "all";
+          // Dialog mode (default ON): confirm with prefill; scheduled starts
+          // keep today's direct path untouched.
+          if (!when && (store.settings?.show_download_info ?? true)) {
+            const fmt = (info?.formats || []).find((f) => f.id === formatId);
+            const isSubs = formatId.startsWith("subs:");
+            close();
+            openIntercept(urlInp.value.trim(), isSubs ? undefined : info?.title, undefined, undefined, {
+              title: info?.title,
+              size: fmt?.size || 0,
+              category: "video",
+              format: isSubs ? "SRT" : fmt?.ext?.toUpperCase(),
+              saveDir: pathInp.value.trim() || undefined,
+              isYtdl: true,
+              ytdl: {
+                format_id: formatId,
+                playlist,
+                playlist_items: items,
+                embed_subs: embed,
+                sub_langs: subLangs,
+                embed_thumbnail: store.settings?.embed_thumbnail !== false,
+                auto_subs: subAuto,
+              },
+            });
+            return;
+          }
           await api.startYtdl(
             urlInp.value.trim(),
             formatId,

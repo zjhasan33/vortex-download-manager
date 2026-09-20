@@ -63,7 +63,23 @@ export async function initApi() {
       const url = typeof p === "string" ? p : (p as { url?: string } | null)?.url;
       if (url) api.onGrabberOpen?.(url);
     }),
-    await listen<{ url: string; filename?: string; referer?: string; cookies?: string }>("download-intercept", (e) => {
+    await listen<{
+      url: string;
+      filename?: string;
+      referer?: string;
+      cookies?: string;
+      ytdl?: {
+        format_id: string;
+        title?: string;
+        size?: number;
+        playlist?: boolean;
+        playlist_items?: string;
+        embed_subs?: boolean;
+        sub_langs?: string;
+        embed_thumbnail?: boolean;
+        auto_subs?: boolean;
+      };
+    }>("download-intercept", (e) => {
       api.onIntercept?.(e.payload);
     }),
   );
@@ -108,6 +124,7 @@ export const api = {
     referer?: string,
     userAgent?: string,
     cookies?: string,
+    startPaused?: boolean,
   ) =>
     cmd<Download>("start_ytdl", {
       url,
@@ -123,11 +140,18 @@ export const api = {
       referer,
       user_agent: userAgent,
       cookies,
+      startPaused,
     }),
 
   openFolder: (path: string) => cmd<void>("open_folder", { path }),
   openFile: (path: string) => cmd<void>("open_saved_file", { path }),
   readUrls: () => cmd<string[]>("read_urls"),
+  probeDownloadInfo: (url: string) =>
+    cmd<{ filename: string; size: number; category: string }>("probe_download_info", { url }),
+  takeDialogPayload: () =>
+    cmd<{ url: string; filename?: string; referer?: string; cookies?: string; ytdl?: Record<string, unknown> } | null>("take_dialog_payload"),
+  ytdlExpectedPath: (dir: string, title: string, ext: string, playlist: boolean) =>
+    cmd<{ exists: boolean; path: string; is_dir: boolean }>("ytdl_expected_path", { dir, title, ext, playlist }),
   getTools: () => cmd<ToolsStatus>("get_tools_status"),
   updateTools: (forceFfmpeg = false) => cmd<UpdateToolsResult>("update_tools", { forceFfmpeg }),
   getSettings: () => cmd<Settings>("get_settings"),
@@ -148,7 +172,7 @@ export const api = {
   /** Set by app.ts to open the Site Grabber modal (extension "Grab This Page"). */
   onGrabberOpen: null as ((url: string) => void) | null,
   /** Fired when the browser intercepts a download — show the IDM-style Start/Later/Cancel. */
-  onIntercept: null as ((p: { url: string; filename?: string; referer?: string; cookies?: string }) => void) | null,
+  onIntercept: null as ((p: { url: string; filename?: string; referer?: string; cookies?: string; ytdl?: { format_id: string; title?: string; size?: number; playlist?: boolean; playlist_items?: string; embed_subs?: boolean; sub_langs?: string; embed_thumbnail?: boolean; auto_subs?: boolean } }) => void) | null,
 };
 
 // ---- Lightweight reactive store ----

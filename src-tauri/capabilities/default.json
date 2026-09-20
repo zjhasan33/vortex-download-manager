@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for the main window and floating drop box",
-  "windows": ["main", "dropbox"],
+  "description": "Default permissions for the main window, floating drop box and download-info dialog",
+  "windows": ["main", "dropbox", "download-info"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",

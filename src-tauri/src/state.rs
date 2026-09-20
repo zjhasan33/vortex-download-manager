@@ -469,6 +469,13 @@ pub struct Settings {
     /// Per-site proxy overrides, first enabled match wins. Empty = global only.
     #[serde(default)]
     pub per_site_proxies: Vec<PerSiteProxyRule>,
+    /// Show the IDM-style "Download File Info" dialog before starting
+    /// downloads (user can still start directly from the dialog).
+    #[serde(default = "default_true")]
+    pub show_download_info: bool,
+    /// Remembered save folder per category id ("video", "zip", …).
+    #[serde(default)]
+    pub category_paths: std::collections::HashMap<String, String>,
 }
 
 /// One per-site proxy override: route a domain (or wildcard) through its own
@@ -562,6 +569,8 @@ impl Default for Settings {
             embed_thumbnail: true,
             credentials: Vec::new(),
             per_site_proxies: Vec::new(),
+            show_download_info: true,
+            category_paths: std::collections::HashMap::new(),
         }
     }
 }
@@ -934,7 +943,19 @@ pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
                 let mgr = mgr.clone();
                 let settings = settings.clone();
                 tauri::async_runtime::spawn(async move {
-                    if crate::download::url_is_downloadable(&url) {
+                    if !crate::download::url_is_downloadable(&url) {
+                        return;
+                    }
+                    // Dialog mode: standalone File Info window instead of
+                    // auto-starting (OFF keeps today's direct path below).
+                    // The main dashboard is never raised for these prompts.
+                    if settings.show_download_info {
+                        crate::open_info_window(
+                            &app,
+                            serde_json::json!({ "url": url, "filename": "", "referer": "", "cookies": "" }),
+                        );
+                        return;
+                    }
                         let opts = download::StartOpts {
                             segments: settings.segments,
                             filename: None,
@@ -957,7 +978,6 @@ pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
                                 serde_json::json!({ "url": url, "id": id, "filename": view.title }),
                             );
                         }
-                    }
                 });
             }
         }

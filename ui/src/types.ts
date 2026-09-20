@@ -122,4 +122,6 @@ export interface Settings {
   embed_thumbnail: boolean;
   credentials: { host: string; username: string; password: string }[];
   per_site_proxies: { id: string; domain_pattern: string; proxy_url: string; enabled: boolean }[];
+  show_download_info: boolean;
+  category_paths: Record<string, string>;
 }

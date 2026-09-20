@@ -1,4 +1,5 @@
 import { openModal, toast } from "../lib/ui";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { icon } from "../lib/icons";
 import { formatBytes } from "../lib/format";
 import { api, store } from "../lib/api";
@@ -119,6 +120,23 @@ export function openAddUrl() {
         }
         const fn = nameInp.value.trim() || url.split("/").pop() || `download_${Date.now()}`;
         const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
+        // Dialog mode (default ON): probe + confirm. Scheduled starts and
+        // dialog-OFF keep today's direct path untouched.
+        if (!when && (store.settings?.show_download_info ?? true)) {
+          let info = { filename: fn, size: 0, category: "other" };
+          try {
+            info = await api.probeDownloadInfo(url);
+          } catch (e: unknown) {
+            toast("Probe failed: " + String(e), "err");
+            return;
+          }
+          close();
+          openIntercept(url, nameInp.value.trim() || info.filename, undefined, undefined, {
+            size: info.size,
+            category: info.category,
+          });
+          return;
+        }
         const startWith = (mode?: string) =>
           api.startDownload(url, pathInp.value.trim() || store.settings?.path || "", Number(segInp.value), fn, when, undefined, mode);
         const doneOk = () => {
@@ -286,6 +304,9 @@ export function openSettings() {
           </label>
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
             <input type="checkbox" id="st-clip" ${s.clipboard_monitor ? "checked" : ""} /> Watch clipboard for URLs (auto-add like IDM)
+          </label>
+          <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="st-dlinfo" ${s.show_download_info ?? true ? "checked" : ""} /> Show "Download File Info" dialog before starting downloads
           </label>
         </div>
       </div>
@@ -509,6 +530,8 @@ export function openSettings() {
           on_complete: root.querySelector<HTMLSelectElement>("#st-oncomplete")!.value,
           show_dropbox: root.querySelector<HTMLInputElement>("#st-dropbox")!.checked,
           clipboard_monitor: root.querySelector<HTMLInputElement>("#st-clip")!.checked,
+          show_download_info: root.querySelector<HTMLInputElement>("#st-dlinfo")!.checked,
+          category_paths: s.category_paths || {},
           embed_subs: root.querySelector<HTMLInputElement>("#st-embed")!.checked,
           sub_langs: root.querySelector<HTMLInputElement>("#st-sublangs")!.value.trim() || "all",
           embed_thumbnail: root.querySelector<HTMLInputElement>("#st-thumb")!.checked,
@@ -541,6 +564,8 @@ export function openGrabber(initialUrl = "", autoStart = false) {
   let items: GrabItem[] = [];
   let finding = false;
   let stopped = false;
+  // Shared with the onClose hook below (chip must die with the modal).
+  let chip: HTMLElement | null = null;
 
   const kinds: Array<[string, string, boolean]> = [
     ["video", "Videos", true],
@@ -611,7 +636,6 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       // pausable/stoppable, keep all modal state alive in this closure, and
       // show a floating chip to restore. The chip dies with the modal via the
       // openModal onClose hook (covers X, Cancel and outside-click).
-      let chip: HTMLElement | null = null;
       let submitted = 0;
       let submitTotal = 0;
       const chipLabel = () => {
@@ -1012,46 +1036,236 @@ export function openConfirmBulkRemove(count: number, onYes: (deleteFile: boolean
 }
 
 /** IDM-style intercept: link clicked → Start Download / Download Later (paused) / Cancel. */
-export function openIntercept(url: string, filename?: string, referer?: string, cookies?: string) {
-  const name = filename || url.split("/").pop() || url;
-  const saveTo = store.settings?.path || "";
+export interface DownloadInfoOpts {
+  title?: string;
+  size?: number;
+  category?: string;
+  format?: string;
+  /** Pre-selected destination folder (e.g. picked in the YouTube modal). */
+  saveDir?: string;
+  isYtdl?: boolean;
+  /** Called after every terminal close (Cancel/Later/Start/morph) — the
+   *  standalone dialog window uses it to close itself. */
+  onDone?: () => void;
+  ytdl?: {
+    format_id: string;
+    playlist?: boolean;
+    playlist_items?: string;
+    embed_subs?: boolean;
+    sub_langs?: string;
+    embed_thumbnail?: boolean;
+    auto_subs?: boolean;
+  };
+}
+
+const INFO_CATS = [
+  { id: "video", label: "Video" },
+  { id: "audio", label: "Audio" },
+  { id: "document", label: "Documents" },
+  { id: "program", label: "Programs" },
+  { id: "zip", label: "Archives" },
+  { id: "other", label: "Other" },
+];
+
+/** Guess a category id from a filename (mirrors backend category_of). */
+function catOfExt(name: string): string {
+  const ext = (name.split(".").pop() || "").toLowerCase().split(/[^a-z0-9]/)[0];
+  const map: Record<string, string[]> = {
+    video: ["mp4", "mkv", "webm", "avi", "mov", "flv", "m4v", "wmv", "mpg", "mpeg", "3gp"],
+    audio: ["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "wma", "aiff"],
+    document: ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "csv", "rtf", "odt"],
+    program: ["exe", "msi", "apk", "appimage", "whl", "deb", "rpm", "bat", "cmd", "ps1"],
+    zip: ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "cab"],
+  };
+  for (const [cat, exts] of Object.entries(map)) if (exts.includes(ext)) return cat;
+  return "other";
+}
+
+/** IDM-style "Download File Info" pre-download confirmation dialog. */
+export function openIntercept(url: string, filename?: string, referer?: string, cookies?: string, opts?: DownloadInfoOpts) {
+  const o = opts || {};
+  // Standalone dialog window? Then this modal owns the window: custom
+  // minimize/close + drag region, and onDone closes the window itself.
+  let isDlg = false;
+  try {
+    isDlg = getCurrentWindow().label === "download-info";
+  } catch {
+    isDlg = false;
+  }
+  // YouTube jobs: force Video (or Audio) + MP4/MP3 badge — never "Other".
+  const ytAudio = !!o.isYtdl && !!o.ytdl && /^(ba-|bestaudio)/.test(o.ytdl.format_id);
+  const isYtUrl = /^(https?:\/\/)?(www\.|m\.)?(youtube\.com|youtu\.be)\//i.test(url);
+  const rawFile = filename || url.split("/").pop() || url;
+  // A raw query string ("watch?v=…") is not a filename: leave the input
+  // empty (backend resolves the real name) with a clean placeholder.
+  const queryish = !rawFile || /[?&=]/.test(rawFile) || !rawFile.includes(".");
+  const file = queryish ? "" : rawFile;
+  const name = o.title || (!queryish ? rawFile : "") || (o.isYtdl || isYtUrl ? "YouTube video" : url);
+  const cat0 = o.isYtdl || isYtUrl ? (ytAudio ? "audio" : "video") : o.category || catOfExt(rawFile);
+  const fmt = o.isYtdl || isYtUrl ? (ytAudio ? "MP3" : "MP4") : (o.format || (rawFile.split(".").pop() || "").split(/[^a-z0-9]/i)[0] || "file").toUpperCase().slice(0, 8);
+  const remembered = store.settings?.category_paths?.[cat0];
+  const saveTo = o.saveDir || remembered || store.settings?.path || "";
   const close = openModal(
     () => `
-  <div class="modal" style="width:480px">
-    <div class="modal-head">
+  <div class="modal" style="width:600px">
+    <div class="modal-head"${isDlg ? ' data-tauri-drag-region style="cursor:move"' : ""}>
       <span style="color:var(--acc-1)">${icon("download", 18)}</span>
-      <h3>Download file?</h3>
+      <h3>Download File Info</h3>
       <div class="spacer"></div>
-      <button class="x" data-close>${icon("close", 16)}</button>
+      ${isDlg
+        ? `<div class="modal-window-controls">
+             <button id="btn-info-minimize" class="btn-win-min" title="Minimize to taskbar/tray">—</button>
+             <button id="btn-info-close" class="btn-win-close" title="Close">✕</button>
+           </div>`
+        : `<button class="x" data-close>${icon("close", 16)}</button>`}
     </div>
     <div class="modal-body">
-      <div style="font-size:13px;color:var(--text-1);word-break:break-all">${escapeAttr(name)}</div>
-      <div style="font-size:11px;color:var(--text-3);word-break:break-all">${escapeAttr(url)}</div>
-      <div class="field">
-        <label>Save to</label>
-        <div style="display:flex;gap:8px">
-          <input class="input ext" id="ic-path" value="${escapeAttr(saveTo)}" spellcheck="false" />
-          <button class="tbtn" id="ic-browse" title="Browse">${icon("folder", 15)}</button>
+      <div style="display:grid;grid-template-columns:1fr 148px;gap:14px">
+        <div style="display:grid;gap:10px;min-width:0">
+          <div class="field" style="margin:0">
+            <label>URL</label>
+            <div style="font-size:11.5px;color:var(--text-3);word-break:break-all;user-select:text">${escapeAttr(url)}</div>
+          </div>
+          <div class="field" style="margin:0">
+            <label>Category</label>
+            <select class="input" id="ic-cat">
+              ${INFO_CATS.map((c) => `<option value="${c.id}" ${c.id === cat0 ? "selected" : ""}>${c.label}</option>`).join("")}
+            </select>
+          </div>
+          <div class="field" style="margin:0">
+            <label>Save As</label>
+            <div style="display:flex;gap:8px">
+              <input class="input ext" id="ic-path" value="${escapeAttr(saveTo)}" spellcheck="false" title="Destination folder" />
+              <button class="tbtn" id="ic-browse" title="Browse">${icon("folder", 15)}</button>
+            </div>
+            <input class="input ext" id="ic-file" value="${escapeAttr(file)}" placeholder="YouTube Video (Auto-named on download)" spellcheck="false" title="File name" style="margin-top:6px" ${o.isYtdl ? "disabled" : ""} />
+            <div id="ic-dupnote" style="display:none;font-size:11px;color:var(--warn,#fbbf24)"></div>
+            ${o.isYtdl ? `<div style="font-size:11px;color:var(--text-3)">YouTube names the file from the video title.</div>` : ""}
+          </div>
+          <label style="display:flex;gap:9px;align-items:center;font-size:12px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="ic-remember" /> Remember this path for this category
+          </label>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;align-items:stretch">
+          <div style="border-radius:12px;padding:14px 8px;text-align:center;background:linear-gradient(135deg,var(--acc-1),var(--acc-2));color:#04121f;font-weight:800;font-size:22px;letter-spacing:1px">${escapeAttr(fmt)}</div>
+          <div style="text-align:center;font-size:12px;color:var(--text-2);font-family:var(--mono)" id="ic-size">${typeof o.size === "number" && o.size > 0 ? formatBytes(o.size) : "Calculating…"}</div>
+          <div style="font-size:13px;color:var(--text-1);word-break:break-all;text-align:center">${escapeAttr(name)}</div>
         </div>
       </div>
     </div>
     <div class="modal-foot">
       <button class="btn-ghost" data-close>Cancel</button>
-      <button class="tbtn" id="ic-later">Download later</button>
-      <button class="tbtn primary" id="ic-start">${icon("download", 15)} Start download</button>
+      <button class="tbtn" id="ic-later">Download Later</button>
+      <button class="tbtn primary" id="ic-start">${icon("download", 15)} Start Download</button>
     </div>
   </div>`,
     (root, close) => {
       root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = close));
+      // Standalone dialog window controls (embedded mode keeps ✕ only).
+      const minBtn = root.querySelector<HTMLButtonElement>("#btn-info-minimize");
+      if (minBtn)
+        minBtn.onclick = () => {
+          getCurrentWindow()
+            .minimize()
+            .catch(() => {});
+        };
+      const dlgClose = root.querySelector<HTMLButtonElement>("#btn-info-close");
+      if (dlgClose)
+        dlgClose.onclick = () => {
+          close();
+          o.onDone?.();
+        };
       root.querySelector<HTMLButtonElement>("#ic-browse")!.onclick = async () => {
         const p = await api.chooseFolder();
         if (p) root.querySelector<HTMLInputElement>("#ic-path")!.value = p;
       };
+      // Category switch re-resolves the save folder (remembered > default).
+      root.querySelector<HTMLSelectElement>("#ic-cat")!.onchange = () => {
+        const cat = root.querySelector<HTMLSelectElement>("#ic-cat")!.value;
+        const remembered = store.settings?.category_paths?.[cat];
+        root.querySelector<HTMLInputElement>("#ic-path")!.value = remembered || store.settings?.path || "";
+      };
+      // Fill in real size for plain HTTP(S) links (YouTube passes its own).
+      if (!o.isYtdl && (typeof o.size !== "number" || o.size <= 0)) {
+        void api
+          .probeDownloadInfo(url)
+          .then((p) => {
+            const el = root.querySelector<HTMLElement>("#ic-size");
+            if (el && p.size > 0) el.textContent = formatBytes(p.size);
+            else if (el) el.textContent = "Unknown";
+          })
+          .catch(() => {
+            const el = root.querySelector<HTMLElement>("#ic-size");
+            if (el) el.textContent = "Unknown";
+          });
+      }
+      // YouTube duplicate note (informational only): yt-dlp auto-renames on
+      // collision ("Name (1).ext"), so it can never silently overwrite —
+      // but the user should still see it coming.
+      if (o.isYtdl && o.title) {
+        const ext = fmt === "MP3" ? "mp3" : "mp4";
+        void api
+          .ytdlExpectedPath(saveTo, o.title, ext, !!o.ytdl?.playlist)
+          .then((r) => {
+            if (!r.exists) return;
+            const el = root.querySelector<HTMLElement>("#ic-dupnote");
+            if (!el) return;
+            el.style.display = "";
+            el.textContent = r.is_dir
+              ? "⚠ Folder already exists — new videos will be added alongside existing files."
+              : `⚠ Already on disk — yt-dlp will save a numbered copy instead of overwriting.`;
+          })
+          .catch(() => {});
+      }
+      const rememberPath = () => {
+        if (!root.querySelector<HTMLInputElement>("#ic-remember")!.checked) return;
+        const cat = root.querySelector<HTMLSelectElement>("#ic-cat")!.value;
+        const dir = root.querySelector<HTMLInputElement>("#ic-path")!.value.trim();
+        if (!store.settings || !dir) return;
+        const next = {
+          ...store.settings,
+          category_paths: { ...(store.settings.category_paths || {}), [cat]: dir },
+        };
+        store.settings = next;
+        void api.saveSettings(next).catch((e) => console.error("[remember path]", e));
+      };
       const go = async (later: boolean) => {
         const savePath = root.querySelector<HTMLInputElement>("#ic-path")!.value.trim() || store.settings?.path || "";
         const segs = store.settings?.segments ?? 16;
-        // start_paused = true queues as Paused (Download Later)
-        const start = (mode?: string) => api.startDownload(url, savePath, segs, filename || undefined, undefined, later, mode ?? (later ? undefined : "prompt"), referer, cookies);
+        rememberPath();
+        // YouTube branch: yt-dlp names the file itself (filename input is
+        // display-only there); start_paused queues for Download Later.
+        if (o.isYtdl && o.ytdl) {
+          const y = o.ytdl;
+          let dl: { id: string } | null = null;
+          try {
+            dl = await api.startYtdl(
+              url, y.format_id, savePath, y.playlist, y.playlist_items, undefined,
+              y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs,
+              referer, undefined, cookies, later,
+            );
+          } catch (e: unknown) {
+            toast(String(e), "err");
+            return;
+          }
+          if (later) {
+            toast("Queued — will start later", "ok");
+            close();
+            return;
+          }
+          if (!dl) {
+            close();
+            return;
+          }
+          morphLive(dl.id);
+          return;
+        }
+        // start_paused = true queues as Paused (Download Later).
+        // NOTE: filename comes from the input only — never the raw URL
+        // (a "watch?v=…" string must not become a file name).
+        // The duplicate prompt fires for Later too (checked at queue time).
+        const fileArg = () => root.querySelector<HTMLInputElement>("#ic-file")!.value.trim() || undefined;
+        const start = (mode?: string) => api.startDownload(url, savePath, segs, fileArg(), undefined, later, mode ?? "prompt", referer, cookies);
         let dl: Awaited<ReturnType<typeof api.startDownload>> | null = null;
         try {
           dl = await start();
@@ -1064,7 +1278,7 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           const choice: "replace" | "rename" | "cancel" = await new Promise((res) => openConfirmExists(m[1], res));
           if (choice === "cancel") return;
           try {
-            dl = await api.startDownload(url, savePath, segs, filename || undefined, undefined, later, choice === "replace" ? "replace" : undefined, referer, cookies);
+            dl = await api.startDownload(url, savePath, segs, fileArg(), undefined, later, choice === "replace" ? "replace" : undefined, referer, cookies);
           } catch (e2: unknown) {
             toast(String(e2), "err");
             return;
@@ -1080,7 +1294,9 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           return;
         }
         // IDM-style: morph into live progress dialog (Pause/Cancel + Minimize to app)
-        const id = dl.id;
+        morphLive(dl.id);
+      }
+      function morphLive(id: string) {
         const body = root.querySelector<HTMLElement>(".modal-body")!;
         const foot = root.querySelector<HTMLElement>(".modal-foot")!;
         body.innerHTML = `
@@ -1120,10 +1336,11 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           if (d.status === "error" || d.status === "cancelled") { unsub(); }
         });
         // Also handle YouTube the same way — ytdlp tasks emit same store events
-      };
+      }
       root.querySelector<HTMLButtonElement>("#ic-start")!.onclick = () => void go(false);
       root.querySelector<HTMLButtonElement>("#ic-later")!.onclick = () => void go(true);
     },
+    () => o.onDone?.(),
   );
   return close;
 }

@@ -11,7 +11,7 @@ if (typeof browser === "undefined" && typeof globalThis.chrome !== "undefined") 
 
 const WS_ADDR = "ws://127.0.0.1:17190";
 const MEDIA_EXT = ["mp4", "webm", "mov", "m4v", "mkv", "flv", "avi", "m4a", "mp3", "ogg", "oga", "opus", "wav", "aac", "flac", "m3u8", "mpd"];
-const FILE_EXT = ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "exe", "msi", "pdf", "apk", "deb", "rpm", "dmg", "torrent", "bin", "img", "whl", "epub", "doc", "docx", "xls", "xlsx", "ppt", "pptx"];
+const FILE_EXT = ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "exe", "msi", "pdf", "apk", "deb", "rpm", "dmg", "bin", "img", "whl", "epub", "doc", "docx", "xls", "xlsx", "ppt", "pptx"];
 // Telemetry / page assets / text / images / code — never considered downloadable.
 const NOISE_EXT = ["txt", "log", "json", "jsonp", "js", "mjs", "cjs", "jsx", "ts", "tsx", "css", "scss", "less", "map", "html", "htm", "xhtml", "xml", "csv", "md", "yml", "yaml", "svg", "ico", "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "woff", "woff2", "ttf", "otf", "eot", "php", "asp", "aspx", "jsp", "vue", "crt", "pem", "ini", "conf", "wasm", "dll"];
 const MEDIA_SITES = ["youtube.com", "youtu.be", "youtube-nocookie.com", "tiktok.com", "instagram.com", "facebook.com", "fb.watch", "twitter.com", "x.com", "dailymotion.com", "vimeo.com", "soundcloud.com", "bilibili.com", "twitch.tv", "reddit.com"];

@@ -365,6 +365,18 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     let url = p["url"].as_str().unwrap_or("").to_string();
                     if url.is_empty() {
                         err("url required")
+                    } else if crate::state::load_settings(app).show_download_info {
+                        // Dialog mode: standalone File Info window instead of
+                        // auto-starting (OFF keeps today's direct path below).
+                        // The main dashboard is never raised for these prompts.
+                        let payload = serde_json::json!({
+                            "url": url,
+                            "filename": p["filename"].as_str().unwrap_or(""),
+                            "referer": p["referer"].as_str().unwrap_or(""),
+                            "cookies": p["cookies"].as_str().unwrap_or(""),
+                        });
+                        crate::open_info_window(app, payload);
+                        json!({"type":"ack","ok":true,"success":true,"action":"dialog_opened"}).to_string()
                     } else {
                         // Acknowledge immediately; the probe/yt-dlp work runs in the
                         // background so the extension popup never times out.
@@ -410,6 +422,27 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     let fid = p["format_id"].as_str().unwrap_or("").to_string();
                     if url.is_empty() || fid.is_empty() {
                         err("url and format_id required")
+                    } else if crate::state::load_settings(app).show_download_info {
+                        // Dialog mode: hover-bar clicks pop the standalone File
+                        // Info window (title/size unknown here — the modal shows
+                        // what the extension sent). OFF = direct start below.
+                        let payload = serde_json::json!({
+                            "url": url,
+                            "filename": "",
+                            "referer": p["referer"].as_str().unwrap_or(""),
+                            "cookies": p["cookies"].as_str().unwrap_or(""),
+                            "ytdl": {
+                                "format_id": fid,
+                                "playlist": p["playlist"].as_bool().unwrap_or(false),
+                                "playlist_items": p["playlist_items"].as_str().unwrap_or(""),
+                                "embed_subs": p["embed_subs"].as_bool().unwrap_or(true),
+                                "sub_langs": p["sub_langs"].as_str().unwrap_or("all"),
+                                "embed_thumbnail": p["embed_thumbnail"].as_bool().unwrap_or(true),
+                                "auto_subs": p["auto_subs"].as_bool().unwrap_or(false),
+                            },
+                        });
+                        crate::open_info_window(app, payload);
+                        json!({"type":"ack","ok":true,"success":true,"action":"dialog_opened"}).to_string()
                     } else {
                         // Synchronous: ytdlp::start() does no network (tool
                         // fetching happens in launch()), so this returns the

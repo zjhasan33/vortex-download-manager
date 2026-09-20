@@ -563,6 +563,18 @@ button {
   display: grid; place-items: center; color: var(--text-3);
 }
 .modal-head .x:hover { background: rgba(239,68,68,0.15); color: #fca5a5; }
+/* Standalone dialog window controls (Download File Info window). */
+.modal-window-controls { display: flex; gap: 6px; align-items: center; }
+.btn-win-min, .btn-win-close {
+  width: 30px; height: 30px; border-radius: 8px;
+  display: grid; place-items: center; color: var(--text-3);
+  font-size: 15px; line-height: 1;
+}
+.btn-win-min:hover { background: rgba(148,163,255,0.15); color: #fff; }
+.btn-win-close:hover { background: rgba(239,68,68,0.15); color: #fca5a5; }
+/* Standalone dialog window body (frameless, compact — no dashboard). */
+body.infowin { background: var(--bg-1); overflow: hidden; }
+body.infowin .modal-overlay { position: absolute; }
 .modal-body { padding: 20px 22px; display: grid; gap: 14px; overflow-y: auto; }
 .modal-foot {
   padding: 14px 22px;
