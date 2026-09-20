@@ -126,6 +126,35 @@
     return n;
   }
 
+  // Deep traversal for shadow DOM + iframe-aware
+  function* deepVideos(root = document) {
+    try {
+      for (const v of root.querySelectorAll("video, audio")) yield v;
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) yield* deepVideos(el.shadowRoot);
+      }
+    } catch (e) {}
+    // Same-origin iframes (cross-origin needs all_frames content script)
+    try {
+      for (const f of root.querySelectorAll("iframe")) {
+        try {
+          if (f.contentDocument) yield* deepVideos(f.contentDocument);
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  // Auto-observe new shadow roots
+  try {
+    const _attach = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (opts) {
+      const r = _attach.call(this, opts);
+      try {
+        new MutationObserver(() => { scan(); refreshUI(); }).observe(r, { childList: true, subtree: true });
+      } catch (e) {}
+      return r;
+    };
+  } catch (e) {}
+
   // ---------------- detection ----------------
 
   function register(el, src, kind) {
@@ -145,7 +174,7 @@
   }
 
   function scan() {
-    for (const v of document.querySelectorAll("video, audio")) {
+    for (const v of deepVideos()) {
       const src = v.currentSrc || v.src;
       if (src) {
         const e = extOf(src);
@@ -161,9 +190,16 @@
         }
       }
     }
-    // youtube-like: video uses blob: — mark page-level
-    if (onlyHost(hostOf(getCurrentUrl())) && document.querySelector("video")) {
-      if (!media.has("__page__")) media.set("__page__", { url: getCurrentUrl(), title: "This page's video", kind: "page" });
+    // Generic blob: fallback — any site with a playing video gets a page-level entry so hover bar can appear even without sniffed HLS.
+    const hasVideo = [...deepVideos()].length > 0;
+    if (hasVideo && !media.has("__page__")) {
+      // Prefer mediaSite check but allow generic blob fallback for anime/generic HLS
+      const v = [...deepVideos()][0];
+      if (v && v.duration && !isNaN(v.duration) && (v.readyState >= 1 || !v.paused || mediaSite() || pendingStream)) {
+        media.set("__page__", { url: getCurrentUrl(), title: "This page's video", kind: "page" });
+      } else if (onlyHost(hostOf(getCurrentUrl()))) {
+        media.set("__page__", { url: getCurrentUrl(), title: "This page's video", kind: "page" });
+      }
     }
     bindBarVideos();
   }
@@ -633,14 +669,14 @@
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url: getCurrentUrl(), format_id: btn.dataset.fid });
+        void send({ type: "start_ytdl", url: u, format_id: btn.dataset.fid });
       });
     });
     hbarFmts.querySelectorAll("[data-sub]").forEach((btn) => {
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url: getCurrentUrl(), format_id: "subs:srt:" + btn.dataset.sub });
+        void send({ type: "start_ytdl", url: u, format_id: "subs:srt:" + btn.dataset.sub });
       });
     });
     placeFmtsBelow();
@@ -689,14 +725,14 @@
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url: getCurrentUrl(), format_id: "subs:" + hbarSubFmt + ":" + btn.dataset.sub });
+        void send({ type: "start_ytdl", url: url, format_id: "subs:" + hbarSubFmt + ":" + btn.dataset.sub });
       });
     });
     placeFmtsBelow();
   }
 
   function bindBarVideos() {
-    for (const v of document.querySelectorAll("video")) {
+    for (const v of deepVideos()) {
       if (boundBarVideos.has(v)) continue;
       boundBarVideos.add(v);
       v.addEventListener("pointerenter", () => hbarShow(v));
@@ -705,7 +741,12 @@
         if (hbarTarget === v) placeHbar();
       });
     }
-    if (hbarTarget && !document.contains(hbarTarget)) hbarHide(0);
+    // Also check shadow-hosted videos that may have been missed
+    if (hbarTarget) {
+      let stillThere = false;
+      for (const v of deepVideos()) if (v === hbarTarget) stillThere = true;
+      if (!stillThere) hbarHide(0);
+    }
   }
 
   window.addEventListener("scroll", () => { if (hbarTarget) placeHbar(); }, true);

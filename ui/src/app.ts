@@ -24,6 +24,12 @@ api.onIntercept = async (p) => {
     await (win as unknown as { unminimize?: () => Promise<void> }).unminimize?.().catch(() => {});
     await win.setFocus().catch(() => {});
   } catch {}
+  const fmtFlat = (p as unknown as { format_id?: string }).format_id;
+  const isYtdlFlat = !!(p as unknown as { is_ytdl?: boolean }).is_ytdl || !!(p as unknown as { isYtdl?: boolean }).isYtdl || !!fmtFlat;
+  if (isYtdlFlat && fmtFlat && !p.ytdl) {
+    openIntercept(p.url, p.filename, p.referer, p.cookies, { isYtdl: true, ytdl: { format_id: fmtFlat } } as never);
+    return;
+  }
   openIntercept(
     p.url,
     p.filename,

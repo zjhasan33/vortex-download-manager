@@ -125,6 +125,7 @@ export const api = {
     userAgent?: string,
     cookies?: string,
     startPaused?: boolean,
+    allowDup?: boolean,
   ) =>
     cmd<Download>("start_ytdl", {
       url,
@@ -141,6 +142,7 @@ export const api = {
       user_agent: userAgent,
       cookies,
       startPaused,
+      allow_dup: allowDup,
     }),
 
   openFolder: (path: string) => cmd<void>("open_folder", { path }),
@@ -152,6 +154,7 @@ export const api = {
     cmd<{ url: string; filename?: string; referer?: string; cookies?: string; ytdl?: Record<string, unknown> } | null>("take_dialog_payload"),
   ytdlExpectedPath: (dir: string, title: string, ext: string, playlist: boolean) =>
     cmd<{ exists: boolean; path: string; is_dir: boolean }>("ytdl_expected_path", { dir, title, ext, playlist }),
+  deleteFileAt: (path: string) => cmd<void>("delete_file_at", { path }),
   getTools: () => cmd<ToolsStatus>("get_tools_status"),
   updateTools: (forceFfmpeg = false) => cmd<UpdateToolsResult>("update_tools", { forceFfmpeg }),
   getSettings: () => cmd<Settings>("get_settings"),
@@ -172,7 +175,7 @@ export const api = {
   /** Set by app.ts to open the Site Grabber modal (extension "Grab This Page"). */
   onGrabberOpen: null as ((url: string) => void) | null,
   /** Fired when the browser intercepts a download — show the IDM-style Start/Later/Cancel. */
-  onIntercept: null as ((p: { url: string; filename?: string; referer?: string; cookies?: string; ytdl?: { format_id: string; title?: string; size?: number; playlist?: boolean; playlist_items?: string; embed_subs?: boolean; sub_langs?: string; embed_thumbnail?: boolean; auto_subs?: boolean } }) => void) | null,
+  onIntercept: null as ((p: { url: string; filename?: string; referer?: string; cookies?: string; format_id?: string; is_ytdl?: boolean; ytdl?: { format_id: string; title?: string; size?: number; playlist?: boolean; playlist_items?: string; embed_subs?: boolean; sub_langs?: string; embed_thumbnail?: boolean; auto_subs?: boolean } }) => void) | null,
 };
 
 // ---- Lightweight reactive store ----
@@ -185,6 +188,8 @@ class Store {
   settings: Settings | null = null;
   private listeners = new Set<Listener>();
   private ticking = false;
+  private speedEma = new Map<string, number>();
+  private totalEma = 0;
 
   subscribe(fn: Listener) {
     this.listeners.add(fn);
@@ -206,7 +211,18 @@ class Store {
     if (d) {
       d.downloaded = p.downloaded;
       d.total_size = p.total_size;
-      d.speed = p.speed;
+      // EMA smoothing (0.3*current + 0.7*prev) — only the displayed speed is smoothed, byte counters stay raw.
+      const prev = this.speedEma.get(p.id) ?? p.speed;
+      const smoothed = p.speed * 0.3 + prev * 0.7;
+      this.speedEma.set(p.id, smoothed);
+      // Prune stale ids (completed downloads keep map bounded).
+      if (this.speedEma.size > 64) {
+        for (const k of this.speedEma.keys()) {
+          if (!this.downloads.some((x) => x.id === k)) this.speedEma.delete(k);
+          if (this.speedEma.size <= 32) break;
+        }
+      }
+      d.speed = Math.round(smoothed);
       d.progress = p.progress;
       d.eta = p.eta;
       if (p.segments != null) d.segments = p.segments;
@@ -227,7 +243,12 @@ class Store {
         conns += x.live || 0;
       }
     }
-    this.stats = { ...this.stats, total_speed: speed, active, segments: segs, connections: conns };
+    this.totalEma = speed * 0.3 + this.totalEma * 0.7;
+    if (this.totalEma === 0) this.totalEma = speed;
+    // Use smoothed total when active, raw when idle (avoids ghost speed).
+    const displayTotal = active ? Math.round(this.totalEma) : speed;
+    if (!active) this.totalEma = 0;
+    this.stats = { ...this.stats, total_speed: displayTotal, active, segments: segs, connections: conns };
     this.emit();
   }
 

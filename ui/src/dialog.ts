@@ -22,8 +22,65 @@ interface DialogPayload {
   };
 }
 
-function openFromPayload(p: DialogPayload) {
+function youtubeId(url: string): string | null {
+  try {
+    const u = url.toLowerCase();
+    const m1 = u.match(/[?&]v=([^&#]+)/);
+    if (m1) return m1[1];
+    const m2 = u.match(/youtu\.be\/([^?&#/]+)/);
+    if (m2) return m2[1];
+    const m3 = u.match(/\/(embed|v|shorts)\/([^?&#/]+)/);
+    if (m3) return m3[2];
+  } catch {}
+  return null;
+}
+
+async function openFromPayload(p: DialogPayload) {
   if (!p || !p.url) return;
+  // Check A: URL / YouTube ID already in history (including Completed).
+  // Format-aware: exact same format/extension only (MP4 vs MP3, 720p vs 1080p are different).
+  const newFmt = p.ytdl?.format_id || "";
+  try {
+    const id = youtubeId(p.url);
+    const list: { url: string; save_path: string; filename: string; format_id?: string }[] = await api.listDownloads().catch(() => []);
+    const dup = list.find((d) => {
+      if (d.url === p.url) {
+        const dupFmt = (d as unknown as { format_id?: string }).format_id || "";
+        if (newFmt && dupFmt && dupFmt !== newFmt) return false;
+        return true;
+      }
+      if (id) {
+        const did = youtubeId(d.url);
+        if (did && did.toLowerCase() === id.toLowerCase()) {
+          const dupFmt = (d as unknown as { format_id?: string }).format_id || "";
+          if (newFmt && dupFmt && dupFmt !== newFmt) return false;
+          return true;
+        }
+      }
+      return false;
+    });
+    if (dup) {
+      const wantAgain = await new Promise<boolean>((res) => {
+        // Direct modal for "already downloaded" — Download Again / Cancel (IDM parity).
+        import("./components/modals").then((m) => {
+          // Use the existing file-exists modal but with tailored text.
+          const anyMod = m as unknown as Record<string, unknown>;
+          const fn = (anyMod.openConfirmExists as ((path: string, cb: (a: string) => void) => void) | undefined)
+            || (anyMod.openConfirmRemove as unknown as ((path: string, cb: (a: string) => void) => void));
+          if (fn) {
+            const label = (dup.save_path || (dup as unknown as { filename: string }).filename || p.url) + " — already downloaded. Download again?";
+            fn(label, (choice: string) => res(choice !== "cancel"));
+          } else {
+            res(window.confirm("This video/file has already been downloaded! Download again?"));
+          }
+        }).catch(() => res(window.confirm("This video/file has already been downloaded! Download again?")));
+      });
+      if (!wantAgain) {
+        getCurrentWindow().close().catch(() => {});
+        return;
+      }
+    }
+  } catch {}
   // Backend may use "referer" or "referrer" spelling; accept both.
   const raw = (p as unknown as Record<string, unknown>)["referrer"];
   const referer =

@@ -1406,11 +1406,29 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             flag_needs_auth(&task);
             return false;
         }
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            // Transient: rate limit / wobbly mirror. Back the connection count
-            // off (AIMD) so throttling hosts stay usable, honor Retry-After,
-            // else back off; the chunk resumes from the cursor afterwards.
+        if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+            // Explicit 429/503 only: transient rate limit / overloaded mirror.
+            // Back the connection count off (AIMD) so throttling hosts stay
+            // usable, honor Retry-After, else back off; the chunk resumes from
+            // the cursor afterwards. Other 5xx / TCP timeouts use plain retry
+            // without halving connections.
             task.note_congestion();
+            attempts += 1;
+            if attempts > MAX_CHUNK_ATTEMPTS {
+                task.set_error(&format!("HTTP {} (server keeps failing)", status.as_u16()));
+                return false;
+            }
+            let wait = retry_after_secs(&resp)
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| retry_backoff(attempts));
+            eprintln!("[vortex-net] segment {idx}: HTTP {} — waiting {}s", status.as_u16(), wait.as_secs());
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        if status.is_server_error() {
+            // Other 5xx (500, 502, 504…) — transient but NOT rate-limit: retry
+            // with backoff and Retry-After, but don't halve connections (AIMD
+            // only for explicit 429/503).
             attempts += 1;
             if attempts > MAX_CHUNK_ATTEMPTS {
                 task.set_error(&format!("HTTP {} (server keeps failing)", status.as_u16()));
@@ -1596,6 +1614,7 @@ async fn monitor_task(task: Arc<Task>) {
     let mut win_bytes = 0u64;
     let mut win_ticks = 0u32;
     let mut prev_bps = 0.0f64;
+    let mut ema_speed: f64 = 0.0;
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let now = task.done.load(Ordering::Relaxed);
@@ -1609,7 +1628,9 @@ async fn monitor_task(task: Arc<Task>) {
         }
         let dt = t.duration_since(last).as_secs_f64().max(0.05);
         let tick_bytes = now.saturating_sub(last_done);
-        let speed = (tick_bytes as f64 / dt) as u64;
+        let raw = tick_bytes as f64 / dt;
+        ema_speed = if ema_speed == 0.0 { raw } else { raw * 0.3 + ema_speed * 0.7 };
+        let speed = ema_speed as u64;
         last = t;
         last_done = now;
         let total = task.total.load(Ordering::Relaxed);
@@ -1661,11 +1682,17 @@ async fn monitor_task(task: Arc<Task>) {
 fn split_range(total: u64, connections: usize, save_path: &Path) -> Vec<Segment> {
     // Work-stealing needs more chunks than connections so free workers can take
     // over whatever a slow connection hasn't finished. Aim for ~4 chunks per
-    // connection, keep each chunk between 1 MB and 32 MB (small tail), and cap
-    // the total number of parts so resume state stays reasonable.
+    // connection and cap the total number of parts so resume state stays reasonable.
+    // For >1 GB files use larger chunks (16-64 MB) to avoid hundreds of tiny
+    // range requests and keep each connection streaming with keep-alive.
     let conns = connections.max(1) as u64;
     let max_chunks = 1024u64;
-    let mut chunk = total.div_ceil(conns * 4).clamp(1024 * 1024, 32 * 1024 * 1024);
+    let (min_chunk, max_chunk) = if total > 1024 * 1024 * 1024 {
+        (16 * 1024 * 1024u64, 64 * 1024 * 1024u64)
+    } else {
+        (1024 * 1024u64, 32 * 1024 * 1024u64)
+    };
+    let mut chunk = total.div_ceil(conns * 4).clamp(min_chunk, max_chunk);
     if total.div_ceil(chunk) > max_chunks {
         chunk = total.div_ceil(max_chunks);
     }

@@ -351,13 +351,27 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
             match typ {
                 "intercept" => {
                     let p = &v["payload"];
-                    let _ = app.emit("download-intercept", json!({
-                        "url": p["url"].as_str().unwrap_or(""),
-                        "filename": p["filename"].as_str().unwrap_or(""),
-                        "referer": p["referer"].as_str().unwrap_or(""),
-                        "cookies": p["cookies"].as_str().unwrap_or(""),
-                    }));
-                    json!({"type":"ack","ok":true,"intercepted":true}).to_string()
+                    if crate::state::load_settings(app).show_download_info {
+                        let payload = serde_json::json!({
+                            "url": p["url"].as_str().unwrap_or(""),
+                            "filename": p["filename"].as_str().unwrap_or(""),
+                            "referer": p["referer"].as_str().unwrap_or(""),
+                            "cookies": p["cookies"].as_str().unwrap_or(""),
+                            "ytdl": p.get("format_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|fid| serde_json::json!({"format_id": fid})),
+                        });
+                        crate::open_info_window(app, payload);
+                        json!({"type":"ack","ok":true,"intercepted":true,"dialog":true}).to_string()
+                    } else {
+                        let _ = app.emit("download-intercept", json!({
+                            "url": p["url"].as_str().unwrap_or(""),
+                            "filename": p["filename"].as_str().unwrap_or(""),
+                            "referer": p["referer"].as_str().unwrap_or(""),
+                            "cookies": p["cookies"].as_str().unwrap_or(""),
+                            "format_id": p["format_id"].as_str().unwrap_or(""),
+                            "is_ytdl": p["is_ytdl"].as_bool().unwrap_or(false),
+                        }));
+                        json!({"type":"ack","ok":true,"intercepted":true}).to_string()
+                    }
                 }
                 "ping" => json!({"type":"pong"}).to_string(),
                 "download" => {

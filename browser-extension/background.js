@@ -25,8 +25,11 @@ const DASH_CT = ["application/dash+xml"];
 const EXT_UA = (typeof navigator !== "undefined" && navigator.userAgent) || "";
 function streamKindOf(url) {
   const u = String(url || "");
-  if (extOf(u) === "m3u8" || u.includes(".m3u8")) return "hls";
-  if (extOf(u) === "mpd" || u.includes(".mpd")) return "dash";
+  const low = u.toLowerCase();
+  if (extOf(u) === "m3u8" || u.includes(".m3u8") || low.includes("/hls/") || low.includes("/hls?") || (low.includes("manifest") && low.includes("m3u8"))) return "hls";
+  if (extOf(u) === "mpd" || u.includes(".mpd") || low.includes("/dash/") || (low.includes("manifest") && low.includes("mpd"))) return "dash";
+  // Fallback: tokenized HLS like /hls/abc123?token=xyz without extension but served as mpegurl (caught via headers)
+  if (low.includes("/hls/") || low.includes("playlist") && low.includes("token")) return "hls";
   return "";
 }
 // Master/index manifests only: skip segments, chunks, maps and init files.
@@ -739,15 +742,26 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "start_ytdl") {
     if (online) {
       return safeRespond(sendResponse, async () => {
-        // Explicit embed override so the popup toggle works both ways
-        // (when OFF, we must send false — otherwise the desktop uses its own settings).
-        const payload = {
-          url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled,
-          referer: msg.referer || pageUrl || undefined,
-          cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
-          user_agent: msg.userAgent || EXT_UA,
-        };
-        return rpc("start_ytdl", payload);
+        // IDM-style: YouTube hover bar goes through the intercept dialog
+        // (Start / Download Later / Cancel) instead of auto-starting.
+        try {
+          await rpc("intercept", {
+            url: msg.url, filename: msg.filename || undefined,
+            referer: msg.referer || pageUrl || undefined,
+            cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
+            user_agent: msg.userAgent || EXT_UA,
+            format_id: msg.format_id, is_ytdl: true,
+          });
+          return { ok: true, intercepted: true };
+        } catch {
+          const payload = {
+            url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled,
+            referer: msg.referer || pageUrl || undefined,
+            cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
+            user_agent: msg.userAgent || EXT_UA,
+          };
+          return rpc("start_ytdl", payload);
+        }
       });
     }
     return safeRespond(sendResponse, async () => {

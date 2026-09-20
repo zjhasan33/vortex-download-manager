@@ -1235,18 +1235,52 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
         rememberPath();
         // YouTube branch: yt-dlp names the file itself (filename input is
         // display-only there); start_paused queues for Download Later.
+        // IDM parity: same file downloaded again must warn (Replace / Keep Both / Cancel) — never silently double.
         if (o.isYtdl && o.ytdl) {
           const y = o.ytdl;
+          let ytdlAllowDup = false;
+          // Pre-check: does the final file (or playlist folder) already exist on disk?
+          if (!later && o.title) {
+            try {
+              const ext = /^(ba-|bestaudio)/.test(y.format_id) ? "mp3" : "mp4";
+              const probe = await api.ytdlExpectedPath(savePath, o.title, ext, !!y.playlist);
+              if (probe.exists) {
+                const label = probe.path || o.title;
+                const choice: "replace" | "rename" | "cancel" = await new Promise((res) => openConfirmExists(label, res));
+                if (choice === "cancel") return;
+                if (choice === "replace") {
+                  try { await api.deleteFileAt(probe.path); } catch {}
+                } else if (choice === "rename") {
+                  ytdlAllowDup = true;
+                }
+              }
+            } catch {}
+          }
           let dl: { id: string } | null = null;
           try {
             dl = await api.startYtdl(
               url, y.format_id, savePath, y.playlist, y.playlist_items, undefined,
               y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs,
-              referer, undefined, cookies, later,
+              referer, undefined, cookies, later, ytdlAllowDup,
             );
           } catch (e: unknown) {
-            toast(String(e), "err");
-            return;
+            const m = String(e).match(/^EXISTS::([\s\S]*)$/);
+            if (m) {
+              const choice: "replace" | "rename" | "cancel" = await new Promise((res) => openConfirmExists(m[1], res));
+              if (choice === "cancel") return;
+              if (choice === "replace") {
+                try { await api.deleteFileAt(m[1].split(" (already")[0].trim()); } catch {}
+              }
+              try {
+                dl = await api.startYtdl(url, y.format_id, savePath, y.playlist, y.playlist_items, undefined, y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs, referer, undefined, cookies, later, choice === "rename");
+              } catch (e2: unknown) {
+                toast(String(e2), "err");
+                return;
+              }
+            } else {
+              toast(String(e), "err");
+              return;
+            }
           }
           if (later) {
             toast("Queued — will start later", "ok");

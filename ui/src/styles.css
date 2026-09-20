@@ -573,8 +573,10 @@ button {
 .btn-win-min:hover { background: rgba(148,163,255,0.15); color: #fff; }
 .btn-win-close:hover { background: rgba(239,68,68,0.15); color: #fca5a5; }
 /* Standalone dialog window body (frameless, compact — no dashboard). */
-body.infowin { background: var(--bg-1); overflow: hidden; }
-body.infowin .modal-overlay { position: absolute; }
+html, body.infowin { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; }
+body.infowin { background: transparent; }
+body.infowin .modal-overlay { position: absolute; inset: 0; background: transparent; backdrop-filter: none; padding: 0; }
+body.infowin .modal { width: 100% !important; height: 100% !important; max-width: none; max-height: none; margin: 0 !important; border-radius: 8px; box-sizing: border-box; }
 .modal-body { padding: 20px 22px; display: grid; gap: 14px; overflow-y: auto; }
 .modal-foot {
   padding: 14px 22px;

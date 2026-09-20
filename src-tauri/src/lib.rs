@@ -91,6 +91,36 @@ struct CapturePayload {
     format_id: Option<String>,
 }
 
+fn youtube_id(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    // youtu.be/<id>
+    if let Some(p) = lower.find("youtu.be/") {
+        let id = url[p + 9..].split(['?', '&', '#', '/']).next().unwrap_or("").trim().to_string();
+        if id.len() >= 6 {
+            return Some(id);
+        }
+    }
+    // youtube.com/watch?v=<id> or &v=<id>
+    for key in ["?v=", "&v="] {
+        if let Some(p) = lower.find(key) {
+            let id = url[p + key.len()..].split(['?', '&', '#', '/']).next().unwrap_or("").trim().to_string();
+            if id.len() >= 6 {
+                return Some(id);
+            }
+        }
+    }
+    // youtube.com/embed/<id> or /v/<id> or /shorts/<id>
+    for tag in ["/embed/", "/v/", "/shorts/"] {
+        if let Some(p) = lower.find(tag) {
+            let id = url[p + tag.len()..].split(['?', '&', '#', '/']).next().unwrap_or("").trim().to_string();
+            if id.len() >= 6 {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -236,6 +266,36 @@ async fn start_download(
     referer: Option<String>,
     cookies: Option<String>,
 ) -> Result<download::DlView, String> {
+    // IDM parity: same file already queued/downloading → warn instead of silent duplicate.
+    // Covers the "0 B still downloading" case (file not on disk yet) and YouTube ID variants (youtu.be vs watch?v=).
+    let views = state.views();
+    let dup = views.iter().find(|v| {
+        if matches!(v.status, download::DlStatus::Completed | download::DlStatus::Cancelled) {
+            return false;
+        }
+        if v.url == url {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (youtube_id(&v.url), youtube_id(&url)) {
+            return a.eq_ignore_ascii_case(&b);
+        }
+        if let Some(fname) = &filename {
+            if !fname.is_empty() && v.filename == *fname {
+                return true;
+            }
+        }
+        false
+    });
+    if on_exists.as_deref() == Some("prompt") {
+        if let Some(dup) = dup {
+            return Err(format!("EXISTS::{} (already in list: {:?})", dup.save_path, dup.status));
+        }
+    } else if dup.is_some() && filename.is_none() {
+        // Even without prompt (grabber batch etc.), don't silently queue a 4th copy of the same video.
+        if let Some(d) = dup {
+            return Err(format!("EXISTS::{} (already in list: {:?})", d.save_path, d.status));
+        }
+    }
     let settings = state::load_settings(&app);
     let opts = download::StartOpts {
         segments,
@@ -580,6 +640,17 @@ async fn ytdl_expected_path(
     Ok(serde_json::json!({ "exists": exists, "path": path.display().to_string(), "is_dir": is_dir }))
 }
 
+#[tauri::command]
+async fn delete_file_at(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if p.is_file() {
+        std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+    } else if p.is_dir() {
+        std::fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Open (or focus) the standalone "Download File Info" dialog window with a
 /// stored payload. The main dashboard is never raised for these prompts.
 fn open_info_window(app: &tauri::AppHandle, payload: serde_json::Value) {
@@ -597,10 +668,12 @@ fn open_info_window(app: &tauri::AppHandle, payload: serde_json::Value) {
         tauri::WebviewUrl::App("index.html#/download-info".into()),
     )
     .title("Download File Info")
-    .inner_size(680.0, 600.0)
-    .min_inner_size(600.0, 520.0)
+    .inner_size(540.0, 390.0)
+    .min_inner_size(540.0, 380.0)
     .decorations(false)
     .transparent(false)
+    .always_on_top(true)
+    .center()
     .build()
     {
         Ok(w) => w,
@@ -685,7 +758,91 @@ async fn start_ytdl(
     user_agent: Option<String>,
     cookies: Option<String>,
     start_paused: Option<bool>,
+    allow_dup: Option<bool>,
 ) -> Result<download::DlView, String> {
+    // Same video already in list → warn (covers 0% + youtu.be vs watch?v= ID variants).
+    // In-flight guard: rapid double-click before the first task is visible in views().
+    // Keep Both (allow_dup) bypasses all duplicate gates by design.
+    let is_audio_new = format_id.starts_with("ba-") || format_id.starts_with("bestaudio");
+    let allow = allow_dup == Some(true);
+    if !allow {
+        {
+            use std::collections::HashSet;
+            use std::sync::{LazyLock, Mutex};
+            static PENDING_YTDL: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+            if let Some(id) = youtube_id(&url) {
+                let key = format!("{}:{}", id.to_ascii_lowercase(), format_id);
+                let mut pending = PENDING_YTDL.lock().unwrap();
+                if pending.contains(&key) {
+                    return Err(format!("EXISTS::pending:{key} (already starting)"));
+                }
+                pending.insert(key.clone());
+                // Auto-clear after 15s so a failed start doesn't block forever.
+                let key2 = key.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    PENDING_YTDL.lock().unwrap().remove(&key2);
+                });
+            }
+        }
+    let views = state.views();
+    if let Some(dup) = views.iter().find(|v| {
+        if matches!(v.status, download::DlStatus::Completed | download::DlStatus::Cancelled) {
+            return false;
+        }
+        // Same exact URL → always duplicate.
+        if v.url == url {
+            return true;
+        }
+        // Same YouTube ID but different format (MP4 vs MP3) is NOT duplicate — allow it.
+        if let (Some(a), Some(b)) = (youtube_id(&v.url), youtube_id(&url)) {
+            if !a.eq_ignore_ascii_case(&b) {
+                return false;
+            }
+            // Same video ID: only block if exact same format/extension (MP4 vs MP3, 720p vs 1080p are different).
+            let dup_fmt = v.format_id.as_deref().unwrap_or("");
+            return dup_fmt == format_id;
+        }
+        false
+    }) {
+        return Err(format!("EXISTS::{} (already in list: {:?})", dup.save_path, dup.status));
+    }
+    // Already on disk (even if list says Completed) → warn like IDM, but only for exact same format/extension.
+    // Different format (MP4 vs MP3, 720p vs 1080p) is a different file — don't warn.
+    if let Some(id) = youtube_id(&url) {
+        let has_same_format = views.iter().any(|v| {
+            youtube_id(&v.url).map(|id2| id2.eq_ignore_ascii_case(&id)).unwrap_or(false)
+                && v.format_id.as_deref().unwrap_or("") == format_id
+        });
+        // Only check disk if same format already exists in history; otherwise different format → allow.
+        if has_same_format {
+            let expect_ext = if is_audio_new { "mp3" } else { "mp4" };
+            let base = std::path::PathBuf::from(save_path.trim());
+            let eff = crate::state::save_dir_for(&base, &format!("[{id}].{expect_ext}"), true);
+            let mut stack = vec![eff.clone(), base.clone()];
+            let mut seen = std::collections::HashSet::new();
+            while let Some(dir) = stack.pop() {
+                if !seen.insert(dir.clone()) { continue; }
+                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                        continue;
+                    }
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                    if ext != expect_ext {
+                        continue;
+                    }
+                    if name.contains(&format!("[{id}]")) || name.contains(&id) {
+                        return Err(format!("EXISTS::{} (already on disk)", p.display()));
+                    }
+                }
+            }
+        }
+    }
+    }
     let settings = state::load_settings(&app);
     let task = ytdlp::start(
         app.clone(),
@@ -1073,6 +1230,9 @@ pub fn run() {
             update_tools,
             get_settings,
             save_settings,
+            delete_file_at,
+            ytdl_expected_path,
+            probe_download_info,
             choose_folder,
             choose_cookies_file,
             get_download_path,
