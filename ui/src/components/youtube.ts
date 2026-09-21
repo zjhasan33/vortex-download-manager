@@ -226,6 +226,7 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
             const isSubs = formatId.startsWith("subs:");
             close();
             openIntercept(urlInp.value.trim(), isSubs ? undefined : info?.title, undefined, undefined, {
+              thumbnail: info?.thumbnail,
               title: info?.title,
               size: fmt?.size || 0,
               category: "video",
@@ -255,6 +256,12 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
             subLangs,
             store.settings?.embed_thumbnail !== false,
             subAuto,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            info?.thumbnail,
           );
           const msg = formatId.startsWith("subs:")
             ? "Subtitle download started"

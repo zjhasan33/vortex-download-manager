@@ -126,6 +126,7 @@ export const api = {
     cookies?: string,
     startPaused?: boolean,
     allowDup?: boolean,
+    thumbnail?: string,
   ) =>
     cmd<Download>("start_ytdl", {
       url,
@@ -143,6 +144,7 @@ export const api = {
       cookies,
       startPaused,
       allow_dup: allowDup,
+      thumbnail,
     }),
 
   openFolder: (path: string) => cmd<void>("open_folder", { path }),

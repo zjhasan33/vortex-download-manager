@@ -242,6 +242,7 @@ async fn launch_yt_from_capture(
         settings.embed_thumbnail,
         false,
         ytdlp::StreamCtx::default(),
+        None,
     )
     .await
     .ok()?;
@@ -816,6 +817,7 @@ async fn start_ytdl(
     cookies: Option<String>,
     start_paused: Option<bool>,
     allow_dup: Option<bool>,
+    thumbnail: Option<String>,
 ) -> Result<download::DlView, String> {
     // Same video already in list → warn (covers 0% + youtu.be vs watch?v= ID variants).
     // In-flight guard: rapid double-click before the first task is visible in views().
@@ -916,6 +918,7 @@ async fn start_ytdl(
         embed_thumbnail.unwrap_or(settings.embed_thumbnail),
         auto_subs.unwrap_or(false),
         ytdlp::StreamCtx { referer, user_agent, cookies },
+        thumbnail,
     )
     .await?;
     let id = task.id.clone();

@@ -1041,6 +1041,7 @@ export interface DownloadInfoOpts {
   size?: number;
   category?: string;
   format?: string;
+  thumbnail?: string;
   /** Pre-selected destination folder (e.g. picked in the YouTube modal). */
   saveDir?: string;
   isYtdl?: boolean;
@@ -1055,6 +1056,7 @@ export interface DownloadInfoOpts {
     sub_langs?: string;
     embed_thumbnail?: boolean;
     auto_subs?: boolean;
+    thumbnail?: string;
   };
 }
 
@@ -1261,7 +1263,7 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
             dl = await api.startYtdl(
               url, y.format_id, savePath, y.playlist, y.playlist_items, undefined,
               y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs,
-              referer, undefined, cookies, later, ytdlAllowDup,
+              referer, undefined, cookies, later, ytdlAllowDup, o.thumbnail || y.thumbnail,
             );
           } catch (e: unknown) {
             const m = String(e).match(/^EXISTS::([\s\S]*)$/);
@@ -1272,7 +1274,7 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
                 try { await api.deleteFileAt(m[1].split(" (already")[0].trim()); } catch {}
               }
               try {
-                dl = await api.startYtdl(url, y.format_id, savePath, y.playlist, y.playlist_items, undefined, y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs, referer, undefined, cookies, later, choice === "rename");
+                dl = await api.startYtdl(url, y.format_id, savePath, y.playlist, y.playlist_items, undefined, y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs, referer, undefined, cookies, later, choice === "rename", o.thumbnail || y.thumbnail);
               } catch (e2: unknown) {
                 toast(String(e2), "err");
                 return;

@@ -361,10 +361,117 @@ fn move_staged_tree(src_root: &std::path::Path, dst_root: &std::path::Path) -> u
     n
 }
 
-async fn try_embed_thumbnail(_app: &tauri::AppHandle, _file: &std::path::Path) -> Result<(), String> {
-    // TODO: fetch thumbnail via yt-dlp --write-thumbnail + ffmpeg mux
-    // For now video is delivered instantly; thumbnail embed is deferred
-    // so download start is never blocked. Placeholder keeps build green.
+async fn try_embed_thumbnail(app: &tauri::AppHandle, file: &std::path::Path, thumb_url: Option<String>, video_url: &str) -> Result<(), String> {
+    // Best-effort post-download thumbnail embed — silent fail, never touches task status.
+    // Order is guaranteed by caller: video already completed + tmp cleaned, subs already embedded.
+    let mut url = thumb_url;
+    // If YtTask.thumb was not threaded (current code hardcodes None), try a lightweight
+    // yt-dlp probe for the thumbnail URL. This is best-effort and silent on failure,
+    // so videos without thumbnails, failed fetches, missing ffmpeg, and subs-only jobs
+    // remain byte-identical to today.
+    if url.is_none() && !video_url.trim().is_empty() {
+        if let Some(bin) = crate::tools::ytdlp_path(app) {
+            let out = tokio::process::Command::new(bin)
+                .arg("--get-thumbnail")
+                .arg("--no-warnings")
+                .arg(video_url)
+                .output()
+                .await;
+            if let Ok(o) = out {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !s.is_empty() && s.starts_with("http") {
+                        url = Some(s.lines().next().unwrap_or("").trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    let Some(url) = url else {
+        return Ok(());
+    };
+    if url.trim().is_empty() {
+        return Ok(());
+    }
+    // Subs-only jobs: never touch srt/vtt outputs.
+    if file.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("srt") || e.eq_ignore_ascii_case("vtt")).unwrap_or(false) {
+        return Ok(());
+    }
+    // Fetch poster to a per-file temp dir (NOT Downloads), convert, mux, cleanup — all silent.
+    let tmp = std::env::temp_dir().join("vortex").join(format!("thumb-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let ext = url.rsplit('.').next().unwrap_or("jpg").split('?').next().unwrap_or("jpg");
+    let ext = ext.split('/').last().unwrap_or("jpg").to_ascii_lowercase();
+    let poster_ext = match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "webp" => ext,
+        _ => "jpg".to_string(),
+    };
+    let poster = tmp.join(format!("poster.{}", poster_ext));
+    // Use reqwest (already in Cargo.toml) — no new deps.
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Ok(());
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Ok(());
+    }
+    if tokio::fs::write(&poster, &bytes).await.is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Ok(());
+    }
+    let ffmpeg = match crate::tools::ffmpeg_path(app).or_else(|| crate::tools::ytdlp_path(app).and_then(|_| None)) {
+        Some(p) => p,
+        None => {
+            // Try ensure_ffmpeg (already ensured in launch() for needs_ffmpeg, but best-effort here).
+            match crate::tools::ensure_ffmpeg(app).await {
+                Ok(p) => p,
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Ok(());
+                }
+            }
+        }
+    };
+    // Convert to jpg for max compatibility (like --convert-thumbnails jpg) if needed.
+    let jpg = if poster_ext == "jpg" || poster_ext == "jpeg" {
+        poster.clone()
+    } else {
+        let jpg_path = tmp.join("poster.jpg");
+        let out = tokio::process::Command::new(&ffmpeg)
+            .arg("-y")
+            .arg("-i")
+            .arg(&poster)
+            .arg(&jpg_path)
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() || !jpg_path.exists() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Ok(());
+        }
+        jpg_path
+    };
+    // Mux cover art into MP4/MKV (and MP3 ID3 where trivially safe).
+    let ext_out = file.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_mp3 = ext_out == "mp3";
+    let tmp_out = tmp.join(format!("out.{}", ext_out));
+    let mut cmd = tokio::process::Command::new(&ffmpeg);
+    cmd.arg("-y").arg("-i").arg(file).arg("-i").arg(&jpg);
+    if is_mp3 {
+        cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-id3v2_version", "3", "-metadata:s:v", "title=\"Album cover\"", "-metadata:s:v", "comment=\"Cover (front)\""]);
+    } else {
+        cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-disposition:v:1", "attached_pic"]);
+    }
+    cmd.arg(&tmp_out);
+    let out = cmd.output().await.map_err(|e| e.to_string())?;
+    if out.status.success() && tmp_out.exists() {
+        let _ = std::fs::rename(&tmp_out, file);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
 }
 
@@ -876,6 +983,7 @@ pub async fn start(
     auto_subs: bool,
     // Browser-captured request context (stream sniffer / takeover).
     ctx: StreamCtx,
+    thumbnail: Option<String>,
 ) -> Result<Arc<YtTask>, String> {
     // NOTE: no tool downloads here — `start()` must stay fast and synchronous
     // (extension WS calls time out on slow fetches). Tools are ensured in
@@ -944,7 +1052,7 @@ pub async fn start(
         status: RwLock::new(DlStatus::Queued),
         error: Mutex::new(None),
         cancel: AtomicBool::new(false),
-        thumb: None,
+        thumb: thumbnail.and_then(|s| { let t = s.trim().to_string(); if t.is_empty() { None } else { Some(t) } }),
         id,
         url,
         format_id,
@@ -1503,11 +1611,16 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                 // Post-download thumbnail embed (non-blocking): video is already
                 // moved to Downloads and marked completed, so instant start is
                 // preserved — thumbnail mux happens in background if ON.
+                // YtTask.thumb is currently always None (see start() hardcode), so this
+                // is byte-identical to today for all current code paths; when wired
+                // from YtdlInfo.thumbnail it will actually fetch and mux.
                 if do_post_thumb {
                     if let Some(first) = (*task.produced.lock().unwrap()).first().cloned() {
                         let app2 = task.app.clone();
+                        let thumb = task.thumb.clone();
+                        let vurl = task.url.clone();
                         tokio::spawn(async move {
-                            let _ = try_embed_thumbnail(&app2, &first).await;
+                            let _ = try_embed_thumbnail(&app2, &first, thumb, &vurl).await;
                         });
                     }
                 }

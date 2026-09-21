@@ -663,6 +663,7 @@ async fn start_ytdl(
         embed_thumb,
         auto_subs.unwrap_or(false),
         ctx,
+        None,
     )
     .await
     {
