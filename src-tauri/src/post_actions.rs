@@ -166,7 +166,7 @@ pub async fn convert_with(
     let ffmpeg_c = ffmpeg.clone();
     let fargs: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(ffmpeg_c);
+        let mut cmd = crate::tools::silent(Command::new(ffmpeg_c));
         cmd.args(["-y", "-i"]).arg(&src_c).args(&fargs).arg(&dst_c);
         let out = cmd.output().map_err(|e| e.to_string())?;
         if !out.status.success() {

@@ -629,7 +629,7 @@ pub fn open_in_folder(path: &str) {
         p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.to_path_buf())
     };
     thread::spawn(move || {
-        let _ = std::process::Command::new("explorer")
+        let _ = crate::tools::silent(std::process::Command::new("explorer"))
             .arg(dir.display().to_string())
             .spawn();
     });
@@ -679,12 +679,29 @@ pub fn save_dir_for(base: &PathBuf, name: &str, categorize: bool) -> PathBuf {
 // ---------------- OS notifications ----------------
 
 pub fn notify_done(app: &AppHandle, title: &str, body: &str) {
-    let _ = app
-        .notification()
-        .builder()
-        .title(title.to_string())
-        .body(body.to_string())
-        .show();
+    let _ = app;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let script = format!(
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; \
+             $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+             $textNodes = $template.GetElementsByTagName('text'); \
+             $textNodes.Item(0).AppendChild($template.CreateTextNode('{}')) > $null; \
+             $textNodes.Item(1).AppendChild($template.CreateTextNode('{}')) > $null; \
+             $toast = [Windows.UI.Notifications.ToastNotification]::new($template); \
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Vortex').Show($toast);",
+            title.replace('\'', "''"),
+            body.replace('\'', "''")
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
+        cmd.creation_flags(0x08000000);
+        let _ = cmd.spawn();
+        return;
+    }
+    #[allow(unreachable_code)]
+    let _ = app.notification().builder().title(title.to_string()).body(body.to_string()).show();
 }
 
 // ---------------- Session persistence ----------------

@@ -1225,7 +1225,7 @@ fn claim_chunk(task: &Task) -> Option<(usize, Segment)> {
 
 /// Minimum remaining bytes on a victim chunk worth splitting (each half stays
 /// >= 1 MB so the extra connection + part file actually pay off).
-const MIN_SPLIT_REMAINING: u64 = 2 * 1024 * 1024;
+const MIN_SPLIT_REMAINING: u64 = 8 * 1024 * 1024; // (8MB prevents high-latency request loops!)
 
 /// Pure cut-point math for a straggler split: victim `[vstart..=vend]` has
 /// `written` bytes on disk. Returns the last byte the victim keeps; the
@@ -1605,6 +1605,7 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
 
         let mut stream = resp.bytes_stream();
         let mut dropped = false;
+        let mut since_check: u64 = 0;
         loop {
             // Stall guard: a half-dead connection that delivers zero bytes for
             // STALL_TIMEOUT gets dropped and reconnected from the cursor.
@@ -1637,11 +1638,12 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
                         break;
                     }
 
-                    // Straggler split: an idle worker cut this chunk at `cut`
-                    // and took the tail. Stop here, drop the bytes past the
-                    // cut (re-downloaded by the stealer) and finish early so
-                    // the tail no longer blocks completion.
-                    let cut = task.split_at.lock().unwrap().get(idx).copied().unwrap_or(u64::MAX);
+                    // Straggler split: throttle to every ~512KB to eliminate
+                    // lock contention across 16 threads (was every 16KB).
+                    since_check += c.len() as u64;
+                    if since_check >= 512 * 1024 {
+                        since_check = 0;
+                        let cut = task.split_at.lock().unwrap().get(idx).copied().unwrap_or(u64::MAX);
                     if cut != u64::MAX && cut >= seg.start && cursor >= cut.saturating_add(1) {
                         let want = cut - seg.start + 1;
                         let _ = file.flush().await;
@@ -1678,8 +1680,8 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
                         // partial bytes and fail softly; the next round resumes
                         // from `have` and stops at the cut.
                         return false;
+                        }
                     }
-
                     if per_conn > 0 {
                         throttle_bytes += c.len() as u64;
                         let since = last_throttle.elapsed().as_secs_f64();

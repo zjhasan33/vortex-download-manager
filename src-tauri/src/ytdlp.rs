@@ -371,18 +371,22 @@ async fn try_embed_thumbnail(app: &tauri::AppHandle, file: &std::path::Path, thu
     // remain byte-identical to today.
     if url.is_none() && !video_url.trim().is_empty() {
         if let Some(bin) = crate::tools::ytdlp_path(app) {
-            let out = tokio::process::Command::new(bin)
-                .arg("--get-thumbnail")
-                .arg("--no-warnings")
-                .arg(video_url)
-                .output()
-                .await;
-            if let Ok(o) = out {
-                if o.status.success() {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if !s.is_empty() && s.starts_with("http") {
-                        url = Some(s.lines().next().unwrap_or("").trim().to_string());
-                    }
+            let bin_c = bin.clone();
+            let vurl = video_url.to_string();
+            let out = tokio::task::spawn_blocking(move || {
+                crate::tools::silent(std::process::Command::new(bin_c))
+                    .arg("--get-thumbnail")
+                    .arg("--no-warnings")
+                    .arg(&vurl)
+                    .output()
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() && s.starts_with("http") {
+                    url = Some(s.lines().next().unwrap_or("").trim().to_string());
                 }
             }
         }
@@ -441,14 +445,20 @@ async fn try_embed_thumbnail(app: &tauri::AppHandle, file: &std::path::Path, thu
         poster.clone()
     } else {
         let jpg_path = tmp.join("poster.jpg");
-        let out = tokio::process::Command::new(&ffmpeg)
-            .arg("-y")
-            .arg("-i")
-            .arg(&poster)
-            .arg(&jpg_path)
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
+        let poster_c = poster.clone();
+        let ffmpeg_c = ffmpeg.clone();
+        let jpg_path_c = jpg_path.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            crate::tools::silent(std::process::Command::new(ffmpeg_c))
+                .arg("-y")
+                .arg("-i")
+                .arg(&poster_c)
+                .arg(&jpg_path_c)
+                .output()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
         if !out.status.success() || !jpg_path.exists() {
             let _ = std::fs::remove_dir_all(&tmp);
             return Ok(());
@@ -459,15 +469,24 @@ async fn try_embed_thumbnail(app: &tauri::AppHandle, file: &std::path::Path, thu
     let ext_out = file.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let is_mp3 = ext_out == "mp3";
     let tmp_out = tmp.join(format!("out.{}", ext_out));
-    let mut cmd = tokio::process::Command::new(&ffmpeg);
-    cmd.arg("-y").arg("-i").arg(file).arg("-i").arg(&jpg);
-    if is_mp3 {
-        cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-id3v2_version", "3", "-metadata:s:v", "title=\"Album cover\"", "-metadata:s:v", "comment=\"Cover (front)\""]);
-    } else {
-        cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-disposition:v:1", "attached_pic"]);
-    }
-    cmd.arg(&tmp_out);
-    let out = cmd.output().await.map_err(|e| e.to_string())?;
+    let file_c = file.to_path_buf();
+    let jpg_c = jpg.clone();
+    let ffmpeg_c = ffmpeg.clone();
+    let tmp_out_c = tmp_out.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = crate::tools::silent(std::process::Command::new(ffmpeg_c));
+        cmd.arg("-y").arg("-i").arg(&file_c).arg("-i").arg(&jpg_c);
+        if is_mp3 {
+            cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-id3v2_version", "3", "-metadata:s:v", "title=\"Album cover\"", "-metadata:s:v", "comment=\"Cover (front)\""]);
+        } else {
+            cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-disposition:v:1", "attached_pic"]);
+        }
+        cmd.arg(&tmp_out_c);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     if out.status.success() && tmp_out.exists() {
         let _ = std::fs::rename(&tmp_out, file);
     }
