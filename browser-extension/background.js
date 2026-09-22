@@ -198,6 +198,10 @@ async function connectAsync() {
     } catch (e) { /* ignore */ }
   };
   const fail = () => {
+    // Only the latest socket may reset bridge state: on a force-reconnect the
+    // old socket's close event fires after the new one was assigned, so letting
+    // it clear ws/wsReady would stomp the fresh connection's flags.
+    if (ws !== sock) return;
     online = false;
     ws = null;
     wsReady = null;
@@ -229,6 +233,21 @@ function launchVortex(cmd, params) {
   // cmd: "capture"; params: object of url/filename[... ] -> percent-encoded query
   const q = new URLSearchParams(params).toString();
   return browser.tabs.create({ url: "vortex://" + cmd + (q ? "?" + q : ""), active: false }).then(() => true);
+}
+
+// Force-drop the current socket and reconnect with the (possibly new) pairing
+// key from storage. Used when the popup saves a key. The old socket's close
+// event is a no-op thanks to the `ws !== sock` guard in fail().
+function forceReconnect() {
+  if (!ws) return connect().catch(() => null);
+  const old = ws;
+  ws = null;
+  wsReady = null;
+  online = false;
+  try {
+    old.close();
+  } catch (e) { /* already closed */ }
+  return connect().catch(() => null);
 }
 
 // ---------------- media / filename helpers ----------------
@@ -276,8 +295,15 @@ function addCapture(cap) {
     }
     browser.storage.local.set({ [CAPTURES_KEY]: list });
     const last = list[0];
-    browser.runtime.sendMessage({ type: "file_captured", capture: last }).catch(() => {});
     lastHud = last;
+    // Toast ONLY in the tab that initiated the download — broadcasting to every
+    // open tab would show capture toasts on unrelated pages.
+    if (cap.tabId > 0) {
+      browser.tabs.sendMessage(cap.tabId, { type: "file_captured", capture: last })
+        .catch(() => { browser.runtime.sendMessage({ type: "file_captured", capture: last }).catch(() => {}); });
+    } else {
+      browser.runtime.sendMessage({ type: "file_captured", capture: last }).catch(() => {});
+    }
   });
 }
 let lastHud = null;
@@ -416,7 +442,7 @@ browser.webRequest.onHeadersReceived.addListener(
     }
   },
   { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "other", "xmlhttprequest", "object"] },
-  ["responseHeaders"]
+  ["responseHeaders", "extraHeaders"]
 );
 
 setInterval(() => {
@@ -465,20 +491,21 @@ async function takeOverDownload(item) {
   const filename = item.filename ? item.filename.split(/[\\/]/).pop() : undefined;
   const referrer = item.referrer || "";
   const cookies = await cookieHeaderFor([url, referrer]);
-  // Cancel + erase the native browser download first so the page sees the
-  // browser didn't save it — Vortex becomes the handler (IDM-style).
+  // Ask Vortex to take over (Start / Download Later / Cancel dialog) BEFORE
+  // touching the native download. If the desktop bridge is offline or rejects,
+  // leave the browser download alone so the file still saves normally.
+  if (!online) return; // let the browser download proceed normally
+  let acked = false;
+  try {
+    await rpc("intercept", { url, filename: filename || undefined, referer: referrer || undefined, cookies: cookies || undefined });
+    acked = true;
+  } catch (e) { /* bridge failed — fall through without ack */ }
+  if (!acked) return; // let the browser download proceed normally
+  // Only now that Vortex confirmed receipt: cancel + erase the native browser
+  // download so the page sees the browser didn't save it (IDM-style).
   try { await browser.downloads.cancel(item.id); } catch (e) {}
   try { await browser.downloads.erase({ id: item.id }); } catch (e) {}
   try { await browser.downloads.removeFile(item.id); } catch (e) {}
-  // IDM-style: show Start / Download Later / Cancel in Vortex — then Vortex
-  // decides (direct start, queued paused, or cancel).
-  if (online) {
-    try {
-      await rpc("intercept", { url, filename: filename || undefined, referer: referrer || undefined, cookies: cookies || undefined });
-      return;
-    } catch (e) { /* fall through to direct */ }
-  }
-  await handleStart({ type: "direct", url, filename, pageUrl: referrer, referer: referrer || undefined, cookies });
 }
 
 if (browser.downloads) {
@@ -564,7 +591,118 @@ function collectPageLinks() {
   return out;
 }
 
-async function handleGrabAll(tab) {
+  // ---- IDM-style 0ms Formats: read the page's OWN player response ----
+  // This function is serialized and executed inside the page (world: "MAIN"),
+  // where window.ytInitialPlayerResponse / ytplayer.config are visible —
+  // isolated content scripts can't see them, and YouTube's CSP blocks
+  // DOM-injected <script>, so MAIN-world scripting is the only clean route.
+  // Must be fully self-contained (no outer references survive serialization).
+  function extractYtInPage() {
+    function parseBalanced(src, start) {
+      let depth = 0, inStr = false, esc = false;
+      for (let i = start; i < src.length; i++) {
+        const c = src[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (c === "\\") esc = true;
+          else if (c === '"') inStr = false;
+        } else if (c === '"') inStr = true;
+        else if (c === "{") depth++;
+        else if (c === "}") {
+          depth--;
+          if (depth === 0) return src.slice(start, i + 1);
+        }
+      }
+      return null;
+    }
+    try {
+      let pr = window.ytInitialPlayerResponse;
+      if (!pr || !pr.streamingData) {
+        try {
+          const args = window.ytplayer && window.ytplayer.config && window.ytplayer.config.args;
+          if (args && args.player_response) pr = JSON.parse(args.player_response);
+        } catch (e) { /* fall through to script scan */ }
+      }
+      if (!pr || !pr.streamingData) {
+        const tags = document.getElementsByTagName("script");
+        for (let i = 0; i < tags.length; i++) {
+          const t = tags[i].textContent || "";
+          let idx = t.indexOf("ytInitialPlayerResponse");
+          while (idx !== -1) {
+            const eq = t.indexOf("=", idx);
+            if (eq !== -1) {
+              let s = eq + 1;
+              while (s < t.length && (t[s] === " " || t[s] === "\n" || t[s] === "\r" || t[s] === "\t")) s++;
+              if (t[s] === "{") {
+                const js = parseBalanced(t, s);
+                if (js) {
+                  try {
+                    const o = JSON.parse(js);
+                    if (o && o.streamingData) { pr = o; break; }
+                  } catch (e) { /* not this occurrence */ }
+                }
+              }
+            }
+            idx = t.indexOf("ytInitialPlayerResponse", idx + 1);
+          }
+          if (pr && pr.streamingData) break;
+        }
+      }
+      if (!pr || !pr.streamingData) return { ok: false, error: "no player response" };
+      const sd = pr.streamingData;
+      const all = (sd.formats || []).concat(sd.adaptiveFormats || []);
+      const heights = [];
+      const seen = {};
+      const sizes = {};
+      let hasAudio = false;
+      for (let i = 0; i < all.length; i++) {
+        const f = all[i];
+        if (!f) continue;
+        const acodec = f.acodec || "";
+        const vcodec = f.vcodec || "";
+        if (acodec && acodec !== "none") hasAudio = true;
+        if (f.height && !seen[f.height]) {
+          seen[f.height] = true;
+          heights.push(f.height);
+          const cl = parseInt(f.contentLength, 10);
+          if (cl > 0) sizes[f.height] = cl;
+        } else if (f.height && f.contentLength) {
+          const cl = parseInt(f.contentLength, 10);
+          if (cl > (sizes[f.height] || 0)) sizes[f.height] = cl;
+        }
+        void vcodec;
+      }
+      heights.sort(function (a, b) { return b - a; });
+      const captions = [];
+      const tracks = (pr.captions &&
+        pr.captions.playerCaptionsTracklistRenderer &&
+        pr.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+      for (let i = 0; i < tracks.length; i++) {
+        const c = tracks[i];
+        if (!c || !c.languageCode) continue;
+        let label = "";
+        if (typeof c.name === "string") label = c.name;
+        else if (c.name && c.name.simpleText) label = c.name.simpleText;
+        else if (c.name && c.name.runs && c.name.runs.length) {
+          label = c.name.runs.map(function (r) { return r.text || ""; }).join("");
+        }
+        const auto = c.kind === "asr" || !!(c.vssId && c.vssId.indexOf("a.") === 0);
+        captions.push({ lang: c.languageCode, label: label || c.languageCode, auto: auto });
+      }
+      return {
+        ok: true,
+        heights: heights,
+        sizes: sizes,
+        hasAudio: hasAudio,
+        captions: captions,
+        videoId: (pr.videoDetails && pr.videoDetails.videoId) || "",
+      };
+    } catch (e) {
+      return { ok: false, error: (e && e.message) || String(e) };
+    }
+  }
+
+  async function handleGrabAll(tab) {
   let links = [];
   try {
     const res = await browser.scripting.executeScript({
@@ -736,12 +874,53 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "analyze") {
-    return safeRespond(sendResponse, () => handleAnalyze(msg.url, sender.tab), 30000);
+    // yt-dlp info probing can take 20-60s on slow/long pages — use a generous
+    // RPC timeout so pre-fetched dropdowns never die with a premature timeout.
+    return safeRespond(sendResponse, () => handleAnalyze(msg.url, sender.tab), 60000);
+  }
+
+  // Instant (0ms) Formats/Subs: execute the extractor INSIDE the page
+  // (world: "MAIN") so window.ytInitialPlayerResponse is directly readable.
+  if (msg.type === "sniff_yt") {
+    const tabId = (tab && tab.id) || msg.tabId;
+    if (!tabId) {
+      sendResponse({ ok: false, error: "no tab for sniff" });
+      return;
+    }
+    return safeRespond(sendResponse, async () => {
+      try {
+        const results = await browser.scripting.executeScript({
+          target: { tabId },
+          world: "MAIN",
+          func: extractYtInPage,
+        });
+        const out = results && results[0] && results[0].result;
+        return out || { ok: false, error: "no in-page result" };
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) };
+      }
+    }, 8000);
   }
 
   if (msg.type === "start_ytdl") {
     if (online) {
       return safeRespond(sendResponse, async () => {
+        // Standalone subtitle downloads (subs:<fmt>:<lang>) ALWAYS go direct —
+        // the intercept dialog's desktop path can't carry the auto_subs flag,
+        // and subtitle-only files need no quality dialog anyway. The
+        // video-download rule is untouched: only official tracks are ever
+        // embedded into the MP4 (auto captions are never sent with format_id).
+        if (msg.format_id && msg.format_id.trim().startsWith("subs:")) {
+          const payload = {
+            url: msg.url, format_id: msg.format_id,
+            embed_subs: false,
+            referer: msg.referer || pageUrl || undefined,
+            cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
+            user_agent: msg.userAgent || EXT_UA,
+          };
+          if (msg.auto_subs === true) payload.auto_subs = true;
+          return rpc("start_ytdl", payload);
+        }
         // IDM-style: YouTube hover bar goes through the intercept dialog
         // (Start / Download Later / Cancel) instead of auto-starting.
         try {
@@ -760,6 +939,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
             user_agent: msg.userAgent || EXT_UA,
           };
+          if (msg.auto_subs === true) payload.auto_subs = true;
           return rpc("start_ytdl", payload);
         }
       });
@@ -800,6 +980,12 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await browser.storage.local.set({ [CAPTURES_KEY]: [] });
       return { ok: true };
     });
+  }
+
+  if (msg.type === "force_reconnect") {
+    forceReconnect();
+    sendResponse({ ok: true });
+    return;
   }
 
   // Unknown message type — never leave the caller hanging.

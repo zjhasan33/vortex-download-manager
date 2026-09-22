@@ -202,6 +202,7 @@
       }
     }
     bindBarVideos();
+    maybePrefetchFormats();
   }
 
   function refreshUI() {
@@ -216,6 +217,128 @@
       (res) => res || {},
       (e) => ({ error: (e && e.message) || String(e) })
     );
+  }
+
+  // ---- In-memory format pre-fetch cache (instant IDM-style ▾ Formats) ----
+  // Vortex Companion plans ahead: while a video plays, the format ladder is
+  // silently fetched once and held in memory. Clicking ▾ Formats then renders
+  // the dropdown instantly (0 ms) instead of waiting on the background round
+  // trip. Never cached for long; keyed by the cleaned URL.
+  const cachedFormatsMap = new Map(); // cleanUrl -> { res, at }
+  const fetchingFormats = new Map(); // cleanUrl -> Promise<res>
+  const FORMAT_CACHE_MS = 8 * 60 * 1000; // 8 minutes
+  function cleanUrlOf(url) {
+    try {
+      const u = new URL(url);
+      u.hash = "";
+      return u.href;
+    } catch (e) {
+      return url;
+    }
+  }
+  function cachedFormatsRes(url) {
+    const e = cachedFormatsMap.get(cleanUrlOf(url));
+    if (e && Date.now() - e.at < FORMAT_CACHE_MS) return e.res;
+    return null;
+  }
+  // Dedupe concurrent analyses: returns the SAME promise while one is in flight.
+  function ensureFormats(url) {
+    const key = cleanUrlOf(url);
+    const cached = cachedFormatsRes(url);
+    if (cached) return Promise.resolve(cached);
+    if (fetchingFormats.has(key)) return fetchingFormats.get(key);
+    const p = send({ type: "analyze", url })
+      .then((res) => {
+        cachedFormatsMap.set(key, { res, at: Date.now() });
+        if (cachedFormatsMap.size > 25) {
+          const oldest = cachedFormatsMap.keys().next().value;
+          cachedFormatsMap.delete(oldest);
+        }
+        return res;
+      })
+      .catch((e) => ({ error: (e && e.message) || String(e) }))
+      .finally(() => fetchingFormats.delete(key));
+    fetchingFormats.set(key, p);
+    return p;
+  }
+  // Silent background pre-fetch — fire & forget, never user-blocking.
+  function prefetchFormats(url) {
+    void ensureFormats(url);
+  }
+  function maybePrefetchFormats() {
+    try {
+      const freshStream = pendingStream && streamFresh(pendingStream);
+      // Only the surfaces that actually expose a ▾ Formats menu are worth
+      // pre-fetching for: media sites and sniffed HLS/DASH streams.
+      if (!mediaSite() && !freshStream) return;
+      const u = freshStream ? pendingStream.url : getCurrentUrl();
+      // Pre-sniff the page's own manifest while the video plays → the very first
+      // ▾ Formats / ▾ Subs click is then truly 0ms (no round-trip at all).
+      // Only meaningful for page-level media (YouTube): stream URLs belong to an
+      // external manifest, not the page. If the analyze ladder is ALSO cached
+      // below, the first ▾ Formats click is still 0ms, so skipping is fine.
+      if (mediaSite() && !freshStream && !inPageRes(u)) void sniffInPage(u);
+      if (cachedFormatsRes(u)) return;
+      // Only bother when a video is actually playing (not on the thumbnail grid).
+      const playing = [...deepVideos()].some(
+        (el) => el && !el.paused && (el.readyState >= 2 || el.currentTime > 0)
+      );
+      if (!playing) return;
+      prefetchFormats(u);
+    } catch (e) { /* never let the prefetch break detection */ }
+  }
+
+  // ---- IDM-style in-page sniffing: instant (0ms) ▾ Formats / ▾ Subs ----
+  // YouTube parks the full quality manifest + caption list in the page's own
+  // memory (window.ytInitialPlayerResponse). We read it via a MAIN-world
+  // scripting.injection (bypasses the page CSP, unlike an injected <script>),
+  // cache it keyed by URL, and render the dropdown from it INSTANTLY — no
+  // background analyze round-trip, no spinner, exactly like IDM's 0ms feel.
+  const inPageFormatsMap = new Map(); // cleanUrl -> { heights, hasAudio, captions, at }
+  let sniffInFlight = null;
+  function inPageRes(url) {
+    const e = inPageFormatsMap.get(cleanUrlOf(url));
+    if (e && Date.now() - e.at < FORMAT_CACHE_MS) return e.data;
+    return null;
+  }
+  // MAIN-world read via background (isolated content scripts can't see the
+  // page's globals). Deduped so concurrent ▾ Formats + ▾ Subs share one call.
+  // Guards against SPA staleness: a sniffed ladder is only cached for the URL
+  // whose videoId it actually belongs to (watch/shorts URLs carry ?v= / /shorts/).
+  function videoIdOf(url) {
+    if (!url) return "";
+    try {
+      const u = new URL(url, location.href);
+      const v = u.searchParams.get("v");
+      if (v) return v;
+      const m = u.pathname.match(/^\/(?:shorts|embed|live)\/([\w-]+)/);
+      return m ? m[1] : "";
+    } catch (e) { return ""; }
+  }
+  function sniffInPage(url) {
+    const key = cleanUrlOf(url);
+    if (sniffInFlight) return sniffInFlight;
+    sniffInFlight = send({ type: "sniff_yt" })
+      .then((res) => {
+        sniffInFlight = null;
+        if (res && res.ok) {
+          // Only cache when the sniffed manifest belongs to the requested
+          // video (SPA navigation can leave a stale ytInitialPlayerResponse).
+          const want = videoIdOf(url);
+          if (!want || res.videoId === want) {
+            inPageFormatsMap.set(key, { data: res, at: Date.now() });
+            if (inPageFormatsMap.size > 20) {
+              const oldest = inPageFormatsMap.keys().next().value;
+              inPageFormatsMap.delete(oldest);
+            }
+            return res;
+          }
+          return null;
+        }
+        return null;
+      })
+      .catch(() => { sniffInFlight = null; return null; });
+    return sniffInFlight;
   }
 
   // ---------------- UI ----------------
@@ -278,7 +401,7 @@
         fetchBusy = true;
         fetchBtn.innerHTML = '<span class="vx-spin"></span> Fetching formats…';
         const url = getCurrentUrl();
-        const res = await send({ type: "analyze", url });
+        const res = await ensureFormats(url);
         fetchBusy = false;
         if (res && res.info && (res.info.formats || []).length) {
           const list = res.info.formats;
@@ -289,13 +412,17 @@
               '<span class="vx-fn">' + (f.size ? " • " + fmtBytes(f.size) : "") + "</span></span>" +
               '<button class="vx-btn vx-slim" data-fid="' + esc(f.id) + '">Download</button></div>';
           }
-          const subs = (res.info.subtitles || []).filter((s) => !s.auto).slice(0, 15);
+          // Rule B: standalone rows list every subtitle track — auto captions too.
+          const subsAll = res.info.subtitles || [];
+          const subs = subsAll.filter((s) => !s.auto).concat(subsAll.filter((s) => s.auto)).slice(0, 15);
           if (subs.length) {
             html2 += '<div class="vx-empty" style="text-align:left;padding:8px 2px 4px">Subtitles / Captions</div>';
             for (const s of subs) {
+              let label = s.label || s.lang;
+              if (s.auto && !/\(auto\)/i.test(label)) label += " (auto)";
               html2 +=
-                '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label) +
-                "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>SRT</button></div>";
+                '<div class="vx-fmt"><span class="vx-fq">' + esc(label) +
+                "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "' data-auto='" + (s.auto ? "1" : "") + "'>SRT</button></div>";
             }
           }
           body.innerHTML = html2;
@@ -310,22 +437,26 @@
             btn.addEventListener("click", () => {
               btn.textContent = "Added ✓";
               btn.disabled = true;
-              void send({ type: "start_ytdl", url, format_id: "subs:srt:" + btn.dataset.sub });
+              void send({ type: "start_ytdl", url, format_id: "subs:srt:" + btn.dataset.sub, auto_subs: btn.dataset.auto === "1" });
             });
           });
-        } else if (res && res.info && (res.info.subtitles || []).some((s) => !s.auto)) {
+        } else if (res && res.info && res.info.subtitles && res.info.subtitles.length) {
           let html2 = "";
-          for (const s of res.info.subtitles.filter((s) => !s.auto).slice(0, 15)) {
+          const subsAll = res.info.subtitles;
+          const subs = subsAll.filter((s) => !s.auto).concat(subsAll.filter((s) => s.auto)).slice(0, 15);
+          for (const s of subs) {
+            let label = s.label || s.lang;
+            if (s.auto && !/\(auto\)/i.test(label)) label += " (auto)";
             html2 +=
-              '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label) +
-              "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>SRT</button></div>";
+              '<div class="vx-fmt"><span class="vx-fq">' + esc(label) +
+              "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "' data-auto='" + (s.auto ? "1" : "") + "'>SRT</button></div>";
           }
           body.innerHTML = html2;
           body.querySelectorAll("[data-sub]").forEach((btn) => {
             btn.addEventListener("click", () => {
               btn.textContent = "Added ✓";
               btn.disabled = true;
-              void send({ type: "start_ytdl", url, format_id: "subs:srt:" + btn.dataset.sub });
+              void send({ type: "start_ytdl", url, format_id: "subs:srt:" + btn.dataset.sub, auto_subs: btn.dataset.auto === "1" });
             });
           });
         } else {
@@ -462,6 +593,10 @@
   }
 
   function barForMediaSite() {
+    // Warm the 0ms in-page ladder at hover time even if the video is paused
+    // (maybePrefetchFormats only pre-sniffs while playing).
+    const cu = getCurrentUrl();
+    if (!inPageRes(cu)) void sniffInPage(cu);
     hbar.innerHTML = '<span class="vx-hb-grip" title="Drag to move">⋮⋮</span><span class="vx-logo"></span><span class="vx-hb-label">Download:</span>';
     hbar.appendChild(makeHbarBtn("MP4 Best", () => hbarStart("bestvideo+bestaudio/best", "MP4 Best")));
     hbar.appendChild(makeHbarBtn("720p", () => hbarStart("bestvideo[height<=720]+bestaudio/best[height<=720]", "720p")));
@@ -605,7 +740,7 @@
         btn.disabled = false;
       }, 2500);
     };
-    const res = await send({ type: "analyze", url: stream.url });
+    const res = await ensureFormats(stream.url);
     const f = res && res.info && res.info.formats && res.info.formats.find((x) => x.has_video && x.has_audio);
     if (f) {
       const r2 = await send({ type: "start_ytdl", url: stream.url, format_id: f.id });
@@ -642,16 +777,109 @@
   async function hbarFormats(urlOverride) {
     fmtsOpen = true;
     hbarFmts.classList.remove("vx-hide");
-    hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching formats…</div>';
-    placeFmtsBelow();
     const u = urlOverride || getCurrentUrl();
-    const res = await send({ type: "analyze", url: u });
-    const subs = (res && res.info && res.info.subtitles || []).filter((s) => !s.auto).slice(0, 15);
-    if (!res || !res.info || !(res.info.formats || []).length) {
-      if (!subs.length) {
-        hbarFmts.innerHTML = '<div class="vx-empty">Error: ' + esc((res && res.error) || "no formats") + "</div>";
+    // INSTANT (0ms): the page's OWN player response was sniffed at hover time —
+    // quality ladder + captions render straight from in-page memory, no
+    // buffer, no round-trip, exactly like IDM.
+    const inPage = inPageRes(u);
+    if (inPage && (inPage.heights || []).length) {
+      renderInPageLadder(inPage, u);
+      return;
+    }
+    // Still resolving the sniff, or the page isn't usable yet: sleek spinner
+    // while we wait — NEVER a hard timeout/error on the user. Stream (overridden)
+    // URLs can't be sniffed from the page, so skip straight to the analyze path.
+    if (!urlOverride) {
+      hbarFmts.innerHTML = '<div class="vx-loading">Loading formats...</div>';
+      placeFmtsBelow();
+      const sniffed = await sniffInPage(u);
+      if (sniffed && (sniffed.heights || []).length) {
+        renderInPageLadder(sniffed, u);
         return;
       }
+    }
+    // Cached analyze ladder was pre-fetched while the video played.
+    const cached = cachedFormatsRes(u);
+    if (cached) {
+      renderFmtsInto(cached, u);
+      placeFmtsBelow();
+      return;
+    }
+    // Colder path: show the inline spinner and await the SAME in-flight promise
+    // if a prefetch is running (never duplicate the analyze, never hard-fail).
+    hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching formats…</div>';
+    placeFmtsBelow();
+    const res = await ensureFormats(u);
+    renderFmtsInto(res, u);
+    placeFmtsBelow();
+  }
+
+  // IDM-style 0ms ladder rendered purely from the page's in-page player
+  // response (heights + audio + captions), with yt-dlp selectors as format_id.
+  const YT_Q_LABELS = { 4320: "8K", 2160: "2160p 4K", 1440: "1440p 2K", 1080: "1080p Full HD", 720: "720p HD", 480: "480p", 360: "360p", 240: "240p", 144: "144p" };
+  function renderInPageLadder(res, u) {
+    let html = "";
+    const heights = (res.heights || []).slice().sort((a, b) => b - a);
+    for (const h of heights) {
+      const label = YT_Q_LABELS[h] || h + "p";
+      const fid = "bestvideo[height<=" + h + "]+bestaudio/best";
+      const size = res.sizes && res.sizes[h] ? " • " + fmtBytes(res.sizes[h]) : "";
+      html +=
+        '<div class="vx-fmt"><span class="vx-fq">' + esc(label) + (size ? '<span class="vx-fn">' + size + "</span>" : "") +
+        "</span>" +
+        '<button class="vx-btn vx-slim" data-fid="' + esc(fid) + '">Download</button></div>';
+    }
+    if (res.hasAudio && !heights.length) {
+      html +=
+        '<div class="vx-fmt"><span class="vx-fq">MP3 Audio' +
+        "</span><button class='vx-btn vx-slim' data-fid='ba-mp3-320'>Download</button></div>";
+    }
+    const caps = (res.captions || []).slice(0, 20);
+    if (caps.length) {
+      html += '<div class="vx-empty" style="text-align:left;padding:8px 2px 4px">Subtitles / Captions</div>';
+      for (const s of caps) {
+        let label = s.label || s.lang;
+        if (s.auto && !/\(auto\)/i.test(label)) label += " (auto)";
+        html +=
+          '<div class="vx-fmt"><span class="vx-fq">' + esc(label) +
+          "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "' data-auto='" + (s.auto ? "1" : "") + "'>SRT</button></div>";
+      }
+    }
+    if (!html) {
+      hbarFmts.innerHTML = '<div class="vx-loading">Loading formats...</div>';
+      placeFmtsBelow();
+      return;
+    }
+    hbarFmts.innerHTML = html;
+    hbarFmts.querySelectorAll("[data-fid]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        btn.textContent = "Added ✓";
+        btn.disabled = true;
+        void send({ type: "start_ytdl", url: u, format_id: btn.dataset.fid });
+      });
+    });
+    hbarFmts.querySelectorAll("[data-sub]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        btn.textContent = "Added ✓";
+        btn.disabled = true;
+        void send({ type: "start_ytdl", url: u, format_id: "subs:srt:" + btn.dataset.sub, auto_subs: btn.dataset.auto === "1" });
+      });
+    });
+    placeFmtsBelow();
+  }
+
+  function renderFmtsInto(res, u) {
+    if (!res || !res.info) {
+      hbarFmts.innerHTML = '<div class="vx-empty">Error: ' + esc((res && res.error) || "no formats") + "</div>";
+      return;
+    }
+    const subs = res.info.subtitles || [];
+    // Golden Rule B: standalone subtitle rows list EVERY track — official and
+    // auto-generated alike (labeled "(auto)"). Never hide machine captions.
+    const avSubs = subs.slice(0, 15);
+    if (!(res.info.formats || []).length && !avSubs.length) {
+      hbarFmts.innerHTML = '<div class="vx-empty">Error: ' + esc(res.error || "no formats") + "</div>";
+      return;
     }
     let html = "";
     for (const f of res.info.formats || []) {
@@ -660,12 +888,14 @@
         '<span class="vx-fn">' + (f.size ? " • " + fmtBytes(f.size) : "") + "</span></span>" +
         '<button class="vx-btn vx-slim" data-fid="' + esc(f.id) + '">Download</button></div>';
     }
-    if (subs.length) {
+    if (avSubs.length) {
       html += '<div class="vx-empty" style="text-align:left;padding:8px 2px 4px">Subtitles / Captions</div>';
-      for (const s of subs) {
+      for (const s of avSubs) {
+        let label = s.label || s.lang;
+        if (s.auto && !/\(auto\)/i.test(label)) label += " (auto)";
         html +=
-          '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label) +
-          "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>SRT</button></div>";
+          '<div class="vx-fmt"><span class="vx-fq">' + esc(label) +
+          "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "' data-auto='" + (s.auto ? "1" : "") + "'>SRT</button></div>";
       }
     }
     hbarFmts.innerHTML = html;
@@ -680,25 +910,59 @@
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url: u, format_id: "subs:srt:" + btn.dataset.sub });
+        void send({ type: "start_ytdl", url: u, format_id: "subs:srt:" + btn.dataset.sub, auto_subs: btn.dataset.auto === "1" });
       });
     });
-    placeFmtsBelow();
   }
 
-  // Dedicated "▾ Subs" dropdown: list official subtitle languages + choose SRT/VTT.
+  // Dedicated "▾ Subs" dropdown: list ALL subtitle languages (official + auto,
+  // auto labeled "(auto)") + choose SRT/VTT. Standalone download is available
+  // for every track — machine captions included (Golden Rule B).
   async function hbarSubs(urlOverride) {
     fmtsOpen = true;
     hbarFmts.classList.remove("vx-hide");
+    const u = urlOverride || getCurrentUrl();
+    // INSTANT (0ms): caption tracks from the page's own player response.
+    const inPage = inPageRes(u);
+    if (inPage && (inPage.captions || []).length) {
+      renderSubs(inPage.captions, u);
+      return;
+    }
+    if (!urlOverride) {
+      hbarFmts.innerHTML = '<div class="vx-loading">Loading subtitles...</div>';
+      placeFmtsBelow();
+      const sniffed = await sniffInPage(u);
+      if (sniffed && (sniffed.captions || []).length) {
+        renderSubs(sniffed.captions, u);
+        return;
+      }
+    }
+    // Cached analyze ladder → real analyze fallback.
+    const cached = cachedFormatsRes(u);
+    if (cached) {
+      renderSubsMenu(cached, u);
+      placeFmtsBelow();
+      return;
+    }
     hbarFmts.innerHTML = '<div class="vx-empty" style="padding:10px"><span class="vx-spin"></span> Fetching subtitles…</div>';
     placeFmtsBelow();
-    const u = urlOverride || getCurrentUrl();
-    const res = await send({ type: "analyze", url: u });
-    const subs = ((res && res.info && res.info.subtitles) || []).filter((s) => !s.auto);
+    const res = await ensureFormats(u);
+    renderSubsMenu(res, u);
+    placeFmtsBelow();
+  }
+
+  function renderSubsMenu(res, u) {
+    const all = (res && res.info && res.info.subtitles) || [];
+    // Golden Rule B: list EVERY subtitle — official tracks first, then
+    // auto-generated (labeled "(auto)"). Never drop machine captions, never
+    // claim "none" while auto captions exist.
+    const official = all.filter((s) => !s.auto);
+    const auto = all.filter((s) => s.auto);
+    const subs = official.concat(auto).slice(0, 20);
     if (!subs.length) {
       hbarFmts.innerHTML =
         '<div class="vx-empty">' +
-        (res && res.error ? "Error: " + esc(res.error) : "No official subtitles available for this video") +
+        (res && res.error ? "Error: " + esc(res.error) : "No subtitles available for this video") +
         "</div>";
       placeFmtsBelow();
       return;
@@ -714,9 +978,12 @@
       '<button class="vx-btn vx-slim ' + (hbarSubFmt === "vtt" ? "vx-on" : "") + '" data-subfmt="vtt">VTT</button>' +
       "</div>";
     for (const s of subs.slice(0, 20)) {
+      let label = s.label || s.lang;
+      // Backend already suffixes "(auto)"; guard in case a bare label slips through.
+      if (s.auto && !/\(auto\)/i.test(label)) label += " (auto)";
       html +=
-        '<div class="vx-fmt"><span class="vx-fq">' + esc(s.label || s.lang) +
-        "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "'>." + hbarSubFmt + "</button></div>";
+        '<div class="vx-fmt"><span class="vx-fq">' + esc(label) +
+        "</span><button class='vx-btn vx-slim' data-sub='" + esc(s.lang) + "' data-auto='" + (s.auto ? "1" : "") + "'>." + hbarSubFmt + "</button></div>";
     }
     hbarFmts.innerHTML = html;
     hbarFmts.querySelectorAll("[data-subfmt]").forEach((btn) => {
@@ -729,7 +996,7 @@
       btn.addEventListener("click", () => {
         btn.textContent = "Added ✓";
         btn.disabled = true;
-        void send({ type: "start_ytdl", url: url, format_id: "subs:" + hbarSubFmt + ":" + btn.dataset.sub });
+        void send({ type: "start_ytdl", url: url, format_id: "subs:" + hbarSubFmt + ":" + btn.dataset.sub, auto_subs: btn.dataset.auto === "1" });
       });
     });
     placeFmtsBelow();
@@ -764,6 +1031,10 @@
     try { hbarHide(0); } catch (e) {}
     hbarTarget = null;
     pendingStream = null;
+    // SPA navigation → the old video's format ladder is meaningless now.
+    cachedFormatsMap.clear();
+    fetchingFormats.clear();
+    inPageFormatsMap.clear();
     try { if (hbarFmts) hbarFmts.classList.add("vx-hide"); } catch (e) {}
     fmtsOpen = false;
     media.clear();

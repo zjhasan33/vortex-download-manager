@@ -1239,11 +1239,10 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                 args.push("--sub-format".into());
                 args.push("srt/vtt/best".into());
                 args.push("--embed-subs".into());
-                if task.auto_subs {
-                    args.push("--write-auto-subs".into());
-                } else {
-                    args.push("--no-write-auto-subs".into());
-                }
+                // GOLDEN RULE: video containers embed ONLY official/manual tracks.
+                // Machine (auto) captions are never embedded — enforced here
+                // unconditionally so auto_subs can never leak into an MP4/MKV.
+                args.push("--no-write-auto-subs".into());
                 args.push("--sub-langs".into());
                 args.push(effective_langs.to_string());
                 args.push("--convert-subs".into());

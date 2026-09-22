@@ -297,6 +297,12 @@ impl StartOpts {
 pub struct TaskSnapshot {
     pub view: DlView,
     pub segments: Vec<[u64; 2]>,
+    // Persisted so a restarted session keeps the tunables the user chose
+    // instead of silently resetting them to the hardcoded defaults.
+    #[serde(default)]
+    pub auto_retries: u32,
+    #[serde(default)]
+    pub start_at: Option<u64>,
 }
 
 pub struct Task {
@@ -495,7 +501,7 @@ pub(crate) fn resolve_filename(resp: &reqwest::Response, url: &str) -> String {
     sanitize(if last.is_empty() { "download" } else { last })
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -993,6 +999,8 @@ pub fn restore(
     view: DlView,
     segments: Vec<[u64; 2]>,
     limit: Arc<AtomicU64>,
+    auto_retries: u32,
+    start_at: Option<u64>,
 ) -> Result<Arc<Task>, String> {
     let save_path = PathBuf::from(view.save_path.clone());
     let num_segments = segments.len();
@@ -1034,8 +1042,8 @@ pub fn restore(
         app,
         client: build_client("").unwrap_or_else(|_| Client::new()),
         retries: AtomicU64::new(0),
-        auto_retries: 3,
-        start_at: None,
+        auto_retries,
+        start_at,
         auth: Mutex::new(auth),
         segments: Mutex::new(segs),
         done_flags: Mutex::new(vec![false; num_segments]),
@@ -1055,7 +1063,7 @@ impl Task {
             .iter()
             .map(|s| [s.start, s.end])
             .collect();
-        TaskSnapshot { view: self.view(), segments: segs }
+        TaskSnapshot { view: self.view(), segments: segs, auto_retries: self.auto_retries, start_at: self.start_at }
     }
 }
 
@@ -1706,7 +1714,14 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             break;
         }
 
-        if !dropped || (seg.end != u64::MAX && cursor >= seg.end + 1) {
+        // Done only when the range ACTUALLY landed. A graceful EOF (server
+        // closing the socket, !dropped) does NOT imply completion: if the
+        // stream ended before seg.end was reached the chunk is incomplete, and
+        // marking it done would truncate/corrupt the merged file. Incomplete =
+        // retry from the cursor with backoff below; unknown-size segments end
+        // naturally at a clean EOF.
+        let complete = (seg.end == u64::MAX && !dropped) || (seg.end != u64::MAX && cursor >= seg.end + 1);
+        if complete {
             mark_done(&task, idx);
             return true;
         }

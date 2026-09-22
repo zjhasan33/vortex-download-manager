@@ -510,8 +510,12 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     let url = p["url"].as_str().unwrap_or("").to_string();
                     let pages = p["max_pages"].as_u64().map(|n| n as usize).unwrap_or(10);
                     let kinds: Vec<String> = p["kinds"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
-                    let cancel = std::sync::atomic::AtomicBool::new(false);
-                    match grabber::grab_site(&url, pages, kinds, &cancel).await {
+                    // Reuse the manager's shared cancel flag so the app's
+                    // Stop button (grab_stop) also aborts WS-initiated crawls,
+                    // exactly like the in-app grab_site command does.
+                    mgr.grab_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let cancel = mgr.grab_cancel.clone();
+                    match grabber::grab_site(&url, pages, kinds, cancel.as_ref()).await {
                         Ok(items) => json!({"type":"grabbed","ok":true,"items":items}).to_string(),
                         Err(e) => err(&e),
                     }
@@ -687,6 +691,10 @@ fn resume_http(mgr: &Arc<DlManager>, id: String) -> String {
     let m = mgr.http.lock().unwrap();
     match m.get(&id) {
         Some(t) => {
+            // A stale cancel from a previous stop/restart must not instantly
+            // abort the relaunched worker — clear it exactly like the in-app
+            // resume command does.
+            t.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
             t.paused.store(false, std::sync::atomic::Ordering::Relaxed);
             let c = t.clone();
             drop(m);

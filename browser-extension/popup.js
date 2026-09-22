@@ -210,6 +210,7 @@ $("pair-save").addEventListener("click", async () => {
   // Force reconnection with the new key
   $("pair-save").textContent = "Saved ✓";
   setTimeout(() => { $("pair-save").textContent = "Save"; }, 1200);
+  try { await browser.runtime.sendMessage({ type: "force_reconnect" }); } catch (e) { /* bg may be waking */ }
   void refreshStatus();
 });
 
@@ -295,12 +296,15 @@ $("subs-fetch").addEventListener("click", async () => {
     reset();
     return;
   }
-  const res = await send({ type: "analyze", url }, 30000);
-  const subs = ((res && res.info && res.info.subtitles) || []).filter((s) => !s.auto);
+  const res = await send({ type: "analyze", url }, 60000);
+  const allSubs = (res && res.info && res.info.subtitles) || [];
+  // Golden Rule B: every subtitle is downloadable standalone — official tracks
+  // first, then auto-generated ones (labeled "(auto)").
+  const subs = allSubs.filter((s) => !s.auto).concat(allSubs.filter((s) => s.auto));
   if (!subs.length) {
     box.innerHTML =
       '<div class="empty">' +
-      (res && res.error ? "Error: " + esc(res.error) : "No official subtitles found.") +
+      (res && res.error ? "Error: " + esc(res.error) : "No subtitles found.") +
       "</div>";
     reset();
     return;
@@ -311,7 +315,9 @@ $("subs-fetch").addEventListener("click", async () => {
     row.className = "cap";
     const name = document.createElement("div");
     name.className = "n";
-    name.textContent = s.label || s.lang;
+    let display = s.label || s.lang;
+    if (s.auto && !/\(auto\)/i.test(display)) display += " (auto)";
+    name.textContent = display;
     name.title = s.lang;
     const dl = document.createElement("button");
     dl.className = "btn primary";
@@ -323,7 +329,7 @@ $("subs-fetch").addEventListener("click", async () => {
       dl.disabled = true;
       dl.textContent = "Sending…";
       const r = await send(
-        { type: "start_ytdl", url, format_id: "subs:" + popSubFmt + ":" + s.lang },
+        { type: "start_ytdl", url, format_id: "subs:" + popSubFmt + ":" + s.lang, auto_subs: s.auto === true },
         8000
       );
       if (r && r.error && !r.launched) {

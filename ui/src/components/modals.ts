@@ -833,7 +833,12 @@ export function openGrabber(initialUrl = "", autoStart = false) {
 }
 
 function escapeAttr(s: string): string {
-  return s.replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 /** First-run welcome: tells a new user what happens automatically (tools),

@@ -719,20 +719,39 @@ pub fn history_file(app: &AppHandle) -> PathBuf {
 struct PersistEntry {
     view: DlView,
     segments: Option<Vec<[u64; 2]>>,
+    #[serde(default)]
+    auto_retries: u32,
+    #[serde(default)]
+    start_at: Option<u64>,
 }
 
 pub fn persist_history(app: &AppHandle, mgr: &DlManager) {
     let mut recs: Vec<PersistEntry> = Vec::new();
     for h in mgr.history.lock().unwrap().iter() {
-        recs.push(PersistEntry { view: h.clone(), segments: None });
+        recs.push(PersistEntry {
+            view: h.clone(),
+            segments: None,
+            auto_retries: 3,
+            start_at: None,
+        });
     }
     for t in mgr.http.lock().unwrap().values() {
         let s = t.snapshot();
         let view = s.view.clone();
-        recs.push(PersistEntry { view, segments: Some(s.segments) });
+        recs.push(PersistEntry {
+            view,
+            segments: Some(s.segments),
+            auto_retries: s.auto_retries,
+            start_at: s.start_at,
+        });
     }
     for t in mgr.yt.lock().unwrap().values() {
-        recs.push(PersistEntry { view: t.view(), segments: None });
+        recs.push(PersistEntry {
+            view: t.view(),
+            segments: None,
+            auto_retries: 3,
+            start_at: None,
+        });
     }
     if let Ok(json) = serde_json::to_string(&serde_json::json!({ "records": recs })) {
         let _ = std::fs::write(history_file(app), json);
@@ -772,6 +791,8 @@ pub fn load_history(app: &AppHandle, mgr: &DlManager) {
                 view.clone(),
                 segs.unwrap_or_default(),
                 mgr.limit.clone(),
+                r.get("auto_retries").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(3),
+                r.get("start_at").and_then(|v| v.as_u64()),
             ) {
                 Ok(task) => {
                     mgr.add_http(task);
@@ -933,47 +954,55 @@ pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
                     last_seen_ms = now;
                     continue;
                 }
-                let url = urls[0].clone();
-                // Debounce: same URL copied again within 4s is treated as a re-copy trigger.
-                if last.as_deref() == Some(url.as_str()) && now.saturating_sub(last_seen_ms) < 4000 {
+                // Debounce: same text block copied again within 4s is treated as a re-copy trigger.
+                if last.as_deref() == Some(text.trim()) && now.saturating_sub(last_seen_ms) < 4000 {
                     last_seen_ms = now;
                     continue;
                 }
-                last = Some(url.clone());
+                last = Some(text.trim().to_string());
                 last_seen_ms = now;
 
-                if is_youtube_playlist_url(&url) {
+                // A block of text may hold several download links — queue/prompt
+                // for EVERY one, not just the first (dedupe within the same copy).
+                let mut seen = std::collections::HashSet::new();
+                for url in &urls {
+                    if url.is_empty() || !seen.insert(url.clone()) {
+                        continue;
+                    }
+
+                    if is_youtube_playlist_url(url) {
+                        let app = app.clone();
+                        let url = url.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // Bring Vortex to the front so the playlist modal is immediately visible.
+                            if let Some(win) = app.get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.unminimize();
+                                let _ = win.set_focus();
+                            }
+                            let _ = app.emit("playlist-clip", serde_json::json!({ "url": url }));
+                        });
+                        continue;
+                    }
+
                     let app = app.clone();
+                    let mgr = mgr.clone();
+                    let settings = settings.clone();
                     let url = url.clone();
                     tauri::async_runtime::spawn(async move {
-                        // Bring Vortex to the front so the playlist modal is immediately visible.
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.show();
-                            let _ = win.unminimize();
-                            let _ = win.set_focus();
+                        if !crate::download::url_is_downloadable(&url) {
+                            return;
                         }
-                        let _ = app.emit("playlist-clip", serde_json::json!({ "url": url }));
-                    });
-                    continue;
-                }
-
-                let app = app.clone();
-                let mgr = mgr.clone();
-                let settings = settings.clone();
-                tauri::async_runtime::spawn(async move {
-                    if !crate::download::url_is_downloadable(&url) {
-                        return;
-                    }
-                    // Dialog mode: standalone File Info window instead of
-                    // auto-starting (OFF keeps today's direct path below).
-                    // The main dashboard is never raised for these prompts.
-                    if settings.show_download_info {
-                        crate::open_info_window(
-                            &app,
-                            serde_json::json!({ "url": url, "filename": "", "referer": "", "cookies": "" }),
-                        );
-                        return;
-                    }
+                        // Dialog mode: standalone File Info window instead of
+                        // auto-starting (OFF keeps today's direct path below).
+                        // The main dashboard is never raised for these prompts.
+                        if settings.show_download_info {
+                            crate::open_info_window(
+                                &app,
+                                serde_json::json!({ "url": url, "filename": "", "referer": "", "cookies": "" }),
+                            );
+                            return;
+                        }
                         let opts = download::StartOpts {
                             segments: settings.segments,
                             filename: None,
@@ -996,7 +1025,8 @@ pub fn clipboard_monitor_loop(app: AppHandle, mgr: Arc<DlManager>) {
                                 serde_json::json!({ "url": url, "id": id, "filename": view.title }),
                             );
                         }
-                });
+                    });
+                }
             }
         }
     });

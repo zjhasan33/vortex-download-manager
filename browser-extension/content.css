@@ -161,6 +161,25 @@
   color: #7d95c2;
   font-size: 12px;
 }
+.vx-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px 10px;
+  color: #bff4ff;
+  font-size: 12px;
+  font-weight: 600;
+}
+.vx-loading::before {
+  content: "";
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(0, 229, 255, 0.3);
+  border-top-color: #00e5ff;
+  border-radius: 50%;
+  animation: vxspin 0.8s linear infinite;
+}
 .vx-spin {
   display: inline-block;
   width: 13px;
