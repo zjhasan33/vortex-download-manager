@@ -541,11 +541,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             path: default_download_dir(),
-            // Start at 16; the adaptive scaler in monitor_task grows toward 32
-            // while per-connection throttling leaves bandwidth on the table.
-            // 16 saturates typical broadband out of the box; servers that cap
-            // per-connection speed still gain from the wider fan-out.
-            segments: 16,
+            // 0 = Auto (Recommended): engine picks 16 (32 for >250MB) at start.
+            segments: 0,
             speed_limit: 0,
             notifications: true,
             sounds: true,

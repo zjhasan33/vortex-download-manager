@@ -38,8 +38,8 @@ export function openAddUrl() {
         <div class="field">
           <label>Connections (segments)</label>
           <div class="seg-slider">
-            <input type="range" id="au-seg" min="1" max="32" value="${segments}" />
-            <span class="val" id="au-segval">${segments}</span>
+            <input type="range" id="au-seg" min="0" max="32" value="${segments}" />
+            <span class="val" id="au-segval">${segments === 0 ? "Auto (Recommended)" : segments + " connections"}</span>
           </div>
         </div>
       </div>
@@ -71,7 +71,10 @@ export function openAddUrl() {
       const nameInp = root.querySelector<HTMLInputElement>("#au-name")!;
       const startInp = root.querySelector<HTMLInputElement>("#au-start")!;
 
-      segInp.addEventListener("input", () => (segVal.textContent = segInp.value));
+      segInp.addEventListener("input", () => {
+        const v = Number(segInp.value);
+        segVal.textContent = v === 0 ? "Auto (Recommended)" : `${v} connections`;
+      });
       root.querySelector<HTMLButtonElement>("#au-browse")!.onclick = async () => {
         const p = await api.chooseFolder();
         if (p) pathInp.value = p;
@@ -192,8 +195,8 @@ export function openSettings() {
         <div class="field">
           <label>Segments per download</label>
           <div class="seg-slider">
-            <input type="range" id="st-seg" min="1" max="32" value="${s.segments}" />
-            <span class="val" id="st-segval">${s.segments}</span>
+            <input type="range" id="st-seg" min="0" max="32" value="${s.segments}" />
+            <span class="val" id="st-segval">${s.segments === 0 ? "Auto (Recommended)" : s.segments + " connections"}</span>
           </div>
         </div>
       </div>
@@ -385,7 +388,10 @@ export function openSettings() {
       };
       const seg = root.querySelector<HTMLInputElement>("#st-seg")!;
       const segVal = root.querySelector<HTMLSpanElement>("#st-segval")!;
-      seg.addEventListener("input", () => (segVal.textContent = seg.value));
+      seg.addEventListener("input", () => {
+        const v = Number(seg.value);
+        segVal.textContent = v === 0 ? "Auto (Recommended)" : `${v} connections`;
+      });
 
       const ckPath = root.querySelector<HTMLInputElement>("#st-cookiepath")!;
       root.querySelector<HTMLButtonElement>("#st-cookiepick")!.onclick = async () => {

@@ -828,7 +828,18 @@ pub async fn start(
 
     let segs;
     let max_conns;
-    if ranged && total > 0 && opts.segments > 1 {
+    // Auto mode: segments == 0 means the engine picks the golden target —
+    // 16 for >250MB files, 8 for medium files — instead of the user setting.
+    let target_conns = if opts.segments == 0 {
+        if total > 250 * 1024 * 1024 {
+            32
+        } else {
+            16
+        }
+    } else {
+        opts.segments
+    };
+    if ranged && total > 0 && target_conns > 1 {
         const MB: u64 = 1024 * 1024;
         if total < 10 * MB {
             // Tiny file: zero segmentation overhead.
@@ -837,10 +848,10 @@ pub async fn start(
         } else if total <= 250 * MB {
             // Medium file (Hetzner 100MB): 8 is the BDP sweet spot for high-latency CDNs.
             // Exactly 8 contiguous ranges → 8 long-lived Keep-Alive streams, no renegotiation storm.
-            max_conns = opts.segments.clamp(2, 32).min(8);
+            max_conns = target_conns.clamp(2, 32).min(8);
             segs = split_range_contiguous(total, max_conns as usize, &save_path_final);
         } else {
-            max_conns = opts.segments.clamp(2, 32);
+            max_conns = target_conns.clamp(2, 32);
             segs = split_range(total, max_conns, &save_path_final);
         }
     } else {

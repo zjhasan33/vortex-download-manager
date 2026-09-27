@@ -177,10 +177,18 @@ fn extract_ffmpeg(zip_path: &std::path::Path, dir: &std::path::Path) -> Result<(
     extract_ffmpeg_as(zip_path, dir, "ffmpeg.exe")
 }
 
+/// Serialize ALL tool downloads through one global async permit so yt-dlp (25MB)
+/// and ffmpeg (111MB) can never run concurrently and cross-contaminate the
+/// same `tools-progress` reporter (the 80% -> 5% rewind bug on fresh installs).
+/// Stale .tmp staging files from a killed run are ignored (fresh .tmp each time).
+static TOOL_DL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Download with resume + retries: a truncated tool fetch (killed app, cut
 /// connection — the classic 7 MB ffmpeg.zip) continues from its partial bytes
 /// instead of restarting from zero and failing the same way again.
 async fn download_to(app: &AppHandle, kind: &str, url: &str, target: &std::path::Path) -> Result<(), String> {
+    // Hold the global async permit for the WHOLE sequential download (tokio Mutex is Send-safe).
+    let _permit = TOOL_DL_LOCK.lock().await;
     const MAX_ATTEMPTS: u64 = 5;
     let mut attempt = 0u64;
     loop {
@@ -215,8 +223,10 @@ async fn download_once(app: &AppHandle, kind: &str, url: &str, target: &std::pat
         .build()
         .map_err(|e| e.to_string())?;
 
-    // Resume a partial file left by a killed/interrupted attempt.
-    let have = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+    // Resume a partial staging file left by a killed/interrupted attempt.
+    // Staging name differs from target, so check the .tmp staging file.
+    let staging_resume = target.with_extension("tmp");
+    let have = std::fs::metadata(&staging_resume).map(|m| m.len()).unwrap_or(0);
     let mut req = client.get(url);
     if have > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
@@ -247,17 +257,20 @@ async fn download_once(app: &AppHandle, kind: &str, url: &str, target: &std::pat
     let remaining = resp.content_length().unwrap_or(0);
     let total = if resumed { have + remaining } else { remaining };
     eprintln!(
-        "[vortex-tools] download started: {url} ({} bytes{})",
+        "[vortex-tools] download started: {kind} from {url} ({} bytes{})",
         if total > 0 { total.to_string() } else { "unknown".into() },
         if resumed { format!(", resuming at {have}") } else { String::new() },
     );
 
+    // Robust staging: stream into `<target>.tmp`, then atomically rename to
+    // `target` only on verified completion — partial downloads never corrupt.
+    let staging = staging_resume;
     let mut out = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .append(resumed)
         .truncate(!resumed)
-        .open(target)
+        .open(&staging)
         .await
         .map_err(|e| format!("Cannot create file: {e}"))?;
     use tokio::io::AsyncWriteExt;
@@ -283,11 +296,13 @@ async fn download_once(app: &AppHandle, kind: &str, url: &str, target: &std::pat
     drop(out);
     // A short stream with no error is still a failure (truncated zip).
     if total > 0 {
-        let final_len = tokio::fs::metadata(target).await.map(|m| m.len()).unwrap_or(0);
+        let final_len = tokio::fs::metadata(&staging).await.map(|m| m.len()).unwrap_or(0);
         if final_len != total {
             return Err(format!("Incomplete download ({final_len}/{total} bytes)"));
         }
     }
+    // Atomic rename: staging -> target only on verified completion.
+    std::fs::rename(&staging, target).map_err(|e| format!("Cannot finalize file: {e}"))?;
     eprintln!("[vortex-tools] download finished: {written} bytes");
     Ok(())
 }
