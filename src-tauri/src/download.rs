@@ -426,6 +426,16 @@ pub fn url_is_downloadable(url: &str) -> bool {
             return true;
         }
     }
+    // CDN query-based: ?file=setup.zip, ?name=movie.mp4, ?url=...mp4 etc.
+    if let Some(q) = lower.split_once('?').map(|(_, q)| q) {
+        for tok in q.split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-') {
+            if let Some(dot) = tok.rfind('.') {
+                if EXTS.iter().any(|e| **e == tok[dot + 1..]) {
+                    return true;
+                }
+            }
+        }
+    }
     false
 }
 
@@ -1004,6 +1014,15 @@ pub fn restore(
 ) -> Result<Arc<Task>, String> {
     let save_path = PathBuf::from(view.save_path.clone());
     let num_segments = segments.len();
+    // Sync downloaded against actual *.vtx.part sizes on disk (crash-safe resume).
+    let mut disk_done: u64 = 0;
+    for idx in 0..num_segments {
+        let part = part_of(&save_path, idx);
+        if let Ok(md) = std::fs::metadata(&part) {
+            disk_done = disk_done.saturating_add(md.len());
+        }
+    }
+    let synced_downloaded = disk_done.min(view.downloaded);
     let segs = segments
         .iter()
         .enumerate()
@@ -1028,7 +1047,7 @@ pub fn restore(
         thumbnail: view.thumbnail.clone(),
         created_at: view.created_at,
         total: AtomicU64::new(view.total_size),
-        done: AtomicU64::new(view.downloaded),
+        done: AtomicU64::new(synced_downloaded),
         num_segments,
         max_conns: AtomicUsize::new(view.connections.clamp(1, 32)),
         penalty_until: AtomicU64::new(0),

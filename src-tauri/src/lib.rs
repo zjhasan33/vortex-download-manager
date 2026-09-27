@@ -810,26 +810,34 @@ async fn start_ytdl(
     // Keep Both (allow_dup) bypasses all duplicate gates by design.
     let is_audio_new = format_id.starts_with("ba-") || format_id.starts_with("bestaudio");
     let allow = allow_dup == Some(true);
-    if !allow {
-        {
-            use std::collections::HashSet;
-            use std::sync::{LazyLock, Mutex};
-            static PENDING_YTDL: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-            if let Some(id) = youtube_id(&url) {
-                let key = format!("{}:{}", id.to_ascii_lowercase(), format_id);
-                let mut pending = PENDING_YTDL.lock().unwrap();
-                if pending.contains(&key) {
-                    return Err(format!("EXISTS::pending:{key} (already starting)"));
-                }
-                pending.insert(key.clone());
-                // Auto-clear after 15s so a failed start doesn't block forever.
-                let key2 = key.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                    PENDING_YTDL.lock().unwrap().remove(&key2);
-                });
-            }
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static PENDING_YTDL: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let pending_key: Option<String> = if !allow {
+        youtube_id(&url).map(|id| format!("{}:{}", id.to_ascii_lowercase(), format_id))
+    } else {
+        None
+    };
+    let clear_pending = |pending_key: &Option<String>| {
+        if let Some(k) = pending_key {
+            PENDING_YTDL.lock().unwrap().remove(k);
         }
+    };
+    if let Some(key) = pending_key.clone() {
+        {
+            let mut pending = PENDING_YTDL.lock().unwrap();
+            if pending.contains(&key) {
+                return Err(format!("EXISTS::pending:{key} (already starting)"));
+            }
+            pending.insert(key.clone());
+        }
+        // Auto-clear after 15s so a failed start doesn't block forever.
+        let key2 = key.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            PENDING_YTDL.lock().unwrap().remove(&key2);
+        });
+    }
     let views = state.views();
     if let Some(dup) = views.iter().find(|v| {
         if matches!(v.status, download::DlStatus::Completed | download::DlStatus::Cancelled) {
@@ -850,6 +858,7 @@ async fn start_ytdl(
         }
         false
     }) {
+        clear_pending(&pending_key);
         return Err(format!("EXISTS::{} (already in list: {:?})", dup.save_path, dup.status));
     }
     // Already on disk (even if list says Completed) → warn like IDM, but only for exact same format/extension.
@@ -881,12 +890,12 @@ async fn start_ytdl(
                         continue;
                     }
                     if name.contains(&format!("[{id}]")) || name.contains(&id) {
+                        clear_pending(&pending_key);
                         return Err(format!("EXISTS::{} (already on disk)", p.display()));
                     }
                 }
             }
         }
-    }
     }
     let settings = state::load_settings(&app);
     let task = ytdlp::start(
@@ -906,7 +915,9 @@ async fn start_ytdl(
         ytdlp::StreamCtx { referer, user_agent, cookies },
         thumbnail,
     )
-    .await?;
+    .await;
+    clear_pending(&pending_key);
+    let task = task?;
     let id = task.id.clone();
     // "Download Later": register paused, launch on resume (resume_download).
     if start_paused.unwrap_or(false) {
@@ -1090,6 +1101,14 @@ async fn read_urls(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 #[tauri::command]
 fn get_ws_token(app: tauri::AppHandle) -> String {
     ws_server::ws_token(&app)
+}
+
+#[tauri::command]
+fn close_dropbox(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("dropbox") {
+        let _ = w.close();
+        let _ = w.destroy();
+    }
 }
 
 #[tauri::command]
@@ -1293,6 +1312,7 @@ pub fn run() {
             read_urls,
             get_ws_token,
             window_action,
+            close_dropbox,
             take_dialog_payload,
         ])
         .run(tauri::generate_context!())

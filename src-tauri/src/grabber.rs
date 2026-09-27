@@ -102,7 +102,9 @@ fn extract_links(html: &str) -> Vec<String> {
     while i + 5 < bytes.len() {
         let is_href = attr_at(bytes, i, b"href");
         let is_src = !is_href && attr_at(bytes, i, b"src");
-        if !is_href && !is_src {
+        let is_srcset = !is_href && !is_src && attr_at(bytes, i, b"srcset");
+        let is_datasrc = !is_href && !is_src && !is_srcset && attr_at(bytes, i, b"data-src");
+        if !is_href && !is_src && !is_srcset && !is_datasrc {
             i += 1;
             continue;
         }
@@ -114,7 +116,7 @@ fn extract_links(html: &str) -> Vec<String> {
                 continue;
             }
         }
-        let mut j = i + if is_href { 4 } else { 3 };
+        let mut j = i + if is_href { 4 } else if is_src { 3 } else if is_srcset { 6 } else { 8 };
         while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
             j += 1;
         }
@@ -138,8 +140,17 @@ let rest = &html[j + 1..];
         let q = quote as char;
         if let Some(end) = rest.find(q) {
             let val = rest[..end].trim();
-            if !val.is_empty() && val.len() < 2048 {
-                out.push(val.to_string());
+            if !val.is_empty() && val.len() < 4096 {
+                if is_srcset {
+                    for part in val.split(',') {
+                        let u = part.split_whitespace().next().unwrap_or("").trim();
+                        if !u.is_empty() && u.len() < 2048 {
+                            out.push(u.to_string());
+                        }
+                    }
+                } else if !val.is_empty() && val.len() < 2048 {
+                    out.push(val.to_string());
+                }
             }
             i = j + 1 + end + 1;
         } else {

@@ -1,4 +1,5 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { invoke } from "@tauri-apps/api/core";
 
 /** Create the floating drop box if enabled (and missing), or close it if disabled. */
 export async function syncDropbox(enabled: boolean): Promise<void> {
@@ -26,12 +27,25 @@ export async function syncDropbox(enabled: boolean): Promise<void> {
         focus: false,
       });
       w.once("tauri://error", (e) => console.error("dropbox failed", e));
-    } else if (existing) {
+    } else {
       try {
-        await existing.close();
-      } catch {
-        /* already closed */
+        await invoke("close_dropbox");
+      } catch {}
+      // Robust close: getByLabel may miss a just-created window, so also try direct close.
+      if (existing) {
+        try {
+          await existing.close();
+        } catch {}
       }
+      try {
+        const { getAllWebviewWindows } = await import("@tauri-apps/api/webviewWindow");
+        const all = await getAllWebviewWindows();
+        for (const w of all) {
+          if (w.label === "dropbox") {
+            try { await w.close(); } catch {}
+          }
+        }
+      } catch {}
     }
   } catch (e) {
     console.error("syncDropbox", e);

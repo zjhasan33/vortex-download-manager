@@ -25,7 +25,7 @@ async function boot() {
   const app = new VortexApp();
   app.mount();
   startTicker(3);
-  if (store.settings?.show_dropbox) void syncDropbox(true);
+  void syncDropbox(!!store.settings?.show_dropbox);
 
   window.__app = app;
   window.addEventListener("error", (e) => toast("UI error: " + e.message, "err"));

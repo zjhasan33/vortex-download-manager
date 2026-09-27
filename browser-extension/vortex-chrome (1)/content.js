@@ -341,22 +341,40 @@
     return sniffInFlight;
   }
 
-  // ---------------- UI (FAB/panel disabled — IDM has no in-page badge) ----------------
-  // FAB and side panel are intentionally disabled. All link detections stay silent in the
-  // extension popup's "Detected links" list. Only the video hover bar remains.
+  // ---------------- UI ----------------
 
- let fab = null, panel = null;
+  let fab, panel;
 
   function ensureEls() {
-    // In-page FAB/panel removed — keep as no-op for callers that still call it.
-    return;
+    if (fab) return;
+    fab = el("div", "vx-fab");
+    fab.appendChild(el("span", "vx-logo"));
+    fab.appendChild(document.createTextNode("Vortex"));
+    fab.addEventListener("click", togglePanel);
+    document.documentElement.appendChild(fab);
+
+    panel = el("div", "vx-panel vx-hidden");
+    panel.innerHTML =
+      '<div class="vx-panel-head"><span class="vx-title"></span><button class="vx-x">✕</button></div>' +
+      '<div class="vx-panel-body"></div>';
+    panel.querySelector(".vx-x").addEventListener("click", hidePanel);
+    document.documentElement.appendChild(panel);
   }
 
   function togglePanel() {
-    return;
+    if (panelOpen) hidePanel();
+    else {
+      panelOpen = true;
+      ensureEls();
+      panel.classList.remove("vx-hidden");
+      if (hbar) hbar.classList.add("vx-hide");
+      scan();
+      renderPanel();
+    }
   }
   function hidePanel() {
     panelOpen = false;
+    if (panel) panel.classList.add("vx-hidden");
   }
 
   function nameOf(m) {
@@ -488,9 +506,24 @@
     if (opener) opener.addEventListener("click", (e) => { e.preventDefault(); void send({ type: "open_vortex" }); });
   }
 
-  function showToast(_cap) {
-    // In-page link toast removed — detections stay silent in popup's list (IDM parity).
-    return;
+  function showToast(cap) {
+    if (!captureToast) {
+      ensureEls();
+      captureToast = el("div", "vx-toast vx-hide");
+      document.documentElement.appendChild(captureToast);
+    }
+    const name = (cap && cap.filename) || "";
+    captureToast.classList.remove("vx-hide");
+    captureToast.innerHTML =
+      "<div><b style='color:#00e5ff'>Vortex:</b> link detected<br/><span class='vx-t-name'>" + esc(name) + "</span></div>" +
+      '<button class="vx-btn vx-slim">Download</button>';
+    const b = captureToast.querySelector("button");
+    b.onclick = () => {
+      if (cap) void send({ type: "download_direct", url: cap.url, filename: cap.filename });
+      captureToast.classList.add("vx-hide");
+    };
+    clearTimeout(captureToast._t);
+    captureToast._t = setTimeout(() => captureToast.classList.add("vx-hide"), 9000);
   }
 
   // ---------------- IDM-style hover bar over the video ----------------
@@ -800,29 +833,6 @@
       html +=
         '<div class="vx-fmt"><span class="vx-fq">MP3 Audio' +
         "</span><button class='vx-btn vx-slim' data-fid='ba-mp3-320'>Download</button></div>";
-    }
-    html += '<div class="vx-empty" style="text-align:left;padding:8px 2px 4px">Audio Formats</div>';
-    {
-      let dur = (res && res.duration) || 0;
-      try {
-        const v = document.querySelector("video");
-        if (!dur && v && isFinite(v.duration) && v.duration > 0) dur = v.duration;
-      } catch (e) {}
-      const audios = [
-        ["MP3 • 320 kbps (Best Quality)", "ba-audio-mp3-320", 320000],
-        ["MP3 • 192 kbps (Standard)", "ba-audio-mp3-192", 192000],
-        ["MP3 • 128 kbps (Compact)", "ba-audio-mp3-128", 128000],
-        ["M4A • 256 kbps (AAC)", "ba-audio-m4a-256", 256000],
-        ["FLAC • Lossless", "ba-audio-flac-0", 0],
-        ["WAV • Lossless", "ba-audio-wav-0", 0],
-      ];
-      for (const [label, fid, br] of audios) {
-        const size = dur && br ? " • " + fmtBytes((dur * br) / 8) : "";
-        html +=
-          '<div class="vx-fmt"><span class="vx-fq">' + esc(label) + (size ? '<span class="vx-fn">' + size + "</span>" : "") +
-          "</span>" +
-          '<button class="vx-btn vx-slim" data-fid="' + esc(fid) + '">Download</button></div>';
-      }
     }
     const caps = (res.captions || []).slice(0, 20);
     if (caps.length) {
