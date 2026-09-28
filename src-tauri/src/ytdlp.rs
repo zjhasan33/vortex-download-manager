@@ -473,21 +473,38 @@ async fn try_embed_thumbnail(app: &tauri::AppHandle, file: &std::path::Path, thu
     let jpg_c = jpg.clone();
     let ffmpeg_c = ffmpeg.clone();
     let tmp_out_c = tmp_out.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        let mut cmd = crate::tools::silent(std::process::Command::new(ffmpeg_c));
-        cmd.arg("-y").arg("-i").arg(&file_c).arg("-i").arg(&jpg_c);
-        if is_mp3 {
-            cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-id3v2_version", "3", "-metadata:s:v", "title=\"Album cover\"", "-metadata:s:v", "comment=\"Cover (front)\""]);
-        } else {
-            cmd.args(["-map", "0", "-map", "1", "-c", "copy", "-disposition:v:1", "attached_pic"]);
+    // MP3 gets a fallback chain (attempt #1 is byte-identical to the old
+    // command, so environments where it worked behave exactly as before).
+    // Video path keeps its single attempt, untouched.
+    let variants: Vec<Vec<&str>> = if is_mp3 {
+        vec![
+            vec!["-map", "0", "-map", "1", "-c", "copy", "-id3v2_version", "3", "-metadata:s:v", "title=\"Album cover\"", "-metadata:s:v", "comment=\"Cover (front)\""],
+            vec!["-map", "0:a:0", "-map", "1:0", "-c:a", "copy", "-c:v", "mjpeg", "-id3v2_version", "3"],
+            vec!["-map", "0", "-map", "1", "-c", "copy", "-id3v2_version", "4"],
+        ]
+    } else {
+        vec![vec!["-map", "0", "-map", "1", "-c", "copy", "-disposition:v:1", "attached_pic"]]
+    };
+    let muxed = tokio::task::spawn_blocking(move || {
+        for v in &variants {
+            let mut cmd = crate::tools::silent(std::process::Command::new(&ffmpeg_c));
+            cmd.arg("-y").arg("-i").arg(&file_c).arg("-i").arg(&jpg_c);
+            cmd.args(v);
+            cmd.arg(&tmp_out_c);
+            if let Ok(out) = cmd.output() {
+                if out.status.success()
+                    && tmp_out_c.exists()
+                    && tmp_out_c.metadata().map(|m| m.len()).unwrap_or(0) > 0
+                {
+                    return true;
+                }
+            }
         }
-        cmd.arg(&tmp_out_c);
-        cmd.output()
+        false
     })
     .await
-    .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
-    if out.status.success() && tmp_out.exists() {
+    if muxed && tmp_out.exists() {
         let _ = std::fs::rename(&tmp_out, file);
     }
     let _ = std::fs::remove_dir_all(&tmp);
