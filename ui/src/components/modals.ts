@@ -7,7 +7,7 @@ import { syncDropbox } from "../lib/dropbox";
 import type { Settings, GrabItem } from "../types";
 
 export function openAddUrl() {
-  const segments = store.settings?.segments ?? 16;
+  const segments = store.settings?.segments ?? 0;
   const importBtn = `
       <div class="field">
         <label>Batch import (.txt)</label>
@@ -39,7 +39,7 @@ export function openAddUrl() {
           <label>Connections (segments)</label>
           <div class="seg-slider">
             <input type="range" id="au-seg" min="0" max="32" value="${segments}" />
-            <span class="val" id="au-segval">${segments === 0 ? "Auto (Recommended)" : segments + " connections"}</span>
+            <span class="val" id="au-segval">${segments === 0 ? "Auto (Recommended)" : segments}</span>
           </div>
         </div>
       </div>
@@ -73,8 +73,9 @@ export function openAddUrl() {
 
       segInp.addEventListener("input", () => {
         const v = Number(segInp.value);
-        segVal.textContent = v === 0 ? "Auto (Recommended)" : `${v} connections`;
+        segVal.textContent = v === 0 ? "Auto (Recommended)" : String(v);
       });
+
       root.querySelector<HTMLButtonElement>("#au-browse")!.onclick = async () => {
         const p = await api.chooseFolder();
         if (p) pathInp.value = p;
@@ -107,24 +108,12 @@ export function openAddUrl() {
       const go = async () => {
         const url = urlInp.value.trim();
         if (!url) return (urlInp.style.borderColor = "var(--bad)");
-        // Torrents are not supported in this version: magnet links and
-        // .torrent files are rejected here instead of opening the P2P flow.
-        if (/^magnet:/i.test(url)) {
-          toast("Torrent downloads are not supported in this version", "err");
-          return;
-        }
-        if (/\.torrent$/i.test(url) && !/^https?:/i.test(url)) {
-          toast("Torrent downloads are not supported in this version", "err");
-          return;
-        }
-        if (/^https?:.*\.torrent([?#]|$)/i.test(url)) {
+        if (/^magnet:/i.test(url) || (/\.torrent$/i.test(url) && !/^https?:/i.test(url)) || /^https?:.*\.torrent([?#]|$)/i.test(url)) {
           toast("Torrent downloads are not supported in this version", "err");
           return;
         }
         const fn = nameInp.value.trim() || url.split("/").pop() || `download_${Date.now()}`;
         const when = startInp.value ? new Date(startInp.value).getTime() || undefined : undefined;
-        // Dialog mode (default ON): probe + confirm. Scheduled starts and
-        // dialog-OFF keep today's direct path untouched.
         if (!when && (store.settings?.show_download_info ?? true)) {
           let info = { filename: fn, size: 0, category: "other" };
           try {
@@ -150,7 +139,6 @@ export function openAddUrl() {
           await startWith("prompt");
           doneOk();
         } catch (e: unknown) {
-          // IDM-style: file exists → ask Replace / Keep both / Cancel.
           const m = String(e).match(/^EXISTS::([\s\S]*)$/);
           if (!m) {
             toast(String(e), "err");
@@ -193,10 +181,10 @@ export function openSettings() {
           </div>
         </div>
         <div class="field">
-          <label>Segments per download</label>
+          <label>Connections (segments)</label>
           <div class="seg-slider">
             <input type="range" id="st-seg" min="0" max="32" value="${s.segments}" />
-            <span class="val" id="st-segval">${s.segments === 0 ? "Auto (Recommended)" : s.segments + " connections"}</span>
+            <span class="val" id="st-segval">${s.segments === 0 ? "Auto (Recommended)" : s.segments}</span>
           </div>
         </div>
       </div>
@@ -239,18 +227,12 @@ export function openSettings() {
           <button class="tbtn" id="st-cookiepick">${icon("folder", 15)}</button>
           <button class="tbtn" id="st-cookieclear" title="Clear">✕</button>
         </div>
-        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          Toggle OFF = cookies always skipped (default). Toggle ON = yt-dlp uses your cookies.txt for YouTube, age-restricted & member-only videos.
-        </div>
       </div>
       <div class="field">
         <label>Browser extension key (pairing)</label>
         <div style="display:flex;gap:8px;align-items:center">
           <input class="input ext" id="st-key" readonly placeholder="loading…" />
           <button class="tbtn" id="st-keycopy" title="Copy to clipboard">${icon("copy", 15)} Copy</button>
-        </div>
-        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          Copy this key into the Vortex browser extension → <b>Connection key</b> once, so only the extension can control the app.
         </div>
       </div>
       <div class="row2">
@@ -282,9 +264,6 @@ export function openSettings() {
             <label>Stop queue at</label>
             <input class="input" id="st-sched-stop" type="time" value="${escapeAttr(s.sched_stop || "")}" />
           </div>
-        </div>
-        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          At start time everything paused resumes; at stop time active downloads pause. Times are daily (local). Overnight ranges like 22:00 → 06:00 work.
         </div>
       </div>
       <div class="field">
@@ -322,9 +301,6 @@ export function openSettings() {
           <span style="font-size:12.5px;color:var(--text-2)">Language(s)</span>
           <input class="input" id="st-sublangs" value="${escapeAttr(s.sub_langs)}" placeholder="all" style="width:130px" spellcheck="false" />
         </div>
-        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          <b>all</b> = automatically embed any official language available (e.g. English, Bengali, Hindi). Use comma-separated codes like <b>en, bn</b> to restrict. ON = only manual/official subtitles are embedded (auto-generated captions are never used). OFF = video downloads with no subtitles at all. Down arrow <b>▾ Subs</b> in the extension downloads a standalone .srt/.vtt into the Subtitles folder.
-        </div>
       </div>
       <div class="field">
         <label>YouTube</label>
@@ -333,41 +309,32 @@ export function openSettings() {
             <input type="checkbox" id="st-thumb" ${s.embed_thumbnail ? "checked" : ""} /> Embed video thumbnail / album cover art
           </label>
         </div>
-        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          Muxes the video thumbnail (MP4 / MKV cover track) or album cover art (MP3 ID3 tag) into every video and audio download.
-        </div>
       </div>
       <div class="field">
         <label>Site logins (HTTP 401 authentication)</label>
         <div id="st-creds" style="display:flex;flex-direction:column;gap:5px">
           ${(s.credentials || []).length === 0
-            ? '<span style="font-size:11.5px;color:var(--text-3)">No saved logins. When a download needs a password, a login box appears automatically.</span>'
+            ? '<span style="font-size:11.5px;color:var(--text-3)">No saved logins.</span>'
             : (s.credentials || [])
                 .map(
                   (c) =>
                     `<div style="display:flex;align-items:center;gap:8px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);border-radius:7px;padding:6px 8px">
                       <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--text-1)">${escapeAttr(c.host)}</span>
                       <span style="font-size:11px;color:var(--text-3)">${escapeAttr(c.username)}</span>
-                      <button class="tbtn" data-cred-rm="${escapeAttr(c.host)}" title="Forget this login">${icon("close", 12)}</button>
+                      <button class="tbtn" data-cred-rm="${escapeAttr(c.host)}">${icon("close", 12)}</button>
                     </div>`,
                 )
                 .join("")}
-        </div>
-        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          Logins for a site are reused automatically on every download from that host. Supports Basic and Digest auth.
         </div>
       </div>
       <div class="field">
         <label>Tools &amp; Dependencies</label>
         <div id="st-tools" style="display:flex;flex-direction:column;gap:6px;align-items:stretch;max-width:340px"></div>
-        <div style="font-size:11px;color:var(--text-3);padding-top:4px">
-          yt-dlp needs frequent updates — YouTube keeps changing, so keeping it current prevents broken downloads. ffmpeg is used for merging and audio conversion.
-        </div>
       </div>
     </div>
     <div class="modal-foot">
       <button class="btn-ghost" data-close>Cancel</button>
-      <button class="btn-ghost" id="st-abort-shutdown" title="Abort a pending Windows shutdown (shutdown /a)">Abort shutdown</button>
+      <button class="btn-ghost" id="st-abort-shutdown">Abort shutdown</button>
       <button class="tbtn primary" id="st-save">Save</button>
     </div>
   </div>`,
@@ -390,7 +357,7 @@ export function openSettings() {
       const segVal = root.querySelector<HTMLSpanElement>("#st-segval")!;
       seg.addEventListener("input", () => {
         const v = Number(seg.value);
-        segVal.textContent = v === 0 ? "Auto (Recommended)" : `${v} connections`;
+        segVal.textContent = v === 0 ? "Auto (Recommended)" : String(v);
       });
 
       const ckPath = root.querySelector<HTMLInputElement>("#st-cookiepath")!;
@@ -400,7 +367,6 @@ export function openSettings() {
       };
       root.querySelector<HTMLButtonElement>("#st-cookieclear")!.onclick = () => (ckPath.value = "");
 
-      // Saved site logins: forget a login
       root.querySelectorAll<HTMLElement>("[data-cred-rm]").forEach((b) => {
         b.addEventListener("click", async () => {
           const host = b.dataset.credRm!;
@@ -411,7 +377,6 @@ export function openSettings() {
         });
       });
 
-      // Per-site proxy rules: working copy edited live, persisted on Save.
       type PxRule = { id: string; domain_pattern: string; proxy_url: string; enabled: boolean };
       let pxRules: PxRule[] = (s.per_site_proxies || []).map((r) => ({ ...r }));
       const pxBox = root.querySelector<HTMLElement>("#st-proxies")!;
@@ -462,7 +427,6 @@ export function openSettings() {
         renderPx();
       };
 
-      // Tools & Dependencies: status + update
       const toolsEl = root.querySelector<HTMLElement>("#st-tools")!;
       const renderTools = () => {
         const t = store.tools;
@@ -496,14 +460,12 @@ export function openSettings() {
           } catch (e) {
             toast("Update check failed: " + String(e), "err");
           } finally {
-            // Always re-render the tools block so the spinner can never get stuck.
             renderTools();
           }
         };
       };
       renderTools();
 
-      // Browser extension pairing key
       const keyInp = root.querySelector<HTMLInputElement>("#st-key")!;
       void api.getWsToken().then((t) => {
         keyInp.value = t;
@@ -565,12 +527,10 @@ export function openSettings() {
 }
 
 export function openGrabber(initialUrl = "", autoStart = false) {
-  // String-guard: the toolbar binds this as a click handler; never accept a DOM Event.
   if (typeof initialUrl !== "string") initialUrl = "";
   let items: GrabItem[] = [];
   let finding = false;
   let stopped = false;
-  // Shared with the onClose hook below (chip must die with the modal).
   let chip: HTMLElement | null = null;
 
   const kinds: Array<[string, string, boolean]> = [
@@ -638,10 +598,6 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-      // Minimize: hide the overlay so the download list below is visible and
-      // pausable/stoppable, keep all modal state alive in this closure, and
-      // show a floating chip to restore. The chip dies with the modal via the
-      // openModal onClose hook (covers X, Cancel and outside-click).
       let submitted = 0;
       let submitTotal = 0;
       const chipLabel = () => {
@@ -757,10 +713,6 @@ export function openGrabber(initialUrl = "", autoStart = false) {
         e.key === "Enter" && root.querySelector<HTMLButtonElement>("#gb-find")!.click(),
       );
 
-      // Bulk submit stays controllable: the modal does NOT auto-close, the
-      // buttons show live progress, and Cancel turns into Stop so a 50-file
-      // storm can be halted mid-flight (remaining items are skipped; use the
-      // toolbar Stop for downloads that already started).
       let submitting = false;
       let stopSubmit = false;
       const cancelBtn = root.querySelector<HTMLButtonElement>("#gb-cancel")!;
@@ -806,8 +758,6 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       };
       que.onclick = () => void submit(true);
       go.onclick = () => void submit(false);
-      // Replaces the plain closer bound above: while submitting, Cancel acts
-      // as Stop for the remaining queue.
       cancelBtn.onclick = () => {
         if (submitting) {
           stopSubmit = true;
@@ -820,8 +770,6 @@ export function openGrabber(initialUrl = "", autoStart = false) {
 
       setTimeout(() => urlInp.focus(), 50);
 
-      // Extension "Grab This Page": open the modal pre-filled AND start crawling
-      // automatically so the user doesn't have to click "Find files" again.
       if (initialUrl && autoStart) {
         setTimeout(() => {
           void startGrab();
@@ -829,7 +777,6 @@ export function openGrabber(initialUrl = "", autoStart = false) {
       }
     },
     () => {
-      // Modal truly gone (X / Cancel / outside-click): drop the minimize chip.
       chip?.remove();
       chip = null;
     },
@@ -839,16 +786,9 @@ export function openGrabber(initialUrl = "", autoStart = false) {
 }
 
 function escapeAttr(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return s.replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
-/** First-run welcome: tells a new user what happens automatically (tools),
- *  how to connect the browser, and how to start. Shown once (localStorage). */
 export function openWelcome(toolsMissing: boolean, onSettings: () => void) {
   let busy = false;
   const close = openModal(
@@ -980,7 +920,6 @@ export function openConfirmRemove(name: string, onYes: (deleteFile: boolean) => 
   return close;
 }
 
-/** IDM-style "file already exists" choice: Replace / Keep both / Cancel. */
 export function openConfirmExists(path: string, onChoice: (action: "replace" | "rename" | "cancel") => void) {
   const close = openModal(
     () => `
@@ -1046,18 +985,14 @@ export function openConfirmBulkRemove(count: number, onYes: (deleteFile: boolean
   return close;
 }
 
-/** IDM-style intercept: link clicked → Start Download / Download Later (paused) / Cancel. */
 export interface DownloadInfoOpts {
   title?: string;
   size?: number;
   category?: string;
   format?: string;
-  thumbnail?: string;
-  /** Pre-selected destination folder (e.g. picked in the YouTube modal). */
   saveDir?: string;
   isYtdl?: boolean;
-  /** Called after every terminal close (Cancel/Later/Start/morph) — the
-   *  standalone dialog window uses it to close itself. */
+  thumbnail?: string;
   onDone?: () => void;
   ytdl?: {
     format_id: string;
@@ -1067,7 +1002,6 @@ export interface DownloadInfoOpts {
     sub_langs?: string;
     embed_thumbnail?: boolean;
     auto_subs?: boolean;
-    thumbnail?: string;
   };
 }
 
@@ -1080,7 +1014,6 @@ const INFO_CATS = [
   { id: "other", label: "Other" },
 ];
 
-/** Guess a category id from a filename (mirrors backend category_of). */
 function catOfExt(name: string): string {
   const ext = (name.split(".").pop() || "").toLowerCase().split(/[^a-z0-9]/)[0];
   const map: Record<string, string[]> = {
@@ -1094,23 +1027,19 @@ function catOfExt(name: string): string {
   return "other";
 }
 
-/** IDM-style "Download File Info" pre-download confirmation dialog. */
+/** IDM-style "Download File Info" pre-download confirmation dialog (with Quick Folder Chips). */
 export function openIntercept(url: string, filename?: string, referer?: string, cookies?: string, opts?: DownloadInfoOpts) {
   const o = opts || {};
-  // Standalone dialog window? Then this modal owns the window: custom
-  // minimize/close + drag region, and onDone closes the window itself.
   let isDlg = false;
   try {
     isDlg = getCurrentWindow().label === "download-info";
   } catch {
     isDlg = false;
   }
-  // YouTube jobs: force Video (or Audio) + MP4/MP3 badge — never "Other".
+
   const ytAudio = !!o.isYtdl && !!o.ytdl && /^(ba-|bestaudio)/.test(o.ytdl.format_id);
   const isYtUrl = /^(https?:\/\/)?(www\.|m\.)?(youtube\.com|youtu\.be)\//i.test(url);
   const rawFile = filename || url.split("/").pop() || url;
-  // A raw query string ("watch?v=…") is not a filename: leave the input
-  // empty (backend resolves the real name) with a clean placeholder.
   const queryish = !rawFile || /[?&=]/.test(rawFile) || !rawFile.includes(".");
   const file = queryish ? "" : rawFile;
   const name = o.title || (!queryish ? rawFile : "") || (o.isYtdl || isYtUrl ? "YouTube video" : url);
@@ -1118,6 +1047,14 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
   const fmt = o.isYtdl || isYtUrl ? (ytAudio ? "MP3" : "MP4") : (o.format || (rawFile.split(".").pop() || "").split(/[^a-z0-9]/i)[0] || "file").toUpperCase().slice(0, 8);
   const remembered = store.settings?.category_paths?.[cat0];
   const saveTo = o.saveDir || remembered || store.settings?.path || "";
+
+  // Right-side badge: displays real high-res poster if available, or clean format badge
+  const thumbImg = o.thumbnail
+    ? `<img src="${escapeAttr(o.thumbnail)}" style="width:100%;height:84px;object-fit:cover;border-radius:10px;border:1px solid rgba(255,255,255,0.15);box-shadow:0 4px 12px rgba(0,0,0,0.5)" alt="Preview" />`
+    : `<div style="border-radius:12px;padding:14px 8px;text-align:center;background:linear-gradient(135deg,var(--acc-1),var(--acc-2));color:#04121f;font-weight:800;font-size:22px;letter-spacing:1px">${escapeAttr(fmt)}</div>`;
+
+  const defaultBasePath = store.settings?.path || "";
+
   const close = openModal(
     () => `
   <div class="modal" style="width:600px">
@@ -1151,16 +1088,30 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
               <input class="input ext" id="ic-path" value="${escapeAttr(saveTo)}" spellcheck="false" title="Destination folder" />
               <button class="tbtn" id="ic-browse" title="Browse">${icon("folder", 15)}</button>
             </div>
+
+            <!-- Quick Folder Chips: 1-click destination switch like IDM Pro -->
+            <div class="quick-chips" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+              <button type="button" class="btn-chip" data-chip="downloads" title="Default Downloads Folder" style="padding:3px 8px;font-size:11px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:var(--text-2);cursor:pointer">📂 Downloads</button>
+              <button type="button" class="btn-chip" data-chip="videos" title="Videos Folder" style="padding:3px 8px;font-size:11px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:var(--text-2);cursor:pointer">🎬 Videos</button>
+              <button type="button" class="btn-chip" data-chip="courses" title="Courses Folder" style="padding:3px 8px;font-size:11px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:var(--text-2);cursor:pointer">📚 Courses</button>
+              <button type="button" class="btn-chip" data-chip="music" title="Music Folder" style="padding:3px 8px;font-size:11px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:var(--text-2);cursor:pointer">🎵 Music</button>
+            </div>
+
             <input class="input ext" id="ic-file" value="${escapeAttr(file)}" placeholder="YouTube Video (Auto-named on download)" spellcheck="false" title="File name" style="margin-top:6px" ${o.isYtdl ? "disabled" : ""} />
             <div id="ic-dupnote" style="display:none;font-size:11px;color:var(--warn,#fbbf24)"></div>
             ${o.isYtdl ? `<div style="font-size:11px;color:var(--text-3)">YouTube names the file from the video title.</div>` : ""}
           </div>
-          <label style="display:flex;gap:9px;align-items:center;font-size:12px;color:var(--text-2);cursor:pointer">
-            <input type="checkbox" id="ic-remember" /> Remember this path for this category
-          </label>
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+            <label style="display:flex;gap:7px;align-items:center;font-size:12px;color:var(--text-2);cursor:pointer">
+              <input type="checkbox" id="ic-remember" /> Remember path for this category
+            </label>
+            <label style="display:flex;gap:7px;align-items:center;font-size:12px;color:var(--text-2);cursor:pointer">
+              <input type="checkbox" id="ic-openwhenready" /> Open file when finished
+            </label>
+          </div>
         </div>
         <div style="display:flex;flex-direction:column;gap:8px;align-items:stretch">
-          <div style="border-radius:12px;padding:14px 8px;text-align:center;background:linear-gradient(135deg,var(--acc-1),var(--acc-2));color:#04121f;font-weight:800;font-size:22px;letter-spacing:1px">${escapeAttr(fmt)}</div>
+          ${thumbImg}
           <div style="text-align:center;font-size:12px;color:var(--text-2);font-family:var(--mono)" id="ic-size">${typeof o.size === "number" && o.size > 0 ? formatBytes(o.size) : "Calculating…"}</div>
           <div style="font-size:13px;color:var(--text-1);word-break:break-all;text-align:center">${escapeAttr(name)}</div>
         </div>
@@ -1174,7 +1125,21 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
   </div>`,
     (root, close) => {
       root.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = close));
-      // Standalone dialog window controls (embedded mode keeps ✕ only).
+
+      // IDM Power Shortcut: Enter key starts download immediately, Esc cancels
+      root.addEventListener("keydown", (e) => {
+        const target = e.target as HTMLElement;
+        if (e.key === "Enter" && target?.tagName !== "TEXTAREA" && target?.tagName !== "BUTTON") {
+          e.preventDefault();
+          root.querySelector<HTMLButtonElement>("#ic-start")?.click();
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          close();
+          o.onDone?.();
+        }
+      });
+
       const minBtn = root.querySelector<HTMLButtonElement>("#btn-info-minimize");
       if (minBtn)
         minBtn.onclick = () => {
@@ -1188,17 +1153,36 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           close();
           o.onDone?.();
         };
+
+      const pathInput = root.querySelector<HTMLInputElement>("#ic-path")!;
+
+      // Quick Folder Chips functionality
+      root.querySelectorAll<HTMLButtonElement>(".btn-chip").forEach((chip) => {
+        chip.onclick = () => {
+          const type = chip.dataset.chip;
+          if (type === "downloads") {
+            pathInput.value = defaultBasePath;
+          } else if (type === "videos") {
+            pathInput.value = defaultBasePath ? `${defaultBasePath}/Videos` : "Videos";
+          } else if (type === "courses") {
+            pathInput.value = defaultBasePath ? `${defaultBasePath}/Courses` : "Courses";
+          } else if (type === "music") {
+            pathInput.value = defaultBasePath ? `${defaultBasePath}/Audio` : "Audio";
+          }
+        };
+      });
+
       root.querySelector<HTMLButtonElement>("#ic-browse")!.onclick = async () => {
         const p = await api.chooseFolder();
-        if (p) root.querySelector<HTMLInputElement>("#ic-path")!.value = p;
+        if (p) pathInput.value = p;
       };
-      // Category switch re-resolves the save folder (remembered > default).
+
       root.querySelector<HTMLSelectElement>("#ic-cat")!.onchange = () => {
         const cat = root.querySelector<HTMLSelectElement>("#ic-cat")!.value;
         const remembered = store.settings?.category_paths?.[cat];
-        root.querySelector<HTMLInputElement>("#ic-path")!.value = remembered || store.settings?.path || "";
+        pathInput.value = remembered || store.settings?.path || "";
       };
-      // Fill in real size for plain HTTP(S) links (YouTube passes its own).
+
       if (!o.isYtdl && (typeof o.size !== "number" || o.size <= 0)) {
         void api
           .probeDownloadInfo(url)
@@ -1212,9 +1196,7 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
             if (el) el.textContent = "Unknown";
           });
       }
-      // YouTube duplicate note (informational only): yt-dlp auto-renames on
-      // collision ("Name (1).ext"), so it can never silently overwrite —
-      // but the user should still see it coming.
+
       if (o.isYtdl && o.title) {
         const ext = fmt === "MP3" ? "mp3" : "mp4";
         void api
@@ -1230,10 +1212,11 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           })
           .catch(() => {});
       }
+
       const rememberPath = () => {
         if (!root.querySelector<HTMLInputElement>("#ic-remember")!.checked) return;
         const cat = root.querySelector<HTMLSelectElement>("#ic-cat")!.value;
-        const dir = root.querySelector<HTMLInputElement>("#ic-path")!.value.trim();
+        const dir = pathInput.value.trim();
         if (!store.settings || !dir) return;
         const next = {
           ...store.settings,
@@ -1242,17 +1225,16 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
         store.settings = next;
         void api.saveSettings(next).catch((e) => console.error("[remember path]", e));
       };
+
       const go = async (later: boolean) => {
-        const savePath = root.querySelector<HTMLInputElement>("#ic-path")!.value.trim() || store.settings?.path || "";
+        const savePath = pathInput.value.trim() || store.settings?.path || "";
         const segs = store.settings?.segments ?? 16;
+        const autoOpen = root.querySelector<HTMLInputElement>("#ic-openwhenready")?.checked;
         rememberPath();
-        // YouTube branch: yt-dlp names the file itself (filename input is
-        // display-only there); start_paused queues for Download Later.
-        // IDM parity: same file downloaded again must warn (Replace / Keep Both / Cancel) — never silently double.
+
         if (o.isYtdl && o.ytdl) {
           const y = o.ytdl;
           let ytdlAllowDup = false;
-          // Pre-check: does the final file (or playlist folder) already exist on disk?
           if (!later && o.title) {
             try {
               const ext = /^(ba-|bestaudio)/.test(y.format_id) ? "mp3" : "mp4";
@@ -1274,7 +1256,7 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
             dl = await api.startYtdl(
               url, y.format_id, savePath, y.playlist, y.playlist_items, undefined,
               y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs,
-              referer, undefined, cookies, later, ytdlAllowDup, o.thumbnail || y.thumbnail,
+              referer, undefined, cookies, later, ytdlAllowDup, o.thumbnail,
             );
           } catch (e: unknown) {
             const m = String(e).match(/^EXISTS::([\s\S]*)$/);
@@ -1285,7 +1267,7 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
                 try { await api.deleteFileAt(m[1].split(" (already")[0].trim()); } catch {}
               }
               try {
-                dl = await api.startYtdl(url, y.format_id, savePath, y.playlist, y.playlist_items, undefined, y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs, referer, undefined, cookies, later, choice === "rename", o.thumbnail || y.thumbnail);
+                dl = await api.startYtdl(url, y.format_id, savePath, y.playlist, y.playlist_items, undefined, y.embed_subs, y.sub_langs, y.embed_thumbnail, y.auto_subs, referer, undefined, cookies, later, choice === "rename", o.thumbnail);
               } catch (e2: unknown) {
                 toast(String(e2), "err");
                 return;
@@ -1304,13 +1286,10 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
             close();
             return;
           }
-          morphLive(dl.id);
+          morphLive(dl.id, autoOpen);
           return;
         }
-        // start_paused = true queues as Paused (Download Later).
-        // NOTE: filename comes from the input only — never the raw URL
-        // (a "watch?v=…" string must not become a file name).
-        // The duplicate prompt fires for Later too (checked at queue time).
+
         const fileArg = () => root.querySelector<HTMLInputElement>("#ic-file")!.value.trim() || undefined;
         const start = (mode?: string) => api.startDownload(url, savePath, segs, fileArg(), undefined, later, mode ?? "prompt", referer, cookies);
         let dl: Awaited<ReturnType<typeof api.startDownload>> | null = null;
@@ -1325,7 +1304,7 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           const choice: "replace" | "rename" | "cancel" = await new Promise((res) => openConfirmExists(m[1], res));
           if (choice === "cancel") return;
           try {
-            dl = await api.startDownload(url, savePath, segs, fileArg(), undefined, later, choice === "replace" ? "replace" : undefined, referer, cookies);
+            dl = await start(choice === "replace" ? "replace" : undefined);
           } catch (e2: unknown) {
             toast(String(e2), "err");
             return;
@@ -1340,10 +1319,10 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           close();
           return;
         }
-        // IDM-style: morph into live progress dialog (Pause/Cancel + Minimize to app)
-        morphLive(dl.id);
-      }
-      function morphLive(id: string) {
+        morphLive(dl.id, autoOpen);
+      };
+
+      function morphLive(id: string, autoOpen?: boolean) {
         const body = root.querySelector<HTMLElement>(".modal-body")!;
         const foot = root.querySelector<HTMLElement>(".modal-foot")!;
         body.innerHTML = `
@@ -1379,13 +1358,20 @@ export function openIntercept(url: string, filename?: string, referer?: string, 
           if (pctEl) pctEl.textContent = `${(d.progress || 0).toFixed(1)}% • ${formatBytes(d.downloaded)} / ${formatBytes(d.total_size || d.downloaded)}`;
           if (spEl) spEl.textContent = d.speed ? `${formatBytes(d.speed)}/s` : "–";
           if (etaEl) etaEl.textContent = d.eta ? `ETA ${Math.floor(d.eta / 60)}m ${d.eta % 60}s` : "";
-          if (d.status === "completed") { toast("Download completed", "ok"); setTimeout(close, 900); unsub(); }
+          if (d.status === "completed") {
+            toast("Download completed", "ok");
+            if (autoOpen && d.save_path) {
+              void api.openSavedFile(d.save_path).catch(() => {});
+            }
+            setTimeout(close, 900);
+            unsub();
+          }
           if (d.status === "error" || d.status === "cancelled") { unsub(); }
         });
-        // Also handle YouTube the same way — ytdlp tasks emit same store events
       }
       root.querySelector<HTMLButtonElement>("#ic-start")!.onclick = () => void go(false);
       root.querySelector<HTMLButtonElement>("#ic-later")!.onclick = () => void go(true);
+      setTimeout(() => root.querySelector<HTMLButtonElement>("#ic-start")?.focus(), 60);
     },
     () => o.onDone?.(),
   );
@@ -1398,7 +1384,6 @@ function toLocalInput(ms: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** Login prompt shown when a download hits HTTP 401/407. */
 export function openAuthDialog(p: { id: string; url: string; host: string }) {
   const close = openModal(
     () => `

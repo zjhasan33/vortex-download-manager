@@ -42,7 +42,7 @@ fn set_autostart(enabled: bool) {
                     &quoted,
                     "/f",
                 ])
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .creation_flags(0x08000000)
                 .spawn();
         } else {
             let _ = std::process::Command::new("reg")
@@ -95,14 +95,12 @@ struct CapturePayload {
 
 fn youtube_id(url: &str) -> Option<String> {
     let lower = url.to_ascii_lowercase();
-    // youtu.be/<id>
     if let Some(p) = lower.find("youtu.be/") {
         let id = url[p + 9..].split(['?', '&', '#', '/']).next().unwrap_or("").trim().to_string();
         if id.len() >= 6 {
             return Some(id);
         }
     }
-    // youtube.com/watch?v=<id> or &v=<id>
     for key in ["?v=", "&v="] {
         if let Some(p) = lower.find(key) {
             let id = url[p + key.len()..].split(['?', '&', '#', '/']).next().unwrap_or("").trim().to_string();
@@ -111,7 +109,6 @@ fn youtube_id(url: &str) -> Option<String> {
             }
         }
     }
-    // youtube.com/embed/<id> or /v/<id> or /shorts/<id>
     for tag in ["/embed/", "/v/", "/shorts/"] {
         if let Some(p) = lower.find(tag) {
             let id = url[p + tag.len()..].split(['?', '&', '#', '/']).next().unwrap_or("").trim().to_string();
@@ -255,8 +252,6 @@ async fn start_download(
     referer: Option<String>,
     cookies: Option<String>,
 ) -> Result<download::DlView, String> {
-    // IDM parity: same file already queued/downloading → warn instead of silent duplicate.
-    // Covers the "0 B still downloading" case (file not on disk yet) and YouTube ID variants (youtu.be vs watch?v=).
     let views = state.views();
     let dup = views.iter().find(|v| {
         if matches!(v.status, download::DlStatus::Completed | download::DlStatus::Cancelled) {
@@ -275,6 +270,10 @@ async fn start_download(
         }
         false
     });
+
+    // Warn on list match regardless of disk state: in-flight tasks have no
+    // final file yet, and Completed tasks are already excluded above — so a
+    // manually-deleted file re-downloads freely while active duplicates warn.
     if on_exists.as_deref() == Some("prompt") {
         if let Some(dup) = dup {
             return Err(format!("EXISTS::{} (already in list: {:?})", dup.save_path, dup.status));
@@ -285,6 +284,7 @@ async fn start_download(
             return Err(format!("EXISTS::{} (already in list: {:?})", d.save_path, d.status));
         }
     }
+
     let settings = state::load_settings(&app);
     let opts = download::StartOpts {
         segments,
@@ -298,8 +298,6 @@ async fn start_download(
         on_exists,
     };
     let task = download::start(app.clone(), url, save_path, opts, state.limit.clone()).await?;
-    // Add in "Paused" state (Grabber "Start immediately" OFF) so the batch
-    // doesn't flood bandwidth at once; the user resumes individually/from toolbar.
     if start_paused.unwrap_or(false) {
         task.paused.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -311,7 +309,6 @@ async fn start_download(
 
 #[tauri::command]
 async fn pause_download(_app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
-    // Scoped lookups: std Mutex guards must not live across awaits (not Send).
     let ht = state.http.lock().unwrap().get(&id).cloned();
     if let Some(t) = ht {
         t.paused.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -325,8 +322,6 @@ async fn pause_download(_app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
     Ok(())
 }
 
-/// Supply login credentials for downloads that hit HTTP 401/407.
-/// `remember` saves the login for this host so future downloads auto-authenticate.
 #[tauri::command]
 async fn set_auth(
     app: tauri::AppHandle,
@@ -352,7 +347,6 @@ async fn set_auth(
     Ok(state.apply_credentials(&id, cred, remember, &app))
 }
 
-/// Forget a saved site login.
 #[tauri::command]
 async fn remove_credential(
     state: State<'_, Arc<DlManager>>,
@@ -367,7 +361,6 @@ async fn remove_credential(
 async fn resume_download(_app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
     let m = state.http.lock().unwrap();
     if let Some(t) = m.get(&id) {
-        // Never double-run an already live task (two loops would corrupt).
         let st = *t.status.read().unwrap();
         if matches!(
             st,
@@ -375,8 +368,6 @@ async fn resume_download(_app: tauri::AppHandle, state: State<'_, Arc<DlManager>
         ) {
             return Ok(());
         }
-        // Clear BOTH flags so resume works after pause AND after cancel/error:
-        // part files were kept, so the task continues from partial bytes.
         t.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         t.paused.store(false, std::sync::atomic::Ordering::Relaxed);
         *t.error.lock().unwrap() = None;
@@ -385,11 +376,8 @@ async fn resume_download(_app: tauri::AppHandle, state: State<'_, Arc<DlManager>
         drop(m);
         state.run_http(c);
     }
-    // youtube tasks are process-bound; resuming restarts via the HTTP path only
     let yt = state.yt.lock().unwrap().get(&id).cloned();
     if let Some(t) = yt {
-        // Launch paused/queued yt tasks (Download Later). Never double-run a
-        // live one — same status guard as the HTTP branch above.
         let st = *t.status.read().unwrap();
         if matches!(
             st,
@@ -420,8 +408,6 @@ async fn resume_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlMana
     Ok(n)
 }
 
-/// Emergency "Stop & Cancel All": instantly halts + removes every active and
-/// queued task (grabber batches, multi-downloads) to wipe a bandwidth storm.
 #[tauri::command]
 async fn cancel_all_active(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>) -> Result<usize, String> {
     let n = state.cancel_all_active();
@@ -429,7 +415,6 @@ async fn cancel_all_active(app: tauri::AppHandle, state: State<'_, Arc<DlManager
     Ok(n)
 }
 
-/// Pause every active (downloading/merging/queued) HTTP + youtube task.
 async fn pause_all_inner(app: &tauri::AppHandle, mgr: Arc<DlManager>) -> usize {
     let ids: Vec<String> = mgr
         .views()
@@ -459,10 +444,6 @@ async fn pause_all_downloads(app: tauri::AppHandle, state: State<'_, Arc<DlManag
 
 #[tauri::command]
 async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>, id: String) -> Result<(), String> {
-    // Cancel: stop download but keep entry + part files so Resume continues
-    // from partial bytes. Idle (paused/queued) tasks flip to Cancelled right
-    // away; running ones transition via their run loop.
-    // (Scoped clones: std Mutex guards must not live across awaits.)
     enum Target {
         Http(Arc<crate::download::Task>),
         Yt(Arc<crate::ytdlp::YtTask>),
@@ -500,7 +481,6 @@ async fn cancel_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
     Ok(())
 }
 
-/// Abort a pending Vortex-scheduled shutdown (`shutdown /s /t 60` grace window).
 #[tauri::command]
 async fn cancel_shutdown(app: tauri::AppHandle) -> Result<(), String> {
     let out = crate::tools::silent(std::process::Command::new("shutdown"))
@@ -522,8 +502,6 @@ async fn remove_download(app: tauri::AppHandle, state: State<'_, Arc<DlManager>>
     Ok(())
 }
 
-/// Apply a bulk action to a set of task ids. `action` is one of
-/// "pause" | "resume" | "retry" | "remove". Returns how many were affected.
 #[tauri::command]
 async fn downloads_action(
     app: tauri::AppHandle,
@@ -549,12 +527,8 @@ async fn downloads_action(
     Ok(n)
 }
 
-/// Lightweight pre-download probe for the "Download File Info" dialog:
-/// filename + size + category without starting anything. Never fails hard —
-/// unknown size/filename just comes back empty for the dialog to display.
 #[tauri::command]
 async fn probe_download_info(url: String) -> Result<serde_json::Value, String> {
-    // FTP files: answer from SIZE/filename without any HTTP machinery.
     if crate::ftp::is_ftp_url(&url) {
         let filename = crate::ftp::filename_of(&url);
         let size = crate::ftp::probe(&url).await.ok().and_then(|i| i.size).unwrap_or(0);
@@ -570,8 +544,6 @@ async fn probe_download_info(url: String) -> Result<serde_json::Value, String> {
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Vortex/1.1")
         .build()
         .map_err(|e| e.to_string())?;
-    // Range 0-0: many servers answer 206 with the total; plain HEAD is often
-    // ignored. Failures just mean "Unknown" in the dialog, not an error.
     let (filename, size) = match client
         .get(&url)
         .header(reqwest::header::RANGE, "bytes=0-0")
@@ -592,7 +564,6 @@ async fn probe_download_info(url: String) -> Result<serde_json::Value, String> {
             (fallback, 0)
         }
     };
-    // Refuse absurd sizes here too (same 1 TiB guard as the download path).
     let size = if size > (1 << 40) { 0 } else { size };
     Ok(serde_json::json!({
         "filename": filename,
@@ -601,9 +572,6 @@ async fn probe_download_info(url: String) -> Result<serde_json::Value, String> {
     }))
 }
 
-/// One-shot handoff for the standalone "Download File Info" dialog window:
-/// the opener stores the payload, the dialog takes it at boot (race-free,
-/// no event-timing dependency).
 #[tauri::command]
 async fn take_dialog_payload(
     state: State<'_, std::sync::Mutex<Option<serde_json::Value>>>,
@@ -611,9 +579,6 @@ async fn take_dialog_payload(
     Ok(state.lock().unwrap_or_else(|e| e.into_inner()).take())
 }
 
-/// Best-effort duplicate warning for YouTube jobs: guess the final output
-/// path the same way the completion step does (yt-dlp auto-renames on real
-/// collisions, so this is informational, never a gate).
 #[tauri::command]
 async fn ytdl_expected_path(
     dir: String,
@@ -683,7 +648,6 @@ async fn auto_organize(state: State<'_, Arc<DlManager>>, path: String) -> Result
     if !p.is_file() {
         return Err("File not found".into());
     }
-    // URL hint — strong signal for Courses/Software routing, looked up from history/views.
     let url = state
         .views()
         .iter()
@@ -695,13 +659,12 @@ async fn auto_organize(state: State<'_, Arc<DlManager>>, path: String) -> Result
     Ok(res.map(|q| q.display().to_string()))
 }
 
-/// Open (or focus) the standalone "Download File Info" dialog window with a
-/// stored payload. The main dashboard is never raised for these prompts.
+/// Open the standalone "Download File Info" dialog window (IDM-style native
+/// prompt: pops in front with focus, never auto-minimizes on blur).
 fn open_info_window(app: &tauri::AppHandle, payload: serde_json::Value) {
     if let Some(pending) = app.try_state::<std::sync::Mutex<Option<serde_json::Value>>>() {
         *pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(payload.clone());
     }
-    // A dialog is already open: nudge it with the new job (it stacks a modal).
     if app.get_webview_window("download-info").is_some() {
         let _ = app.emit_to("download-info", "dialog-update", &payload);
         return;
@@ -712,24 +675,23 @@ fn open_info_window(app: &tauri::AppHandle, payload: serde_json::Value) {
         tauri::WebviewUrl::App("index.html#/download-info".into()),
     )
     .title("Download File Info")
-    .inner_size(540.0, 390.0)
-    .min_inner_size(540.0, 380.0)
+    .inner_size(540.0, 420.0)
+    .min_inner_size(540.0, 390.0)
     .decorations(false)
     .transparent(false)
-    .always_on_top(true)
+    .always_on_top(false) // Natural stacking
     .center()
     .build()
     {
         Ok(w) => w,
         Err(_) => return,
     };
+
     let _ = win.show();
     let _ = win.set_focus();
 }
 
-/// Delete every `*.vtx.part` file that belongs to the given final file.
 fn remove_one(_app: &tauri::AppHandle, state: &Arc<DlManager>, id: &str, delete_file: bool) {
-    // Final-file + part-file cleanup both live inside remove_with_file now.
     state.remove_with_file(id, delete_file);
 }
 
@@ -765,7 +727,6 @@ async fn grab_site(
     max_pages: Option<usize>,
     kinds: Option<Vec<String>>,
 ) -> Result<Vec<grabber::GrabItem>, String> {
-    // Each grab starts with a fresh cancel flag (the Stop button flips it).
     let cancel = state.inner().grab_cancel.clone();
     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
     grabber::grab_site(
@@ -777,7 +738,6 @@ async fn grab_site(
     .await
 }
 
-/// Abort the in-progress Site Grabber crawl.
 #[tauri::command]
 async fn grab_stop(state: State<'_, Arc<DlManager>>) -> Result<(), String> {
     state.inner().grab_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -805,93 +765,79 @@ async fn start_ytdl(
     allow_dup: Option<bool>,
     thumbnail: Option<String>,
 ) -> Result<download::DlView, String> {
-    // Same video already in list → warn (covers 0% + youtu.be vs watch?v= ID variants).
-    // In-flight guard: rapid double-click before the first task is visible in views().
-    // Keep Both (allow_dup) bypasses all duplicate gates by design.
     let is_audio_new = format_id.starts_with("ba-") || format_id.starts_with("bestaudio");
     let allow = allow_dup == Some(true);
-    use std::collections::HashSet;
-    use std::sync::{LazyLock, Mutex};
-    static PENDING_YTDL: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-    let pending_key: Option<String> = if !allow {
-        youtube_id(&url).map(|id| format!("{}:{}", id.to_ascii_lowercase(), format_id))
-    } else {
-        None
-    };
-    let clear_pending = |pending_key: &Option<String>| {
-        if let Some(k) = pending_key {
-            PENDING_YTDL.lock().unwrap().remove(k);
-        }
-    };
-    if let Some(key) = pending_key.clone() {
+    if !allow {
         {
-            let mut pending = PENDING_YTDL.lock().unwrap();
-            if pending.contains(&key) {
-                return Err(format!("EXISTS::pending:{key} (already starting)"));
+            use std::collections::HashSet;
+            use std::sync::{LazyLock, Mutex};
+            static PENDING_YTDL: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+            if let Some(id) = youtube_id(&url) {
+                let key = format!("{}:{}", id.to_ascii_lowercase(), format_id);
+                let mut pending = PENDING_YTDL.lock().unwrap();
+                if pending.contains(&key) {
+                    return Err(format!("EXISTS::pending:{key} (already starting)"));
+                }
+                pending.insert(key.clone());
+                let key2 = key.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    PENDING_YTDL.lock().unwrap().remove(&key2);
+                });
             }
-            pending.insert(key.clone());
         }
-        // Auto-clear after 15s so a failed start doesn't block forever.
-        let key2 = key.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            PENDING_YTDL.lock().unwrap().remove(&key2);
-        });
-    }
-    let views = state.views();
-    if let Some(dup) = views.iter().find(|v| {
-        if matches!(v.status, download::DlStatus::Completed | download::DlStatus::Cancelled) {
-            return false;
-        }
-        // Same exact URL → always duplicate.
-        if v.url == url {
-            return true;
-        }
-        // Same YouTube ID but different format (MP4 vs MP3) is NOT duplicate — allow it.
-        if let (Some(a), Some(b)) = (youtube_id(&v.url), youtube_id(&url)) {
-            if !a.eq_ignore_ascii_case(&b) {
+        let views = state.views();
+        // Warn on list match regardless of disk state: in-flight tasks have no
+        // final file yet, and Completed tasks are already excluded above — so a
+        // manually-deleted file re-downloads freely while active duplicates warn.
+        if let Some(dup) = views.iter().find(|v| {
+            if matches!(v.status, download::DlStatus::Completed | download::DlStatus::Cancelled) {
                 return false;
             }
-            // Same video ID: only block if exact same format/extension (MP4 vs MP3, 720p vs 1080p are different).
-            let dup_fmt = v.format_id.as_deref().unwrap_or("");
-            return dup_fmt == format_id;
+            if v.url == url {
+                return true;
+            }
+            if let (Some(a), Some(b)) = (youtube_id(&v.url), youtube_id(&url)) {
+                if !a.eq_ignore_ascii_case(&b) {
+                    return false;
+                }
+                let dup_fmt = v.format_id.as_deref().unwrap_or("");
+                return dup_fmt == format_id;
+            }
+            false
+        }) {
+            return Err(format!("EXISTS::{} (already in list: {:?})", dup.save_path, dup.status));
         }
-        false
-    }) {
-        clear_pending(&pending_key);
-        return Err(format!("EXISTS::{} (already in list: {:?})", dup.save_path, dup.status));
-    }
-    // Already on disk (even if list says Completed) → warn like IDM, but only for exact same format/extension.
-    // Different format (MP4 vs MP3, 720p vs 1080p) is a different file — don't warn.
-    if let Some(id) = youtube_id(&url) {
-        let has_same_format = views.iter().any(|v| {
-            youtube_id(&v.url).map(|id2| id2.eq_ignore_ascii_case(&id)).unwrap_or(false)
-                && v.format_id.as_deref().unwrap_or("") == format_id
-        });
-        // Only check disk if same format already exists in history; otherwise different format → allow.
-        if has_same_format {
-            let expect_ext = if is_audio_new { "mp3" } else { "mp4" };
-            let base = std::path::PathBuf::from(save_path.trim());
-            let eff = crate::state::save_dir_for(&base, &format!("[{id}].{expect_ext}"), true);
-            let mut stack = vec![eff.clone(), base.clone()];
-            let mut seen = std::collections::HashSet::new();
-            while let Some(dir) = stack.pop() {
-                if !seen.insert(dir.clone()) { continue; }
-                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        stack.push(p);
-                        continue;
-                    }
-                    let name = e.file_name().to_string_lossy().to_string();
-                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-                    if ext != expect_ext {
-                        continue;
-                    }
-                    if name.contains(&format!("[{id}]")) || name.contains(&id) {
-                        clear_pending(&pending_key);
-                        return Err(format!("EXISTS::{} (already on disk)", p.display()));
+
+        if let Some(id) = youtube_id(&url) {
+            let has_same_format = views.iter().any(|v| {
+                youtube_id(&v.url).map(|id2| id2.eq_ignore_ascii_case(&id)).unwrap_or(false)
+                    && v.format_id.as_deref().unwrap_or("") == format_id
+            });
+            if has_same_format {
+                let expect_ext = if is_audio_new { "mp3" } else { "mp4" };
+                let base = std::path::PathBuf::from(save_path.trim());
+                let eff = crate::state::save_dir_for(&base, &format!("[{id}].{expect_ext}"), true);
+                let mut stack = vec![eff.clone(), base.clone()];
+                let mut seen = std::collections::HashSet::new();
+                while let Some(dir) = stack.pop() {
+                    if !seen.insert(dir.clone()) { continue; }
+                    let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        if p.is_dir() {
+                            stack.push(p);
+                            continue;
+                        }
+                        let name = e.file_name().to_string_lossy().to_string();
+                        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                        if ext != expect_ext {
+                            continue;
+                        }
+                        // Only error if the file actually exists on disk!
+                        if (name.contains(&format!("[{id}]")) || name.contains(&id)) && p.is_file() {
+                            return Err(format!("EXISTS::{} (already on disk)", p.display()));
+                        }
                     }
                 }
             }
@@ -915,11 +861,8 @@ async fn start_ytdl(
         ytdlp::StreamCtx { referer, user_agent, cookies },
         thumbnail,
     )
-    .await;
-    clear_pending(&pending_key);
-    let task = task?;
+    .await?;
     let id = task.id.clone();
-    // "Download Later": register paused, launch on resume (resume_download).
     if start_paused.unwrap_or(false) {
         *task.status.write().unwrap() = crate::download::DlStatus::Paused;
         state.add_yt(task);
@@ -942,9 +885,6 @@ async fn get_tools_status(app: tauri::AppHandle) -> serde_json::Value {
     })
 }
 
-/// Check for yt-dlp updates (fast; self-updater with a 15s cap). ffmpeg is a
-/// ~111MB download that rarely changes, so it is only re-fetched when it is
-/// entirely missing or `force_ffmpeg` is explicitly set.
 #[tauri::command]
 async fn update_tools(app: tauri::AppHandle, force_ffmpeg: bool) -> serde_json::Value {
     let y_old = tools::ytdlp_version(&app);
@@ -953,7 +893,6 @@ async fn update_tools(app: tauri::AppHandle, force_ffmpeg: bool) -> serde_json::
     let mut timed_out = false;
     let mut msgs: Vec<String> = Vec::new();
 
-    // 1) yt-dlp self-update (the only thing that changes frequently).
     match tools::update_ytdlp(&app).await {
         Ok(()) => {
             let v = tools::ytdlp_version(&app);
@@ -978,7 +917,6 @@ async fn update_tools(app: tauri::AppHandle, force_ffmpeg: bool) -> serde_json::
         }
     }
 
-    // 2) ffmpeg: skip unless missing or explicitly forced.
     if force_ffmpeg || f_old.is_none() {
         match tools::update_ffmpeg(&app).await {
             Ok(()) => {
@@ -1042,7 +980,6 @@ async fn choose_folder(app: tauri::AppHandle) -> Result<Option<String>, String> 
     Ok(picked.map(|p| p.to_string()))
 }
 
-/// Pick a Netscape-format cookies.txt file for yt-dlp.
 #[tauri::command]
 async fn choose_cookies_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let picked = tauri::async_runtime::spawn_blocking(move || {
@@ -1073,7 +1010,6 @@ async fn open_saved_file(path: String) -> Result<(), String> {
     state::open_file(path)
 }
 
-/// Batch import: pick a .txt file and read its URLs (one per line).
 #[tauri::command]
 async fn read_urls(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let picked = tauri::async_runtime::spawn_blocking(move || {
@@ -1101,14 +1037,6 @@ async fn read_urls(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 #[tauri::command]
 fn get_ws_token(app: tauri::AppHandle) -> String {
     ws_server::ws_token(&app)
-}
-
-#[tauri::command]
-fn close_dropbox(app: tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("dropbox") {
-        let _ = w.close();
-        let _ = w.destroy();
-    }
 }
 
 #[tauri::command]
@@ -1147,8 +1075,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        // Second launch focuses the running window instead of starting a
-        // ghost instance whose downloads would be invisible (empty list).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let show = |w: tauri::WebviewWindow| {
                 let _ = w.show();
@@ -1163,8 +1089,6 @@ pub fn run() {
             }
         }))
         .manage(Arc::new(DlManager::new()))
-        // Pending payload for the standalone "Download File Info" dialog
-        // window (taken once at boot via take_dialog_payload — race-free).
         .manage(std::sync::Mutex::new(None::<serde_json::Value>))
         .setup(|app| {
             let handle = app.handle();
@@ -1177,14 +1101,12 @@ pub fn run() {
             }
             register_vortex_protocol();
 
-            // Restore persisted session (terminal -> history, unfinished -> paused HTTP tasks).
             state::load_history(handle, mgr.inner());
             state::persist_loop(handle.clone(), mgr.inner().clone());
             state::sleep_block_loop(mgr.inner().clone());
             state::completion_watch_loop(handle.clone(), mgr.inner().clone());
             state::clipboard_monitor_loop(handle.clone(), mgr.inner().clone());
 
-            // Minimize-to-tray + tray menu.
             if let Some(icon) = app.default_window_icon() {
                 let show = MenuItem::with_id(app, "show", "Show Vortex", true, None::<&str>)?;
                 let pause_all = MenuItem::with_id(app, "pause_all", "Pause All Downloads", true, None::<&str>)?;
@@ -1223,8 +1145,6 @@ pub fn run() {
                             });
                         }
                         "quit" => {
-                            // Flush in-flight progress to disk before exiting
-                            // (the 2 s persist timer alone would lose the tail).
                             let mgr = app.state::<Arc<DlManager>>().inner().clone();
                             state::persist_history(&app, &mgr);
                             app.exit(0);
@@ -1250,7 +1170,6 @@ pub fn run() {
                 let _ = app.manage(tray);
             }
 
-            // Close = hide to tray (quit via tray menu).
             if let Some(win) = app.get_webview_window("main") {
                 let hide_win = win.clone();
                 win.on_window_event(move |event| {
@@ -1312,7 +1231,6 @@ pub fn run() {
             read_urls,
             get_ws_token,
             window_action,
-            close_dropbox,
             take_dialog_payload,
         ])
         .run(tauri::generate_context!())

@@ -17,13 +17,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::auth::{self, Cred};
 
 const PART_EXT: &str = ".vtx.part";
-
-/// Absurd Content-Length guard (e.g. spoofed u64::MAX) shared by the HTTP
-/// and FTP probes: it would wrap segment math and preallocate exabytes.
-/// 1 TiB is far above any legitimate single file.
 const MAX_DOWNLOAD_BYTES: u64 = 1 << 40;
 
-/// Print the full network error chain (incl. cert/proxy causes) to stdout.
 pub fn log_net_err(e: &reqwest::Error, ctx: &str) {
     eprintln!("[vortex-net] {ctx}: {e}");
     let mut src = e.source();
@@ -39,15 +34,10 @@ pub fn build_client(proxy: &str) -> Result<Client, String> {
     build_client_with_ua(proxy, crate::tools::BROWSER_UA, &[])
 }
 
-/// Like `build_client`, but with extra default request headers (e.g. cookies
-/// and referer captured from a browser download takeover).
 pub fn build_client_with_headers(proxy: &str, headers: &[(String, String)]) -> Result<Client, String> {
     build_client_with_ua(proxy, crate::tools::BROWSER_UA, headers)
 }
 
-/// Client that presents a neutral tool UA (e.g. `Wget/x`). Some mirror
-/// anti-hotlinking guards bounce browser-like UAs in an endless 302 loop;
-/// a curl/wget-grade UA gets served normally.
 pub fn build_tool_client(proxy: &str) -> Result<Client, String> {
     build_client_with_ua(proxy, crate::tools::TOOL_UA, &[])
 }
@@ -59,17 +49,11 @@ pub fn build_tool_client_with_headers(proxy: &str, headers: &[(String, String)])
 fn build_client_with_ua(proxy: &str, ua: &str, extra: &[(String, String)]) -> Result<Client, String> {
     let mut cb = Client::builder()
         .user_agent(ua)
-        // Small TTFB chunks: disable Nagle so range requests stream immediately.
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(15))
-        // Mirror/CDN chains can bounce 15+ hops; follow up to 20 redirects across
-        // hosts and schemes (https<->http) — same behaviour as IDM.
         .redirect(reqwest::redirect::Policy::limited(20))
-        // Keep a pooled connection per segment alive for retries/resume.
         .pool_max_idle_per_host(64)
-        // Let HTTP/2 dynamically grow the receive window so large files don't
-        // stall waiting for WINDOW_UPDATE round-trips.
         .http2_adaptive_window(true)
         .http2_initial_stream_window_size(8 * 1024 * 1024)
         .http2_initial_connection_window_size(16 * 1024 * 1024);
@@ -77,7 +61,6 @@ fn build_client_with_ua(proxy: &str, ua: &str, extra: &[(String, String)]) -> Re
         let p = Proxy::all(proxy.trim()).map_err(|e| format!("Bad proxy: {e}"))?;
         cb = cb.proxy(p);
     } else {
-        // Never fall back to system/HTTP(S)_PROXY env (e.g. BurpSuite 127.0.0.1:8080).
         cb = cb.no_proxy();
     }
     if !extra.is_empty() {
@@ -97,7 +80,6 @@ fn build_client_with_ua(proxy: &str, ua: &str, extra: &[(String, String)]) -> Re
     cb.build().map_err(|e| format!("Client error: {e}"))
 }
 
-/// First `WWW-Authenticate` header value (e.g. `Basic realm="x"`, `Digest ...`).
 fn challenge_of(resp: &reqwest::Response) -> Option<String> {
     resp.headers()
         .get(WWW_AUTHENTICATE)
@@ -105,9 +87,6 @@ fn challenge_of(resp: &reqwest::Response) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Send a range GET through the task's auth context. If the server answers 401
-/// with a Digest challenge the request is retried once with the computed header
-/// and the winning header is stored back into `auth`.
 async fn send_authorized(
     client: &Client,
     url: &str,
@@ -147,7 +126,6 @@ async fn send_authorized(
     Ok((resp, next))
 }
 
-/// Put a task into the waiting-for-login state and ask the UI to show a dialog.
 pub fn flag_needs_auth(task: &Task) {
     task.set_error("Authentication required (HTTP 401)");
     task.set_status(DlStatus::NeedsAuth);
@@ -171,9 +149,7 @@ pub enum DlStatus {
     Merging,
     Error,
     Cancelled,
-    /// Waiting for the user to supply login credentials (HTTP 401/407).
     NeedsAuth,
-    /// Torrent magnet resolving metadata over DHT (auto-flips to Downloading).
     Resolving,
 }
 
@@ -207,7 +183,6 @@ pub struct DlView {
     pub eta: u64,
     pub segments: usize,
     pub connections: usize,
-    /// Live worker connections at this moment (0 when idle).
     #[serde(default)]
     pub live: usize,
     pub status: DlStatus,
@@ -220,8 +195,6 @@ pub struct DlView {
     pub completed_at: Option<u64>,
     #[serde(default)]
     pub format_id: Option<String>,
-    /// Final on-disk output files (multi-file jobs: playlists, subtitles).
-    /// Used by remove-with-delete; empty for single-file downloads.
     #[serde(default)]
     pub produced: Vec<String>,
 }
@@ -233,7 +206,6 @@ pub struct Segment {
     part: PathBuf,
 }
 
-/// Login + the current Authorization header value for a task's requests.
 #[derive(Clone)]
 pub struct AuthCtx {
     pub cred: Cred,
@@ -248,13 +220,8 @@ pub struct StartOpts {
     pub start_at: Option<u64>,
     pub auto_retries: u32,
     pub proxy: String,
-    /// Referer header to send (the page that initiated the browser download).
     pub referer: Option<String>,
-    /// Cookie header string (e.g. "sid=abc; pref=1") for authenticated downloads.
     pub cookies: Option<String>,
-    /// Existing-file policy: None = silent auto-rename (default, headless
-    /// flows); Some("prompt") = abort with `EXISTS::<path>` so the UI can ask;
-    /// Some("replace") = delete the existing file + parts and reuse its path.
     pub on_exists: Option<String>,
 }
 
@@ -279,8 +246,6 @@ impl StartOpts {
         }
     }
 
-    /// Extra request headers a download should carry
-    /// (Cookie/Referer captured from a browser download takeover).
     pub fn extra_headers(&self) -> Vec<(String, String)> {
         let mut h = Vec::new();
         if let Some(c) = self.cookies.as_deref().map(|c| c.trim()).filter(|c| !c.is_empty()) {
@@ -317,14 +282,8 @@ pub struct Task {
     pub total: AtomicU64,
     pub done: AtomicU64,
     pub num_segments: usize,
-    /// Max simultaneous connections (segments are split into smaller chunks than this).
-    /// Atomic: the adaptive scaler in `monitor_task` grows this 8 → 32 while
-    /// throttled; `run()` picks up the new value every worker round.
     pub max_conns: AtomicUsize,
-    /// AIMD penalty window (epoch ms): set when the server protests with
-    /// 429/503 — adaptive growth stays off until this passes.
     pub penalty_until: AtomicU64,
-    /// Number of worker connections currently running (real-time, for stats).
     pub live: AtomicUsize,
     pub status: RwLock<DlStatus>,
     pub error: Mutex<Option<String>>,
@@ -340,14 +299,8 @@ pub struct Task {
     pub auth: Mutex<Option<AuthCtx>>,
     segments: Mutex<Vec<Segment>>,
     done_flags: Mutex<Vec<bool>>,
-    /// Which chunk each worker has currently claimed (for dynamic work-stealing).
     claimed: Mutex<Vec<bool>>,
-    /// Per-chunk dynamic split point (IDM-style straggler split). `u64::MAX` =
-    /// no split. When an idle worker steals the tail half of a slow chunk it
-    /// stores the cut byte here; the victim stops there, truncates its own part
-    /// file (it is the sole writer, so this is race-free) and finishes early.
     split_at: Mutex<Vec<u64>>,
-    /// Epoch ms when the download reached Completed (None until then).
     completed_at: Mutex<Option<u64>>,
 }
 
@@ -358,9 +311,6 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Exponential backoff with ±25% jitter: 1s, 2s, 4s … capped at 30s.
-/// Jitter uses a nanos-seeded xorshift so simultaneous workers don't wake in
-/// lockstep and hammer a recovering server (no extra deps needed).
 fn retry_backoff(attempt: u64) -> Duration {
     let shift = attempt.saturating_sub(1).min(5);
     let base_ms = 1000u64.saturating_mul(1 << shift).min(30_000);
@@ -372,12 +322,10 @@ fn retry_backoff(attempt: u64) -> Duration {
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
-    let pct = 75 + (x % 51) as u64; // 75..125
+    let pct = 75 + (x % 51) as u64;
     Duration::from_millis((base_ms * pct / 100).max(200))
 }
 
-/// Honor `Retry-After: <seconds>` (429/503) when present, clamped to 2 min.
-/// HTTP-date form is ignored (treated as absent).
 fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
     resp.headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -386,8 +334,6 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
         .map(|n| n.min(120))
 }
 
-/// Statuses where retrying is pointless (wrong URL, gone, range unusable…).
-/// Everything else failed is treated as transient and retried with backoff.
 fn is_fatal_status(s: StatusCode) -> bool {
     matches!(
         s,
@@ -400,23 +346,15 @@ fn is_fatal_status(s: StatusCode) -> bool {
     )
 }
 
-/// Give up on one chunk after this many consecutive reconnects without any
-/// forward progress (the round-level backoff then applies).
 const MAX_CHUNK_ATTEMPTS: u64 = 15;
-/// A connection that delivers zero bytes for this long is half-dead: drop it
-/// and reconnect from the cursor instead of hanging the tail forever.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Heuristic: is this URL likely a downloadable file (vs a plain webpage)?
 pub fn url_is_downloadable(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     let path = lower.split('?').next().unwrap_or(&lower);
     const EXTS: &[&str] = &[
-        // media
         "mp4", "mkv", "webm", "avi", "mov", "flv", "m4v", "wmv", "mpg", "mpeg", "3gp", "m4a", "aac", "flac", "wav", "ogg", "opus", "mp3",
-        // archives / programs / docs
         "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "cab", "exe", "msi", "apk", "appimage", "whl", "deb", "rpm", "pdf", "epub", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "ttf", "otf", "bin", "img", "ipa", "torrent",
-        // subtitles
         "srt", "vtt",
     ];
     if let Some(dot) = path.rfind('.') {
@@ -426,12 +364,15 @@ pub fn url_is_downloadable(url: &str) -> bool {
             return true;
         }
     }
-    // CDN query-based: ?file=setup.zip, ?name=movie.mp4, ?url=...mp4 etc.
-    if let Some(q) = lower.split_once('?').map(|(_, q)| q) {
-        for tok in q.split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-') {
-            if let Some(dot) = tok.rfind('.') {
-                if EXTS.iter().any(|e| **e == tok[dot + 1..]) {
-                    return true;
+    // Also scan query params (e.g. ?file=setup.zip)
+    if let Some(q) = lower.split('?').nth(1) {
+        for part in q.split('&') {
+            if let Some(v) = part.split('=').nth(1) {
+                if let Some(dot) = v.rfind('.') {
+                    let ext = &v[dot + 1..];
+                    if EXTS.contains(&ext) {
+                        return true;
+                    }
                 }
             }
         }
@@ -608,8 +549,6 @@ impl Task {
         let (t0, b0) = *h.front().unwrap();
         let (t1, b1) = *h.back().unwrap();
         let dt = t1.duration_since(t0).as_secs_f64().max(0.05);
-        // `done` can move backwards on straggler truncate: saturate instead
-        // of wrapping to a gigantic fake speed.
         (b1.saturating_sub(b0) as f64 / dt) as u64
     }
 
@@ -648,11 +587,6 @@ impl Task {
         *self.error.lock().unwrap() = Some(msg.to_string());
     }
 
-    /// AIMD fallback: the server protested with 429/503 — halve parallelism
-    /// (floor 2, takes effect next worker round) and suppress adaptive
-    /// growth for 30 s, so the download keeps flowing on throttling hosts
-    /// instead of hammering into a ban. Re-arming is automatic: growth
-    /// resumes once throughput holds outside the penalty window.
     pub fn note_congestion(&self) {
         let cur = self.max_conns.load(Ordering::Relaxed);
         let next = (cur / 2).max(4);
@@ -663,8 +597,6 @@ impl Task {
         self.penalty_until.store(now_ms() + 30_000, Ordering::Relaxed);
     }
 
-    /// Apply a fresh login and queue for retry. Digest auth is negotiated
-    /// automatically against the server's challenge on the next request.
     pub fn set_auth_ctx(&self, cred: Cred) {
         let hdr = auth::basic_auth_value(&cred.username, &cred.password);
         *self.auth.lock().unwrap() = Some(AuthCtx { cred, hdr });
@@ -683,15 +615,11 @@ pub async fn start(
     let base = PathBuf::from(save_path.trim());
     let mut url = url;
 
-    // FTP is a different protocol family: probe, segments and workers all
-    // route through the in-house plain-FTP client (no reqwest involved).
     if crate::ftp::is_ftp_url(&url) {
         return start_ftp(app, url, base, opts, limit).await;
     }
 
     let settings = crate::state::load_settings(&app);
-    // Per-site proxy override wins over the global proxy for this URL
-    // ("DIRECT" bypasses it); no match → global proxy (or direct).
     let eff_proxy = crate::state::proxy_for_url(&settings.per_site_proxies, &opts.proxy, &url);
     let extra = opts.extra_headers();
     let mut client = if extra.is_empty() {
@@ -700,7 +628,6 @@ pub async fn start(
         build_client_with_headers(&eff_proxy, &extra)?
     };
 
-    // Auto-login with any credential already saved for this host (Basic/Digest).
     let mut auth = auth::find_cred(&settings.credentials, &url).map(|cred| AuthCtx {
         hdr: auth::basic_auth_value(&cred.username, &cred.password),
         cred,
@@ -719,12 +646,6 @@ pub async fn start(
                 || e.is_decode()
                 || e.is_timeout() =>
         {
-            // Mirror anti-hotlinking guards bounce browser-like UAs in an endless
-            // 302 loop (e.g. mirrors.nju.edu.cn redirects to itself); other hosts
-            // (e.g. Hetzner speed servers) reset browser-UA connections outright.
-            // Retry once with a neutral tool UA like IDM/wget do — the rebuilt
-            // client then serves the whole task, since the browser UA would fail
-            // every segment the same way.
             log_net_err(&e, "probe failed; retrying with tool UA");
             client = if extra.is_empty() {
                 build_tool_client(&eff_proxy)?
@@ -749,11 +670,6 @@ pub async fn start(
         }
     };
 
-    // A probe answered with an HTTP error (403 bot-wall, 404, 5xx…) is not a
-    // file: fail fast with a clean message instead of building a degenerate
-    // task (e.g. total=Content-Length:1) whose workers all die with
-    // "too many consecutive failures". 401/407 flow into the login dialog via
-    // the workers, so they are exempt here.
     {
         let st = probe.status();
         if (st.is_client_error() || st.is_server_error())
@@ -770,8 +686,6 @@ pub async fn start(
         .and_then(|v| v.to_str().ok().map(|s| s.to_lowercase().contains("bytes")))
         .unwrap_or(false);
 
-    // Resolve every redirect once, then pin segment workers straight to the final
-    // host (mirrors/CDNs bounce a lot; replaying the chain per chunk is fragile).
     let final_url = probe.url().to_string();
     if final_url != url {
         eprintln!("[vortex-net] url resolved: {url} -> {final_url}");
@@ -780,13 +694,10 @@ pub async fn start(
 
     let got_206 = probe.status() == StatusCode::PARTIAL_CONTENT;
     let total = parse_total(&probe);
-    // Absurd Content-Length guard (MAX_DOWNLOAD_BYTES): refuse early with a
-    // clean error instead of preallocating exabytes.
     if total > MAX_DOWNLOAD_BYTES {
         return Err(format!("Server claims an absurd file size ({total} bytes) — refused"));
     }
 
-    // Some servers reply 200 to `bytes=0-0` but still honour real ranges; re-probe once.
     let mut ranged = got_206;
     if !ranged && accept_ranges && total > 0 {
         let mut auth2 = auth.clone();
@@ -807,10 +718,7 @@ pub async fn start(
 
     let eff_dir = crate::state::save_dir_for(&base, &name, opts.categorize);
     fs::create_dir_all(&eff_dir).map_err(|e| format!("Cannot create folder: {e}"))?;
-    // Existing-file policy (IDM-style): "prompt" aborts before any byte is
-    // fetched so the UI can ask Replace / Keep both / Cancel; "replace"
-    // deletes the old file + its parts and reuses the exact path; anything
-    // else keeps the historical silent auto-rename.
+
     let candidate = eff_dir.join(&name);
     let save_path_final = match opts.on_exists.as_deref() {
         Some("prompt") if candidate.exists() => {
@@ -826,37 +734,36 @@ pub async fn start(
         _ => unique_path(&eff_dir, &name),
     };
 
-    let segs;
-    let max_conns;
-    // Auto mode: segments == 0 means the engine picks the golden target —
-    // 16 for >250MB files, 8 for medium files — instead of the user setting.
+    let id = uuid::Uuid::new_v4().to_string();
+
+    // Isolated Temporary Staging Directory for parts (No white files in Downloads!)
+    let parts_staging_dir = std::env::temp_dir().join("vortex").join("parts").join(&id);
+    let _ = fs::create_dir_all(&parts_staging_dir);
+
+    // Auto connection resolution while strictly preserving Golden Speed Rules:
     let target_conns = if opts.segments == 0 {
-        if total > 250 * 1024 * 1024 {
-            32
-        } else {
-            16
-        }
+        if total > 250 * 1024 * 1024 { 32 } else { 16 }
     } else {
         opts.segments
     };
+
+    let segs;
+    let max_conns;
     if ranged && total > 0 && target_conns > 1 {
         const MB: u64 = 1024 * 1024;
         if total < 10 * MB {
-            // Tiny file: zero segmentation overhead.
             max_conns = 1;
-            segs = vec![Segment { start: 0, end: total.saturating_sub(1), part: part_of(&save_path_final, 0) }];
+            segs = vec![Segment { start: 0, end: total.saturating_sub(1), part: part_of(&parts_staging_dir, 0) }];
         } else if total <= 250 * MB {
-            // Medium file (Hetzner 100MB): 8 is the BDP sweet spot for high-latency CDNs.
-            // Exactly 8 contiguous ranges → 8 long-lived Keep-Alive streams, no renegotiation storm.
             max_conns = target_conns.clamp(2, 32).min(8);
-            segs = split_range_contiguous(total, max_conns as usize, &save_path_final);
+            segs = split_range_contiguous(total, max_conns as usize, &parts_staging_dir);
         } else {
             max_conns = target_conns.clamp(2, 32);
-            segs = split_range(total, max_conns, &save_path_final);
+            segs = split_range(total, max_conns, &parts_staging_dir);
         }
     } else {
         max_conns = 1;
-        segs = vec![Segment { start: 0, end: u64::MAX, part: part_of(&save_path_final, 0) }];
+        segs = vec![Segment { start: 0, end: u64::MAX, part: part_of(&parts_staging_dir, 0) }];
     }
     let num_segments = segs.len();
 
@@ -867,7 +774,6 @@ pub async fn start(
         }
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
     let fname = save_path_final
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -909,10 +815,6 @@ pub async fn start(
     Ok(task)
 }
 
-/// `download::start` for ftp:// URLs: probes with the in-house FTP client
-/// (SIZE + REST support), then builds a task identical to the HTTP path —
-/// the only difference is that `download_segment` opens per-connection FTP
-/// sessions (REST cursor + RETR) instead of reqwest range requests.
 async fn start_ftp(
     app: AppHandle,
     url: String,
@@ -936,7 +838,7 @@ async fn start_ftp(
 
     let eff_dir = crate::state::save_dir_for(&base, &name, opts.categorize);
     fs::create_dir_all(&eff_dir).map_err(|e| format!("Cannot create folder: {e}"))?;
-    // Same existing-file policy as the HTTP path (prompt / replace / rename).
+
     let candidate = eff_dir.join(&name);
     let save_path_final = match opts.on_exists.as_deref() {
         Some("prompt") if candidate.exists() => {
@@ -952,15 +854,17 @@ async fn start_ftp(
         _ => unique_path(&eff_dir, &name),
     };
 
-    // Segments only when the server supports REST resume; otherwise one
-    // bounded stream (or an unbounded one when SIZE was refused).
+    let id = uuid::Uuid::new_v4().to_string();
+    let parts_staging_dir = std::env::temp_dir().join("vortex").join("parts").join(&id);
+    let _ = fs::create_dir_all(&parts_staging_dir);
+
     let (segs, max_conns) = if info.resume && total > 0 && opts.segments > 1 {
         let mc = opts.segments.clamp(2, 32);
-        (split_range(total, mc, &save_path_final), mc)
+        (split_range(total, mc, &parts_staging_dir), mc)
     } else if total > 0 {
-        (vec![Segment { start: 0, end: total - 1, part: part_of(&save_path_final, 0) }], 1)
+        (vec![Segment { start: 0, end: total - 1, part: part_of(&parts_staging_dir, 0) }], 1)
     } else {
-        (vec![Segment { start: 0, end: u64::MAX, part: part_of(&save_path_final, 0) }], 1)
+        (vec![Segment { start: 0, end: u64::MAX, part: part_of(&parts_staging_dir, 0) }], 1)
     };
     let num_segments = segs.len();
 
@@ -971,7 +875,6 @@ async fn start_ftp(
         }
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
     let fname = save_path_final
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1001,7 +904,6 @@ async fn start_ftp(
         paused: AtomicBool::new(false),
         history: Mutex::new(VecDeque::new()),
         limit,
-        // Never used by FTP workers; kept so Task stays one type for HTTP+FTP.
         client: build_client("").unwrap_or_else(|_| Client::new()),
         retries: AtomicU64::new(0),
         auto_retries: opts.auto_retries,
@@ -1014,7 +916,6 @@ async fn start_ftp(
     Ok(task)
 }
 
-/// Rebuild a live task from persisted data (for resume after restart).
 pub fn restore(
     app: AppHandle,
     view: DlView,
@@ -1025,19 +926,12 @@ pub fn restore(
 ) -> Result<Arc<Task>, String> {
     let save_path = PathBuf::from(view.save_path.clone());
     let num_segments = segments.len();
-    // Sync downloaded against actual *.vtx.part sizes on disk (crash-safe resume).
-    let mut disk_done: u64 = 0;
-    for idx in 0..num_segments {
-        let part = part_of(&save_path, idx);
-        if let Ok(md) = std::fs::metadata(&part) {
-            disk_done = disk_done.saturating_add(md.len());
-        }
-    }
-    let synced_downloaded = disk_done.min(view.downloaded);
+    let parts_staging_dir = std::env::temp_dir().join("vortex").join("parts").join(&view.id);
+    let _ = fs::create_dir_all(&parts_staging_dir);
     let segs = segments
         .iter()
         .enumerate()
-        .map(|(i, [s, e])| Segment { start: *s, end: *e, part: part_of(&save_path, i) })
+        .map(|(i, [s, e])| Segment { start: *s, end: *e, part: part_of(&parts_staging_dir, i) })
         .collect::<Vec<_>>();
     let status = match view.status {
         DlStatus::Completed => DlStatus::Completed,
@@ -1048,6 +942,15 @@ pub fn restore(
         hdr: auth::basic_auth_value(&cred.username, &cred.password),
         cred,
     });
+
+    let mut disk_done = 0u64;
+    for s in &segs {
+        if let Ok(m) = s.part.metadata() {
+            disk_done += m.len();
+        }
+    }
+    let synced_downloaded = if disk_done > 0 { disk_done.min(view.downloaded) } else { view.downloaded };
+
     let task = Arc::new(Task {
         id: view.id.clone(),
         url: view.url.clone(),
@@ -1098,10 +1001,8 @@ impl Task {
 }
 
 pub async fn run(task: Arc<Task>) {
-    // Detect pre-existing completed state (all segments done) so resume finishes instantly.
     task.push_history();
 
-    // Scheduled start: wait (Queued) until the target timestamp.
     if let Some(ta) = task.start_at {
         let now = now_ms();
         if now < ta {
@@ -1110,9 +1011,6 @@ pub async fn run(task: Arc<Task>) {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             if task.cancel.load(Ordering::Relaxed) {
-                // Cancel keeps part files on purpose: Resume continues from
-                // the partial bytes instead of starting over (IDM behavior).
-                // Parts are deleted on Remove (delete_part) and on completion.
                 task.set_status(DlStatus::Cancelled);
                 return;
             }
@@ -1125,7 +1023,6 @@ pub async fn run(task: Arc<Task>) {
 
     loop {
         if task.cancel.load(Ordering::Relaxed) {
-            // Keep parts (see above): resume continues where this stopped.
             task.set_status(DlStatus::Cancelled);
             break;
         }
@@ -1134,12 +1031,8 @@ pub async fn run(task: Arc<Task>) {
             break;
         }
 
-        // Re-open every unfinished chunk for claiming (covers retries after failure).
         reset_claims(&task);
 
-        // Spin up to `max_conns` workers; each one pulls the next available chunk
-        // until none are left, so fast connections take over slow connections' work.
-        // (Reloaded every round: the adaptive scaler may have grown it.)
         let mut workers = Vec::new();
         for _ in 0..task.max_conns.load(Ordering::Relaxed).max(1) {
             if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
@@ -1177,26 +1070,20 @@ pub async fn run(task: Arc<Task>) {
         }
 
         if all_ok {
-            // Workers drained but chunks remain (paused mid-chunk); loop again.
             task.retries.store(0, Ordering::Relaxed);
             continue;
         }
 
-        // Login needed: stay in this state until credentials are supplied.
         if *task.status.read().unwrap() == DlStatus::NeedsAuth {
             break;
         }
 
-        // Forward progress forgives past failures: a 99%-done file must not
-        // die because of 3 transient blips in a row.
         let round_done = task.done.load(Ordering::Relaxed);
         if round_done > last_round_done {
             task.retries.store(0, Ordering::Relaxed);
         }
         last_round_done = round_done;
 
-        // Some chunk failed — retry with exponential backoff + jitter, capped
-        // by auto_retries.
         let r = task.retries.fetch_add(1, Ordering::Relaxed) + 1;
         if r > task.auto_retries.max(1) as u64 {
             task.set_error("Too many consecutive failures");
@@ -1209,9 +1096,6 @@ pub async fn run(task: Arc<Task>) {
     monitor.abort();
 }
 
-/// A worker claims chunks one after another until the queue is empty. When no
-/// free chunk is left it tries to steal the tail half of a slow chunk
-/// (IDM-style dynamic re-segmentation) instead of idling on the tail.
 async fn worker_loop(task: Arc<Task>) -> bool {
     loop {
         if task.cancel.load(Ordering::Relaxed) || task.paused.load(Ordering::Relaxed) {
@@ -1221,11 +1105,6 @@ async fn worker_loop(task: Arc<Task>) -> bool {
             Some(c) => c,
             None => match try_steal(&task) {
                 Some(c) => c,
-                // A slow tail may develop *after* we looked: while sibling
-                // workers are still busy, wait and look again instead of
-                // exiting and leaving one connection to crawl alone. Always
-                // re-check completion first, otherwise idle workers keep each
-                // other's `live` count above 1 and nobody ever exits.
                 None => {
                     if all_chunks_done(&task) {
                         return true;
@@ -1244,7 +1123,6 @@ async fn worker_loop(task: Arc<Task>) -> bool {
     }
 }
 
-/// Atomically hand out the next unclaimed, unfinished chunk.
 fn claim_chunk(task: &Task) -> Option<(usize, Segment)> {
     let segs = task.segments.lock().unwrap();
     let mut claimed = task.claimed.lock().unwrap();
@@ -1261,15 +1139,9 @@ fn claim_chunk(task: &Task) -> Option<(usize, Segment)> {
     None
 }
 
-/// Minimum remaining bytes on a victim chunk worth splitting (each half stays
-/// >= 1 MB so the extra connection + part file actually pay off).
-const MIN_SPLIT_REMAINING: u64 = 8 * 1024 * 1024; // (8MB prevents high-latency request loops!)
+// Golden Rule: strictly 8MB steal threshold to avoid high-latency request loops!
+const MIN_SPLIT_REMAINING: u64 = 8 * 1024 * 1024;
 
-/// Pure cut-point math for a straggler split: victim `[vstart..=vend]` has
-/// `written` bytes on disk. Returns the last byte the victim keeps; the
-/// stealer takes `[cut+1..=vend]`. `None` when there is nothing worth
-/// stealing (too little left, degenerate range, or already complete).
-/// The two halves always partition the original range exactly once.
 fn split_cut(vstart: u64, vend: u64, written: u64) -> Option<u64> {
     if vend < vstart {
         return None;
@@ -1291,30 +1163,19 @@ fn split_cut(vstart: u64, vend: u64, written: u64) -> Option<u64> {
     Some(cut)
 }
 
-/// Steal the tail half of the slowest in-progress chunk. Returns the new chunk
-/// already claimed by the caller. The victim observes the cut via `split_at`,
-/// stops there and truncates its own part file, so byte ranges never overlap
-/// and the final merge stays exact.
 fn try_steal(task: &Task) -> Option<(usize, Segment)> {
-    // Pointless (and pure overhead) with a single live worker — there is
-    // nobody to help, and "stealing from yourself" only adds part files.
     if task.live.load(Ordering::Relaxed) < 2 {
         return None;
     }
-    // FTP control sessions would need coordinated cut + victim truncation;
-    // the plain FTP path keeps one connection per chunk (IDM does the same).
     if crate::ftp::is_ftp_url(&task.url) {
         return None;
     }
-    // Lock order everywhere: segments -> done_flags -> claimed -> split_at.
     let mut segs = task.segments.lock().unwrap();
     let mut done_flags = task.done_flags.lock().unwrap();
     let mut claimed = task.claimed.lock().unwrap();
     let mut split_at = task.split_at.lock().unwrap();
 
-    // Slowest = largest remaining. Skip finished, unclaimed (claim_chunk's job),
-    // unbounded single-stream, already-splitting, and too-small chunks.
-    let mut victim: Option<(usize, u64)> = None; // (idx, remaining)
+    let mut victim: Option<(usize, u64)> = None;
     for (i, seg) in segs.iter().enumerate() {
         if done_flags.get(i).copied().unwrap_or(true) {
             continue;
@@ -1340,11 +1201,8 @@ fn try_steal(task: &Task) -> Option<(usize, Segment)> {
     }
     let (idx, _) = victim?;
 
-    // Cut in the middle of the *remaining* work, not the original range, so a
-    // nearly-stalled victim hands over close to half of what's actually left.
     let vstart = segs[idx].start;
     let vend = segs[idx].end;
-    // Re-read: the victim kept downloading since the scan above.
     let written = segs[idx].part.metadata().map(|m| m.len()).unwrap_or(0);
     let cut = match split_cut(vstart, vend, written) {
         Some(c) => c,
@@ -1352,15 +1210,12 @@ fn try_steal(task: &Task) -> Option<(usize, Segment)> {
     };
 
     let new_idx = segs.len();
+    let parts_staging_dir = std::env::temp_dir().join("vortex").join("parts").join(&task.id);
     let new_seg = Segment {
         start: cut + 1,
         end: vend,
-        part: part_of(&task.save_path, new_idx),
+        part: part_of(&parts_staging_dir, new_idx),
     };
-    // Shrink the victim first so every later `segment_done` check uses the cut
-    // range; the victim truncates its own part file when it observes `split_at`.
-    // All four vecs are extended while the locks are held so no other thread
-    // ever observes mismatched lengths.
     segs[idx].end = cut;
     segs.push(new_seg.clone());
     done_flags.push(false);
@@ -1370,7 +1225,6 @@ fn try_steal(task: &Task) -> Option<(usize, Segment)> {
     Some((new_idx, new_seg))
 }
 
-/// Mark finished chunks as taken; leave failed/partial chunks claimable again.
 fn reset_claims(task: &Task) {
     let segs = task.segments.lock().unwrap();
     let mut claimed = task.claimed.lock().unwrap();
@@ -1387,8 +1241,6 @@ fn all_chunks_done(task: &Task) -> bool {
 }
 
 async fn finalize(task: &Arc<Task>) {
-    // Multi-GB merges must never run on a Tokio worker: hand the whole
-    // blocking pass to the blocking pool.
     let t = task.clone();
     let r = tokio::task::spawn_blocking(move || {
         finalize_blocking(&t);
@@ -1402,6 +1254,7 @@ async fn finalize(task: &Arc<Task>) {
 
 fn finalize_blocking(task: &Arc<Task>) {
     task.set_status(DlStatus::Merging);
+    let parts_staging_dir = std::env::temp_dir().join("vortex").join("parts").join(&task.id);
     let mut parts: Vec<PathBuf> = {
         let mut segs = task.segments.lock().unwrap().clone();
         segs.retain(|s| s.end != u64::MAX);
@@ -1409,15 +1262,12 @@ fn finalize_blocking(task: &Arc<Task>) {
         segs.into_iter().map(|s| s.part).collect()
     };
     if parts.is_empty() {
-        parts = vec![part_of(&task.save_path, 0)];
+        parts = vec![part_of(&parts_staging_dir, 0)];
     }
-    // Fast path: a single part IS the file — atomic rename instead of a full
-    // read+write copy pass. This halves disk I/O for small/single-connection
-    // downloads (no double write) and finishes instantly.
+
     if parts.len() == 1 {
         let moved = fs::rename(&parts[0], &task.save_path).is_ok() || copy_one(&parts[0], &task.save_path);
         if moved {
-            // rename already removed the part; copy fallback leaves it behind.
             let _ = fs::remove_file(&parts[0]);
             finish_ok(task);
         } else {
@@ -1432,8 +1282,6 @@ fn finalize_blocking(task: &Arc<Task>) {
         .write(true)
         .open(&task.save_path);
     if let Ok(mut f) = out {
-        // Preallocate the final size up front: one contiguous allocation
-        // instead of fragmentation from incremental growth.
         let total = task.total.load(Ordering::Relaxed);
         if total > 0 {
             let _ = f.set_len(total);
@@ -1454,7 +1302,6 @@ fn finalize_blocking(task: &Arc<Task>) {
         let _ = f.flush();
         drop(f);
         if ok {
-            cleanup_parts(task.clone());
             finish_ok(task);
         } else {
             task.set_error("Failed to merge parts");
@@ -1463,8 +1310,6 @@ fn finalize_blocking(task: &Arc<Task>) {
     }
 }
 
-/// Copy a single part to the destination (fallback when rename can't work,
-/// e.g. across volumes). Returns success.
 fn copy_one(src: &Path, dst: &Path) -> bool {
     let out = OpenOptions::new().create(true).truncate(true).write(true).open(dst);
     if let (Ok(s), Ok(mut d)) = (fs::File::open(src), out) {
@@ -1477,8 +1322,6 @@ fn copy_one(src: &Path, dst: &Path) -> bool {
     false
 }
 
-/// Record successful completion: drop part files and pin counters to the real
-/// on-disk size.
 fn finish_ok(task: &Arc<Task>) {
     cleanup_parts(task.clone());
     let sz = fs::metadata(&task.save_path).map(|m| m.len()).unwrap_or(0);
@@ -1525,13 +1368,6 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
         Err(_) => return false,
     };
     let offset = std_file.metadata().map(|m| m.len()).unwrap_or(0);
-    // NOTE: no set_len preallocation here on purpose. Part-file length IS the
-    // resume/progress signal (`segment_done`, `done0`), and this handle writes
-    // in append mode — growing the file early would fake completion and
-    // misplace every later append. Contiguity is handled instead by the
-    // preallocated final file in `finalize` (Step 3).
-    // Buffered async writes: flush in ~1 MB batches instead of one disk syscall
-    // per network chunk (this is a major throughput win on both HDD and SSD).
     let mut file = tokio::io::BufWriter::with_capacity(1024 * 1024, tokio::fs::File::from_std(std_file));
     let mut cursor = if seg.end == u64::MAX {
         seg.start.checked_add(offset).unwrap_or(seg.start)
@@ -1547,8 +1383,8 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
     let client = task.client.clone();
     let mut last_throttle = Instant::now();
     let mut throttle_bytes = 0u64;
-    // Consecutive reconnects without forward progress (reset on any bytes).
     let mut attempts: u64 = 0;
+    let mut since_check: usize = 0; // Throttle lock contention
 
     while !task.cancel.load(Ordering::Relaxed) && !task.paused.load(Ordering::Relaxed) {
         let range = if seg.end == u64::MAX {
@@ -1579,11 +1415,6 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             return false;
         }
         if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
-            // Explicit 429/503 only: transient rate limit / overloaded mirror.
-            // Back the connection count off (AIMD) so throttling hosts stay
-            // usable, honor Retry-After, else back off; the chunk resumes from
-            // the cursor afterwards. Other 5xx / TCP timeouts use plain retry
-            // without halving connections.
             task.note_congestion();
             attempts += 1;
             if attempts > MAX_CHUNK_ATTEMPTS {
@@ -1598,9 +1429,6 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             continue;
         }
         if status.is_server_error() {
-            // Other 5xx (500, 502, 504…) — transient but NOT rate-limit: retry
-            // with backoff and Retry-After, but don't halve connections (AIMD
-            // only for explicit 429/503).
             attempts += 1;
             if attempts > MAX_CHUNK_ATTEMPTS {
                 task.set_error(&format!("HTTP {} (server keeps failing)", status.as_u16()));
@@ -1614,8 +1442,6 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             continue;
         }
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            // Cursor is at/past EOF: if the part already holds the full range,
-            // the chunk is done; otherwise fail so the round re-examines it.
             let expected = seg.end - seg.start + 1;
             if seg.end != u64::MAX
                 && seg.part.metadata().map(|m| m.len()).unwrap_or(0) >= expected
@@ -1627,7 +1453,6 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             return false;
         }
         if is_fatal_status(status) {
-            // Retrying a 404/410/etc. is pointless — fail fast with the code.
             task.set_error(&format!("HTTP {} (not retryable)", status.as_u16()));
             return false;
         }
@@ -1636,17 +1461,13 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             return false;
         }
         if seg.end != u64::MAX && status != StatusCode::PARTIAL_CONTENT {
-            // Server claims range support but answered with the whole file.
             task.set_error("Server ignored range request");
             return false;
         }
 
         let mut stream = resp.bytes_stream();
         let mut dropped = false;
-        let mut since_check: u64 = 0;
         loop {
-            // Stall guard: a half-dead connection that delivers zero bytes for
-            // STALL_TIMEOUT gets dropped and reconnected from the cursor.
             let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
                 Ok(c) => c,
                 Err(_) => {
@@ -1676,50 +1497,39 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
                         break;
                     }
 
-                    // Straggler split: throttle to every ~512KB to eliminate
-                    // lock contention across 16 threads (was every 16KB).
-                    since_check += c.len() as u64;
+                    // Throttled lock check: only check split_at every 512KB written to stop 16-thread lock contention!
+                    since_check += c.len();
                     if since_check >= 512 * 1024 {
                         since_check = 0;
                         let cut = task.split_at.lock().unwrap().get(idx).copied().unwrap_or(u64::MAX);
-                    if cut != u64::MAX && cut >= seg.start && cursor >= cut.saturating_add(1) {
-                        let want = cut - seg.start + 1;
-                        let _ = file.flush().await;
-                        // Truncate via a fresh handle: this task is the sole
-                        // writer of its part file, so shrink-to-`want` is exact.
-                        // Only finish early when the part is exactly `want`
-                        // afterwards — otherwise leave the chunk unfinished so
-                        // it gets re-downloaded instead of merged corrupt.
-                        let have = seg.part.metadata().map(|m| m.len()).unwrap_or(0);
-                        if have == want {
-                            mark_done(&task, idx);
+                        if cut != u64::MAX && cut >= seg.start && cursor >= cut.saturating_add(1) {
+                            let want = cut - seg.start + 1;
                             let _ = file.flush().await;
-                            return true;
-                        }
-                        if have > want {
-                            let cut_ok = std::fs::OpenOptions::new()
-                                .write(true)
-                                .open(&seg.part)
-                                .and_then(|f| f.set_len(want))
-                                .is_ok();
-                            let _ = file.flush().await;
-                            if cut_ok {
-                                task.done.fetch_sub(have - want, Ordering::Relaxed);
+                            let have = seg.part.metadata().map(|m| m.len()).unwrap_or(0);
+                            if have == want {
                                 mark_done(&task, idx);
+                                let _ = file.flush().await;
                                 return true;
                             }
-                            // Truncate failed with an overlong part: delete it
-                            // and fail the round so the shrunk range is
-                            // re-downloaded cleanly instead of merged corrupt.
-                            let _ = std::fs::remove_file(&seg.part);
+                            if have > want {
+                                let cut_ok = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&seg.part)
+                                    .and_then(|f| f.set_len(want))
+                                    .is_ok();
+                                let _ = file.flush().await;
+                                if cut_ok {
+                                    task.done.fetch_sub(have - want, Ordering::Relaxed);
+                                    mark_done(&task, idx);
+                                    return true;
+                                }
+                                let _ = std::fs::remove_file(&seg.part);
+                                return false;
+                            }
                             return false;
                         }
-                        // Behind the cut (part shorter than `want`): keep the
-                        // partial bytes and fail softly; the next round resumes
-                        // from `have` and stops at the cut.
-                        return false;
-                        }
                     }
+
                     if per_conn > 0 {
                         throttle_bytes += c.len() as u64;
                         let since = last_throttle.elapsed().as_secs_f64();
@@ -1755,9 +1565,6 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
             mark_done(&task, idx);
             return true;
         }
-        // Connection dropped/stall before finishing this segment — restart
-        // the range from the cursor with backoff. No bytes flowed, so the
-        // per-chunk attempt budget grows; it resets on any received bytes.
         attempts += 1;
         if attempts > MAX_CHUNK_ATTEMPTS {
             task.set_error("Connection keeps dropping (chunk gave up)");
@@ -1769,10 +1576,6 @@ async fn download_segment(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
     true
 }
 
-/// One FTP segment worker: mirrors the HTTP loop's resume/throttle/retry
-/// semantics but streams over its own control session (REST cursor + RETR)
-/// instead of a reqwest range GET. Chunk-cutting (work stealing) is disabled
-/// for FTP (see `try_steal`), so ranges never overlap and merges stay exact.
 async fn download_segment_ftp(task: Arc<Task>, seg: Segment, idx: usize) -> bool {
     let expected = if seg.end == u64::MAX { u64::MAX } else { seg.end - seg.start + 1 };
     if seg.end != u64::MAX && seg.part.metadata().map(|m| m.len()).unwrap_or(0) >= expected {
@@ -1797,14 +1600,10 @@ async fn download_segment_ftp(task: Arc<Task>, seg: Segment, idx: usize) -> bool
 
     let mut last_throttle = Instant::now();
     let mut throttle_bytes = 0u64;
-    // Consecutive reconnects without forward progress (reset on any bytes).
     let mut attempts: u64 = 0;
-    // Server refused REST on the last attempt: restart the chunk from 0.
     let mut no_resume = false;
 
     while !task.cancel.load(Ordering::Relaxed) && !task.paused.load(Ordering::Relaxed) {
-        // A server without REST cannot continue a partial part: drop the
-        // bytes and stream the whole range again from the top.
         if no_resume && cursor > seg.start {
             no_resume = false;
             drop(file);
@@ -1842,9 +1641,6 @@ async fn download_segment_ftp(task: Arc<Task>, seg: Segment, idx: usize) -> bool
             let n = match tokio::time::timeout(STALL_TIMEOUT, xf.data.read(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => n,
                 Ok(Ok(_)) => {
-                    // Clean EOF: normal once the range is complete; otherwise
-                    // the server shut the data connection early — count the
-                    // reconnect as an attempt so it can't spin forever.
                     if seg.end != u64::MAX && cursor < seg.end + 1 {
                         attempts += 1;
                     }
@@ -1892,7 +1688,6 @@ async fn download_segment_ftp(task: Arc<Task>, seg: Segment, idx: usize) -> bool
 
         let range_complete = seg.end == u64::MAX || cursor >= seg.end + 1;
         if range_complete {
-            // The final control reply decides: 226/250 = transfer intact.
             match xf.finish().await {
                 Ok(()) => {
                     mark_done(&task, idx);
@@ -1911,9 +1706,7 @@ async fn download_segment_ftp(task: Arc<Task>, seg: Segment, idx: usize) -> bool
             }
         }
 
-        // Early EOF / stall / read error before the range finished: retry
-        // from the cursor (REST makes this exact; without REST the chunk
-        // restarts from 0 via the `no_resume` path above).
+        attempts += 1;
         if attempts > MAX_CHUNK_ATTEMPTS {
             task.set_error("FTP connection keeps dropping (chunk gave up)");
             return false;
@@ -1924,10 +1717,6 @@ async fn download_segment_ftp(task: Arc<Task>, seg: Segment, idx: usize) -> bool
     true
 }
 
-/// Smart-adaptive scaling decision (pure, unit-tested): grow while the last
-/// window kept up with the previous one (server still has headroom), never
-/// past 32 connections, and only when enough bytes remain to be worth the
-/// extra part files.
 fn should_grow(prev_bps: f64, recent_bps: f64, max_conns: usize, remaining: u64) -> bool {
     if max_conns >= 32 || remaining < 32 * 1024 * 1024 {
         return false;
@@ -1941,12 +1730,8 @@ fn should_grow(prev_bps: f64, recent_bps: f64, max_conns: usize, remaining: u64)
 async fn monitor_task(task: Arc<Task>) {
     let mut last = Instant::now();
     let mut last_done = task.done.load(Ordering::Relaxed);
-    // IPC throttle: emit at most every 250 ms, and only when bytes moved
-    // (plus a 1 s heartbeat so a stalled ETA still refreshes). This caps IPC
-    // at 4/s and frees the CPU for network + disk I/O on fast links.
     let mut last_emit = Instant::now() - Duration::from_secs(1);
     let mut sent_done = u64::MAX;
-    // Adaptive windows: 20 ticks x 250 ms = 5 s per evaluation.
     let mut win_bytes = 0u64;
     let mut win_ticks = 0u32;
     let mut prev_bps = 0.0f64;
@@ -1990,9 +1775,6 @@ async fn monitor_task(task: Arc<Task>) {
             );
         }
 
-        // Adaptive scaling: additive increase (+4 / 5 s) while throughput
-        // holds — the classic sign of per-connection throttling. Suspended
-        // inside the AIMD penalty window after 429/503 congestion.
         win_bytes += tick_bytes;
         win_ticks += 1;
         if win_ticks >= 20 {
@@ -2017,13 +1799,7 @@ async fn monitor_task(task: Arc<Task>) {
 
 fn split_range(total: u64, connections: usize, save_path: &Path) -> Vec<Segment> {
     const MB: u64 = 1024 * 1024;
-    // Dynamic chunk sizing without hardcoding a single size: pick the tier
-    // purely from file size, then clamp so chunks stay close to connection
-    // count for keep-alive (spec: total_chunks <= conns*2). Raw byte counters
-    // stay exact; only chunk boundaries change, so resume/work-stealing/part
-    // cleanup and duplicate dialogs remain 100% intact.
     if total < 10 * MB {
-        // Zero overhead for tiny files.
         let mut out = Vec::new();
         out.push(Segment { start: 0, end: total.saturating_sub(1), part: part_of(save_path, 0) });
         return out;
@@ -2031,14 +1807,12 @@ fn split_range(total: u64, connections: usize, save_path: &Path) -> Vec<Segment>
     let conns = connections.max(1) as u64;
     let max_chunks = 1024u64;
     let (min_chunk, max_chunk) = if total <= 100 * MB {
-        (8 * MB, 12 * MB + 512 * 1024) // 12.5 MB — 100MB/8 = 12.5MB exactly
+        (8 * MB, 12 * MB + 512 * 1024)
     } else if total <= 1024 * MB {
         (16 * MB, 32 * MB)
     } else {
         (32 * MB, 64 * MB)
     };
-    // Tier chunk, then strictly enforce conns*2 cap (keep-alive) even if that
-    // pushes chunk beyond tier max for huge files (e.g. 10 GB / 32 = 312 MB).
     let tier_chunk = (total.div_ceil(conns * 2)).clamp(min_chunk, max_chunk);
     let required = total.div_ceil(conns * 2);
     let mut chunk = tier_chunk.max(required);
@@ -2049,8 +1823,6 @@ fn split_range(total: u64, connections: usize, save_path: &Path) -> Vec<Segment>
     let mut start = 0u64;
     let mut i = 0usize;
     while start < total {
-        // Saturating arithmetic: even a hostile `total` can never wrap the
-        // tiling into an infinite loop (the caller caps at 1 TiB anyway).
         let end = start.saturating_add(chunk).saturating_sub(1).min(total.saturating_sub(1));
         out.push(Segment { start, end, part: part_of(save_path, i) });
         start = end.saturating_add(1);
@@ -2063,9 +1835,6 @@ fn split_range(total: u64, connections: usize, save_path: &Path) -> Vec<Segment>
 }
 
 fn split_range_contiguous(total: u64, connections: usize, save_path: &Path) -> Vec<Segment> {
-    // Exactly `connections` equal contiguous ranges for medium files (10–250 MB).
-    // Each worker streams its 12.5 MB (for 100MB/8) in one Keep-Alive stream,
-    // with zero queue renegotiation overhead on high-latency links.
     let n = connections.max(1);
     let base = total / n as u64;
     let rem = total % n as u64;
@@ -2084,16 +1853,13 @@ fn split_range_contiguous(total: u64, connections: usize, save_path: &Path) -> V
     out
 }
 
-fn part_of(save: &Path, index: usize) -> PathBuf {
-    let mut name = save.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{index}{PART_EXT}"));
-    save.with_file_name(name)
+fn part_of(staging_dir: &Path, index: usize) -> PathBuf {
+    staging_dir.join(format!("{index}{PART_EXT}"))
 }
 
 fn cleanup_parts(task: Arc<Task>) {
-    for s in task.segments.lock().unwrap().iter() {
-        let _ = fs::remove_file(&s.part);
-    }
+    let parts_staging_dir = std::env::temp_dir().join("vortex").join("parts").join(&task.id);
+    let _ = fs::remove_dir_all(&parts_staging_dir);
 }
 
 #[cfg(test)]
@@ -2102,8 +1868,6 @@ mod step_tests {
 
     #[test]
     fn split_cut_partitions_exactly() {
-        // (vstart, vend, written) — union of [vstart..cut] + [cut+1..vend]
-        // must equal [vstart..vend], both halves >= 1 MB.
         for (vs, ve, w) in [
             (0u64, 32 * 1024 * 1024 - 1, 0u64),
             (0, 32 * 1024 * 1024 - 1, 16 * 1024 * 1024),
@@ -2120,15 +1884,11 @@ mod step_tests {
 
     #[test]
     fn split_cut_refuses_gracefully() {
-        // Too little left.
         assert!(split_cut(0, 32 * 1024 * 1024 - 1, 31 * 1024 * 1024).is_none());
-        // Degenerate / tiny ranges never panic.
         assert!(split_cut(0, 0, 0).is_none());
         assert!(split_cut(0, 100, 0).is_none());
         assert!(split_cut(5, 4, 0).is_none());
-        // Complete chunk.
         assert!(split_cut(0, 1024 * 1024 * 8, 1024 * 1024 * 8).is_none());
-        // written past the end (stale metadata) is clamped, not panicking.
         assert!(split_cut(0, 8 * 1024 * 1024, u64::MAX).is_none());
     }
 
@@ -2142,8 +1902,8 @@ mod step_tests {
                 assert!(m >= base * 75 / 100 && m <= base * 125 / 100 + 1, "a={} m={m}", i + 1);
             }
         }
-        assert!(ms(0) >= 750); // saturating attempt arithmetic
-        assert!(ms(u64::MAX) <= 30000 * 125 / 100 + 1); // no shift overflow
+        assert!(ms(0) >= 750);
+        assert!(ms(u64::MAX) <= 30000 * 125 / 100 + 1);
     }
 
     #[test]
@@ -2158,24 +1918,19 @@ mod step_tests {
 
     #[test]
     fn should_grow_table() {
-        // capped, tiny tail, dead link, regressing speed → no growth
         assert!(!should_grow(1e6, 1e6, 32, 1 << 30));
         assert!(!should_grow(1e6, 1e6, 8, 1024));
         assert!(!should_grow(1e6, 0.0, 8, 1 << 30));
         assert!(!should_grow(1e6, 5e5, 8, 1 << 30));
-        // climbing / flat / first movement with room → grow
         assert!(should_grow(1e6, 1.2e6, 8, 1 << 30));
         assert!(should_grow(1e6, 0.95e6, 8, 1 << 30));
         assert!(should_grow(0.0, 1e5, 8, 1 << 30));
         assert!(should_grow(0.0, 0.0, 8, 1 << 30) == false);
-        // exactly at the remaining threshold grows; 31 conns still allowed
         assert!(should_grow(1e6, 1e6, 31, 32 * 1024 * 1024));
     }
 
     #[test]
     fn split_range_tiles_without_gaps() {
-        // Steps 1+3 interplay: whatever split_range emits, chained splits +
-        // merge must cover every byte exactly once.
         let dir = std::env::temp_dir();
         for total in [1u64, 1024, 1024 * 1024, 40 * 1024 * 1024 + 7, 1024 * 1024 * 1024, u64::MAX] {
             let chunks = split_range(total, 8, &dir.join("probe.bin"));
