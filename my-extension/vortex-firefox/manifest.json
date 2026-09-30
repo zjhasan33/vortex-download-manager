@@ -1,0 +1,46 @@
+{
+  "manifest_version": 2,
+  "name": "Vortex Companion",
+  "version": "1.3.1",
+  "description": "Capture downloads and grab videos from any site — works with the Vortex download manager (like IDM's extension).",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "vortex-companion@fahad.local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "alarms",
+    "webRequest",
+    "contextMenus",
+    "notifications",
+    "storage",
+    "tabs",
+    "downloads",
+    "cookies",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "32": "icons/icon32.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "icons": {
+    "32": "icons/icon32.png",
+    "128": "icons/icon128.png"
+  }
+}

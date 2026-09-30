@@ -415,6 +415,7 @@ export class VortexApp {
     for (let i = 0; i < items.length && i < kids.length; i++) {
       const d = items[i];
       const el = kids[i];
+      if (el.dataset.row !== d.id) continue;
       const fill = el.querySelector<HTMLElement>(".bar .fill");
       const pct = Number.isFinite(d.progress) ? d.progress.toFixed(1) : "0.0";
       if (fill) fill.style.width = `${pct}%`;
@@ -542,8 +543,9 @@ export class VortexApp {
     const re = this.root.querySelector<HTMLButtonElement>("#tb-resume");
     const st = this.root.querySelector<HTMLButtonElement>("#tb-stop");
     if (pa) pa.disabled = !active;
-    if (re) re.disabled = !active;
-    if (st) st.disabled = !active;
+    const resumable = store.downloads.filter((d) => d.status === "paused").length;
+    if (re) re.disabled = !active && !resumable;
+    if (st) st.disabled = !active && !resumable;
     // Emergency batch bar: visible whenever more than one download is live.
     const bat = this.root.querySelector<HTMLElement>("#batch-bar");
     const bcount = this.root.querySelector<HTMLElement>("#batch-active-count");

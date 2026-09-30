@@ -608,6 +608,16 @@ async fn ytdl_expected_path(
 #[tauri::command]
 async fn delete_file_at(path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(path.trim());
+    let canon = p.canonicalize().map_err(|e| e.to_string())?;
+    let s = canon.to_string_lossy().to_lowercase();
+    for root in [std::env::var("windir").unwrap_or_default(), std::env::var("ProgramFiles").unwrap_or_default(), std::env::var("ProgramFiles(x86)").unwrap_or_default()].iter().filter(|r| !r.is_empty()) {
+        if s.starts_with(&root.to_lowercase()) {
+            return Err("Refusing to delete inside system folders".into());
+        }
+    }
+    if canon.parent().map(|par| par.as_os_str().is_empty() || par.parent().is_none()).unwrap_or(true) {
+        return Err("Refusing to delete drive root".into());
+    }
     if p.is_file() {
         std::fs::remove_file(&p).map_err(|e| e.to_string())?;
     } else if p.is_dir() {
@@ -691,8 +701,9 @@ fn open_info_window(app: &tauri::AppHandle, payload: serde_json::Value) {
     let _ = win.set_focus();
 }
 
-fn remove_one(_app: &tauri::AppHandle, state: &Arc<DlManager>, id: &str, delete_file: bool) {
-    state.remove_with_file(id, delete_file);
+fn remove_one(app: &tauri::AppHandle, state: &Arc<DlManager>, id: &str, delete_file: bool) {
+    let delete_parts = state::load_settings(app).delete_part;
+    state.remove_with_file(id, delete_file, delete_parts);
 }
 
 #[tauri::command]
@@ -1102,6 +1113,7 @@ pub fn run() {
             register_vortex_protocol();
 
             state::load_history(handle, mgr.inner());
+            state::sweep_orphan_temp(mgr.inner());
             state::persist_loop(handle.clone(), mgr.inner().clone());
             state::sleep_block_loop(mgr.inner().clone());
             state::completion_watch_loop(handle.clone(), mgr.inner().clone());

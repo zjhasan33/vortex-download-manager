@@ -357,6 +357,7 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                             "filename": p["filename"].as_str().unwrap_or(""),
                             "referer": p["referer"].as_str().unwrap_or(""),
                             "cookies": p["cookies"].as_str().unwrap_or(""),
+                            "user_agent": p["user_agent"].as_str().unwrap_or(""),
                             "ytdl": p.get("format_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|fid| serde_json::json!({"format_id": fid})),
                         });
                         crate::open_info_window(app, payload);
@@ -367,6 +368,7 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                             "filename": p["filename"].as_str().unwrap_or(""),
                             "referer": p["referer"].as_str().unwrap_or(""),
                             "cookies": p["cookies"].as_str().unwrap_or(""),
+                            "user_agent": p["user_agent"].as_str().unwrap_or(""),
                             "format_id": p["format_id"].as_str().unwrap_or(""),
                             "is_ytdl": p["is_ytdl"].as_bool().unwrap_or(false),
                         }));
@@ -540,7 +542,8 @@ async fn dispatch(app: &AppHandle, msg: &str) -> String {
                     let p = &v["payload"];
                     let id = p["id"].as_str().unwrap_or("").to_string();
                     let delete_file = p["delete_file"].as_bool().unwrap_or(false);
-                    mgr.remove_with_file(&id, delete_file);
+                    let delete_parts = crate::state::load_settings(app).delete_part;
+                    mgr.remove_with_file(&id, delete_file, delete_parts);
                     json!({"type":"removed","ok":true,"id":id}).to_string()
                 }
                 "list" => {

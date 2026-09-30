@@ -110,7 +110,7 @@ export function openYoutube(preset?: { url?: string; playlist?: boolean; analyze
 
         body.innerHTML = `
           <div class="yt-info">
-            <div class="yt-thumb" style="background-image:url('${info.thumbnail.replace(/'/g, "%27")}')"></div>
+            <div class="yt-thumb" style="background-image:url('${info.thumbnail.replace(/'/g, "%27").replace(/"/g, "%22").replace(/\)/g, "%29").replace(/\\/g, "")}')"></div>
             <div class="yt-meta">
               <h4>${esc(info.title)}</h4>
               <div class="tags">

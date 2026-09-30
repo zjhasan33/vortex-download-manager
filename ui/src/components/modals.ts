@@ -290,6 +290,9 @@ export function openSettings() {
           <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
             <input type="checkbox" id="st-dlinfo" ${s.show_download_info ?? true ? "checked" : ""} /> Show "Download File Info" dialog before starting downloads
           </label>
+          <label style="display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="st-delpart" ${s.delete_part ?? true ? "checked" : ""} /> Delete part files (.vtx.part) when a task is removed
+          </label>
         </div>
       </div>
       <div class="field">
@@ -488,7 +491,7 @@ export function openSettings() {
           sounds: root.querySelector<HTMLInputElement>("#st-sounds")!.checked,
           auto_start: root.querySelector<HTMLInputElement>("#st-autostart")!.checked,
           categorize_folders: root.querySelector<HTMLInputElement>("#st-cat")!.checked,
-          delete_part: s.delete_part,
+          delete_part: root.querySelector<HTMLInputElement>("#st-delpart")!.checked,
           max_active: Math.max(1, Number(root.querySelector<HTMLInputElement>("#st-maxact")!.value) || 5),
           auto_retries: Math.max(0, Number(root.querySelector<HTMLInputElement>("#st-retries")!.value) || 0),
           proxy: root.querySelector<HTMLInputElement>("#st-proxy")!.value.trim(),
@@ -786,7 +789,7 @@ export function openGrabber(initialUrl = "", autoStart = false) {
 }
 
 function escapeAttr(s: string): string {
-  return s.replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;");
 }
 
 export function openWelcome(toolsMissing: boolean, onSettings: () => void) {

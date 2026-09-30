@@ -8,6 +8,16 @@
 if (typeof browser === "undefined" && typeof globalThis.chrome !== "undefined") {
   var browser = globalThis.chrome;
 }
+// Firefox MV2 has no scripting API — shim it over tabs.executeScript so the
+// shared executeScript({target, func}) call sites work unchanged.
+if (browser && !browser.scripting && browser.tabs && browser.tabs.executeScript) {
+  browser.scripting = {
+    executeScript: ({ target, func, args }) => {
+      const code = "(" + func.toString() + ").apply(null, " + JSON.stringify(args || []) + ")";
+      return browser.tabs.executeScript(target && target.tabId, { code }).then((r) => [{ result: r && r[0] }]);
+    },
+  };
+}
 
 const WS_ADDR = "ws://127.0.0.1:17190";
 const MEDIA_EXT = ["mp4", "webm", "mov", "m4v", "mkv", "flv", "avi", "m4a", "mp3", "ogg", "oga", "opus", "wav", "aac", "flac", "m3u8", "mpd"];
@@ -189,9 +199,22 @@ async function connectAsync() {
       const msg = JSON.parse(ev.data);
       if (msg.req && pending.has(msg.req)) {
         const p = pending.get(msg.req);
+        // Instant ack is not the result — hold for the real reply, but fall
+        // back to the ack itself if nothing else arrives within 8 s.
+        if (msg.type === "ack" && !p.acked) {
+          p.acked = true;
+          p.ackTimer = setTimeout(() => {
+            if (pending.has(msg.req)) {
+              pending.delete(msg.req);
+              clearTimeout(p.timer);
+              p.resolve(msg);
+            }
+          }, 8000);
+          return;
+        }
         pending.delete(msg.req);
         clearTimeout(p.timer);
-        if (p.rejectTimer) clearTimeout(p.rejectTimer);
+        if (p.ackTimer) clearTimeout(p.ackTimer);
         if (msg.type === "error") p.resolve({ error: msg.error });
         else p.resolve(msg);
       }
@@ -512,7 +535,8 @@ async function takeOverDownload(item) {
   // download so the page sees the browser didn't save it (IDM-style).
   try { await browser.downloads.cancel(item.id); } catch (e) {}
   try { await browser.downloads.erase({ id: item.id }); } catch (e) {}
-  try { await browser.downloads.removeFile(item.id); } catch (e) {}
+  // Firefox has no downloads.removeFile — guard so takeover never throws there.
+  try { if (browser.downloads.removeFile) await browser.downloads.removeFile(item.id); } catch (e) {}
 }
 
 if (browser.downloads) {
@@ -850,9 +874,12 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse,
       async () => {
         if (url.startsWith("blob:") || isMediaSite(pageUrl)) {
-          if (online) return { ...(await handleAnalyze(pageUrl)), action: "analyze" };
-          await launchVortex("capture", { url: pageUrl, via: "yt" });
-          return { ok: false, action: "analyze", launched: true, title };
+          if (online) {
+            const a = await handleAnalyze(pageUrl);
+            if (a && a.error) return { error: "Protected video (login/DRM): " + a.error, action: "analyze" };
+            return { ...a, action: "analyze" };
+          }
+          return { error: "Vortex is offline — cannot resolve this video", action: "analyze" };
         }
         return handleStart({
           type: "direct", url, filename: msg.filename, pageUrl,
@@ -895,17 +922,26 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     return safeRespond(sendResponse, async () => {
+      // Firefox has no MAIN world — try MAIN (Chrome), fall back to ISOLATED.
+      let results = null;
       try {
-        const results = await browser.scripting.executeScript({
+        results = await browser.scripting.executeScript({
           target: { tabId },
           world: "MAIN",
           func: extractYtInPage,
         });
-        const out = results && results[0] && results[0].result;
-        return out || { ok: false, error: "no in-page result" };
       } catch (e) {
-        return { ok: false, error: (e && e.message) || String(e) };
+        try {
+          results = await browser.scripting.executeScript({
+            target: { tabId },
+            func: extractYtInPage,
+          });
+        } catch (e2) {
+          return { ok: false, error: (e2 && e2.message) || String(e2) };
+        }
       }
+      const out = results && results[0] && results[0].result;
+      return out || { ok: false, error: "no in-page result" };
     }, 8000);
   }
 
@@ -931,14 +967,23 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // IDM-style: YouTube hover bar goes through the intercept dialog
         // (Start / Download Later / Cancel) instead of auto-starting.
         try {
-          await rpc("intercept", {
+          const ir = await rpc("intercept", {
             url: msg.url, filename: msg.filename || undefined,
             referer: msg.referer || pageUrl || undefined,
             cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
             user_agent: msg.userAgent || EXT_UA,
             format_id: msg.format_id, is_ytdl: true,
           });
-          return { ok: true, intercepted: true };
+          if (ir && !ir.error) return { ok: true, intercepted: true };
+          // Intercept refused/errored — fall through to direct start_ytdl.
+          const fb = {
+            url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled,
+            referer: msg.referer || pageUrl || undefined,
+            cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
+            user_agent: msg.userAgent || EXT_UA,
+          };
+          if (msg.auto_subs === true) fb.auto_subs = true;
+          return rpc("start_ytdl", fb);
         } catch {
           const payload = {
             url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled,

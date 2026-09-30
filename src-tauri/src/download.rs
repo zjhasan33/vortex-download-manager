@@ -385,7 +385,7 @@ pub fn sanitize(name: &str) -> String {
         .chars()
         .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
         .collect();
-    let trimmed = cleaned.trim();
+    let trimmed = cleaned.trim().replace("..", "_");
     if trimmed.is_empty() {
         format!("download_{}", now_ms())
     } else {

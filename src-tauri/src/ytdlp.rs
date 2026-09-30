@@ -361,6 +361,37 @@ fn move_staged_tree(src_root: &std::path::Path, dst_root: &std::path::Path) -> u
     n
 }
 
+/// Background second pass (LAZY-SUBS, additive): fetch official subtitles and
+/// mux them into the already-completed video file. Never delays download start;
+/// on failure the video stays intact (sidecar subs may remain in temp, cleaned).
+async fn lazy_embed_subs(app: &tauri::AppHandle, file: &std::path::Path, url: &str, langs: &str, referer: &str, user_agent: &str) -> Result<(), String> {
+    let bin = crate::tools::ensure_ytdlp(app).await?;
+    let effective = if langs.trim().eq_ignore_ascii_case("all") { "en,bn,ur,ar,hi".to_string() } else { langs.trim().to_string() };
+    let tmp = std::env::temp_dir().join("vortex").join(format!("subs-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(["--newline", "--no-warnings", "--ignore-errors", "--skip-download",
+        "--write-subs", "--no-write-auto-subs",
+        "--sub-langs", &effective, "--sub-format", "srt/vtt/best", "--embed-subs",
+        "--extractor-retries", "2", "--no-playlist",
+        "--paths", &format!("temp:{}", tmp.display()),
+        "-o", &file.display().to_string(), url]);
+    if !referer.is_empty() {
+        cmd.args(["--referer", referer]);
+    }
+    if !user_agent.is_empty() {
+        cmd.args(["--user-agent", user_agent]);
+    }
+    // Silent like every other spawn: never pop a console window (release rule).
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let st = cmd.status().await.map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&tmp);
+    if st.success() { Ok(()) } else { Err(format!("yt-dlp subs pass exited {st}")) }
+}
+
 async fn try_embed_thumbnail(app: &tauri::AppHandle, file: &std::path::Path, thumb_url: Option<String>, video_url: &str) -> Result<(), String> {
     // Best-effort post-download thumbnail embed — silent fail, never touches task status.
     // Order is guaranteed by caller: video already completed + tmp cleaned, subs already embedded.
@@ -1161,6 +1192,10 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
     let watch = tokio::spawn(progress_watch(task.clone()));
     let audio_fmt = parse_audio_fmt(&task.format_id);
     let is_subs = task.format_id.starts_with("subs:");
+    // LAZY-SUBS (additive): single-video official-subs embed moves to a
+    // background pass after completion so timedtext fetch never delays start.
+    // Playlists keep today's inline embed; subs-only/audio paths are untouched.
+    let lazy_subs = !is_subs && audio_fmt.is_none() && task.embed_subs && !task.sub_langs.trim().is_empty() && !task.include_playlist;
 
     let mut args: Vec<String> = vec![
         "--newline".into(),
@@ -1177,7 +1212,7 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
     if task.include_playlist {
         args.push("--yes-playlist".into());
         let items = task.playlist_items.trim().to_string();
-        if !items.is_empty() {
+        if !items.is_empty() && items.chars().all(|c| c.is_ascii_digit() || ",-: ".contains(c)) {
             args.push("--playlist-items".into());
             args.push(items);
         }
@@ -1236,7 +1271,7 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             args.push("--merge-output-format".into());
             args.push("mp4".into());
             args.push("-f".into());
-            args.push(task.format_id.clone());
+            args.push(task.format_id.chars().filter(|c| !c.is_control()).collect());
             // Embed chapter markers + full metadata so VLC/players show chapters
             // (described/scoreboard) for tutorials & long videos.
             args.push("--embed-metadata".into());
@@ -1245,7 +1280,7 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
             // Fixed: limit retries so a 502 on YouTube timedtext (e.g. bn) never
             // blocks the video for 10 retries, and a subtitle failure never
             // aborts the whole download (--ignore-errors + extractor retries).
-            if task.embed_subs && !task.sub_langs.trim().is_empty() {
+            if task.embed_subs && !task.sub_langs.trim().is_empty() && !lazy_subs {
                 let langs = task.sub_langs.trim();
                 // "all" hit every language and triggers 502 storms; prefer en/bn
                 // when the user kept the default, still covering Bengali + English.
@@ -1655,7 +1690,27 @@ pub(crate) async fn ytdlp_run(task: Arc<YtTask>, bin: &std::path::Path) -> Resul
                         let thumb = task.thumb.clone();
                         let vurl = task.url.clone();
                         tokio::spawn(async move {
-                            let _ = try_embed_thumbnail(&app2, &first, thumb, &vurl).await;
+                            if let Err(e) = try_embed_thumbnail(&app2, &first, thumb, &vurl).await {
+                                eprintln!("[thumb] embed failed for {}: {e}", first.display());
+                                let _ = app2.emit("thumb-failed", first.to_string_lossy().into_owned());
+                            }
+                        });
+                    }
+                }
+                // LAZY-SUBS (additive): official subs embed in background after the
+                // video is already completed — timedtext fetch never delays start.
+                if lazy_subs {
+                    if let Some(final_file) = (*task.produced.lock().unwrap()).first().cloned() {
+                        let app3 = task.app.clone();
+                        let url3 = task.url.clone();
+                        let langs3 = task.sub_langs.clone();
+                        let ref3 = task.referer.clone();
+                        let ua3 = task.user_agent.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = lazy_embed_subs(&app3, &final_file, &url3, &langs3, &ref3, &ua3).await {
+                                eprintln!("[subs] lazy embed failed for {}: {e}", final_file.display());
+                                let _ = app3.emit("subs-failed", final_file.to_string_lossy().into_owned());
+                            }
                         });
                     }
                 }

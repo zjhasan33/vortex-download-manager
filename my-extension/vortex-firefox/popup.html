@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Vortex</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="head">
+      <span class="logo"></span>
+      <div class="ht">
+        <b>VORTEX</b>
+        <span id="status" class="status off">connecting…</span>
+      </div>
+    </header>
+
+    <section class="addurl">
+      <input id="url" type="text" placeholder="Paste direct file or video URL" spellcheck="false" />
+      <button id="addbtn" class="btn primary">Add URL</button>
+    </section>
+
+    <section class="grabpage">
+      <button id="grab-page" class="btn primary grabpage-btn">🔗 Grab All Links on This Page</button>
+    </section>
+
+    <section class="notify">
+      <label class="toggle">
+        <input type="checkbox" id="notify-toggle" />
+        <span>Show notification when download link detected</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="intercept-toggle" checked />
+        <span>Intercept browser downloads (Vortex as default downloader)</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="subs-toggle" checked />
+        <span>Embed official subtitles into video downloads</span>
+      </label>
+      <label class="slider-row" title="How see-through the video hover bar is">
+        <span>Hover bar opacity</span>
+        <input type="range" id="hbar-opacity" min="20" max="100" step="5" value="100" />
+        <b id="hbar-opacity-val">100%</b>
+      </label>
+    </section>
+
+    <section class="subs">
+      <div class="cap-head">
+        <span>Subtitles ▾</span>
+        <span class="subfmt">
+          <button id="subfmt-srt" class="fmtbtn on">SRT</button>
+          <button id="subfmt-vtt" class="fmtbtn">VTT</button>
+        </span>
+      </div>
+      <button id="subs-fetch" class="btn ghost subs-fetch">List subtitles for current tab</button>
+      <div id="subs-list" class="subs-list"></div>
+    </section>
+
+    <section id="stats" class="stats hidden">
+      <div><b id="st-active">0</b><span>active</span></div>
+      <div><b id="st-speed">0 B/s</b><span>speed</span></div>
+      <div><b id="st-done">0</b><span>finished</span></div>
+    </section>
+
+    <section class="pair">
+      <div class="pair-head">
+        <span>Connection key</span>
+        <button id="pair-clear" class="linkbtn" title="Forget key">clear</button>
+      </div>
+      <div class="pair-row">
+        <input id="pair-key" type="text" placeholder="Paste key from Vortex → Settings" spellcheck="false" />
+        <button id="pair-save" class="btn primary">Save</button>
+      </div>
+      <div class="pair-hint">Get the key from Vortex app → Settings → Browser extension key → Copy, then paste it here once.</div>
+    </section>
+
+    <section class="captures">
+      <div class="cap-head">
+        <span>Detected links</span>
+        <button id="clear" class="linkbtn" title="Clear">clear</button>
+      </div>
+      <div id="cap-list" class="cap-list">
+        <div class="empty">Watching for downloads on any tab…</div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <button id="open" class="btn ghost">Open Vortex</button>
+      <button id="refresh" class="btn ghost">Refresh status</button>
+    </footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -71,7 +71,10 @@ impl DlManager {
     /// With `delete_file`, multi-file jobs (playlists, subtitles) wipe every
     /// produced file, and an emptied playlist sub-folder shell goes too.
     /// Every caller funnels here, so no path can leak files anymore.
-    pub fn remove_with_file(&self, id: &str, delete_file: bool) {
+    pub fn remove_with_file(&self, id: &str, delete_file: bool, delete_parts: bool) {
+        // YouTube staging (%TEMP%\vortex\<id>) is useless once the task is gone.
+        let ytmp = std::env::temp_dir().join("vortex").join(id);
+        let _ = std::fs::remove_dir_all(&ytmp);
         if delete_file {
             let mut paths: Vec<PathBuf> = Vec::new();
             // Playlist shell to remove afterwards (only when left empty).
@@ -115,6 +118,12 @@ impl DlManager {
                     let _ = std::fs::remove_dir(&dir);
                 }
             }
+        } else if delete_parts {
+            if let Some(t) = self.http.lock().unwrap().get(id) {
+                cleanup_parts_for(&t.save_path);
+            }
+            let tmp = std::env::temp_dir().join("vortex").join("parts").join(id);
+            let _ = std::fs::remove_dir_all(&tmp);
         }
         self.remove(id);
     }
@@ -397,6 +406,38 @@ impl DlManager {
         let mut settings = load_settings(app);
         settings.credentials.retain(|c| c.host != host);
         save_settings(app, &settings);
+    }
+}
+
+/// App-start sweep: drop orphaned `%TEMP%\vortex` staging left by a crash/kill.
+/// Only removes dirs whose id is unknown to live tasks + history.
+pub fn sweep_orphan_temp(mgr: &DlManager) {
+    use std::collections::HashSet;
+    let mut known: HashSet<String> = HashSet::new();
+    for k in mgr.http.lock().unwrap().keys() {
+        known.insert(k.clone());
+    }
+    for k in mgr.yt.lock().unwrap().keys() {
+        known.insert(k.clone());
+    }
+    for v in mgr.history.lock().unwrap().iter() {
+        known.insert(v.id.clone());
+    }
+    let root = std::env::temp_dir().join("vortex");
+    if let Ok(entries) = std::fs::read_dir(root.join("parts")) {
+        for e in entries.flatten() {
+            if !known.contains(&e.file_name().to_string_lossy().into_owned()) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.path().is_dir() && name != "parts" && !known.contains(&name) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
     }
 }
 

@@ -189,9 +189,22 @@ async function connectAsync() {
       const msg = JSON.parse(ev.data);
       if (msg.req && pending.has(msg.req)) {
         const p = pending.get(msg.req);
+        // Instant ack is not the result — hold for the real reply, but fall
+        // back to the ack itself if nothing else arrives within 8 s.
+        if (msg.type === "ack" && !p.acked) {
+          p.acked = true;
+          p.ackTimer = setTimeout(() => {
+            if (pending.has(msg.req)) {
+              pending.delete(msg.req);
+              clearTimeout(p.timer);
+              p.resolve(msg);
+            }
+          }, 8000);
+          return;
+        }
         pending.delete(msg.req);
         clearTimeout(p.timer);
-        if (p.rejectTimer) clearTimeout(p.rejectTimer);
+        if (p.ackTimer) clearTimeout(p.ackTimer);
         if (msg.type === "error") p.resolve({ error: msg.error });
         else p.resolve(msg);
       }
@@ -850,9 +863,12 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse,
       async () => {
         if (url.startsWith("blob:") || isMediaSite(pageUrl)) {
-          if (online) return { ...(await handleAnalyze(pageUrl)), action: "analyze" };
-          await launchVortex("capture", { url: pageUrl, via: "yt" });
-          return { ok: false, action: "analyze", launched: true, title };
+          if (online) {
+            const a = await handleAnalyze(pageUrl);
+            if (a && a.error) return { error: "Protected video (login/DRM): " + a.error, action: "analyze" };
+            return { ...a, action: "analyze" };
+          }
+          return { error: "Vortex is offline — cannot resolve this video", action: "analyze" };
         }
         return handleStart({
           type: "direct", url, filename: msg.filename, pageUrl,
@@ -931,14 +947,23 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // IDM-style: YouTube hover bar goes through the intercept dialog
         // (Start / Download Later / Cancel) instead of auto-starting.
         try {
-          await rpc("intercept", {
+          const ir = await rpc("intercept", {
             url: msg.url, filename: msg.filename || undefined,
             referer: msg.referer || pageUrl || undefined,
             cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
             user_agent: msg.userAgent || EXT_UA,
             format_id: msg.format_id, is_ytdl: true,
           });
-          return { ok: true, intercepted: true };
+          if (ir && !ir.error) return { ok: true, intercepted: true };
+          // Intercept refused/errored — fall through to direct start_ytdl.
+          const fb = {
+            url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled,
+            referer: msg.referer || pageUrl || undefined,
+            cookies: msg.cookies || await cookieHeaderFor([msg.url, pageUrl]),
+            user_agent: msg.userAgent || EXT_UA,
+          };
+          if (msg.auto_subs === true) fb.auto_subs = true;
+          return rpc("start_ytdl", fb);
         } catch {
           const payload = {
             url: msg.url, format_id: msg.format_id, embed_subs: subsEnabled,
